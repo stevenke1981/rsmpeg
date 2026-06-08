@@ -29,3 +29,7 @@ rodio = "0.20"
 # Video playback: OpenH264 (H.264 decode via Cisco's C library) + minifb (window/display)
 openh264 = "0.9"
 minifb = "0.28"
+
+# GUI (egui native framework for rsmpeg gui subcommand)
+eframe = "0.28"
+rfd = "0.15"        # native file dialog

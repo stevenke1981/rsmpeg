@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod gui;
 mod playback;
 
 #[derive(Parser)]
@@ -51,6 +52,11 @@ enum Commands {
     ListFormats,
     /// List registered codecs
     ListCodecs,
+    /// Launch the egui graphical media player
+    Gui {
+        /// Optional media file to open on startup
+        input: Option<String>,
+    },
 }
 
 fn main() {
@@ -79,6 +85,7 @@ fn main() {
         Commands::Play { input, info } => cmd_play(input, *info),
         Commands::ListFormats => cmd_list_formats(),
         Commands::ListCodecs => cmd_list_codecs(),
+        Commands::Gui { input } => cmd_gui(input.as_deref()),
     }
 }
 
@@ -322,6 +329,17 @@ fn cmd_play(input: &str, info_only: bool) {
         }
         Err(e) => {
             eprintln!("  Playback error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Launch the egui GUI player.
+fn cmd_gui(input: Option<&str>) {
+    match gui::run_gui(input) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("GUI error: {}", e);
             std::process::exit(1);
         }
     }
