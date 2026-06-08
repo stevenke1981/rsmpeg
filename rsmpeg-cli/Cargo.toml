@@ -25,3 +25,7 @@ symphonia = { version = "0.5", default-features = false, features = [
     "mp3", "isomp4", "aac", "vorbis", "flac", "mkv", "ogg", "wav", "pcm", "alac", "adpcm",
 ] }
 rodio = "0.20"
+
+# Video playback: OpenH264 (H.264 decode via Cisco's C library) + minifb (window/display)
+openh264 = "0.9"
+minifb = "0.28"

@@ -315,8 +315,8 @@ fn cmd_play(input: &str, info_only: bool) {
         return;
     }
 
-    // Use Symphonia + rodio for actual playback
-    match playback::play_audio_file(input) {
+    // Use Symphonia + rodio for audio, OpenH264 + minifb for video
+    match playback::play_media(input) {
         Ok(()) => {
             println!("  Playback complete.");
         }
