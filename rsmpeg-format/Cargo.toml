@@ -2,7 +2,17 @@
 name = "rsmpeg-format"
 version.workspace = true
 edition.workspace = true
-description = "Stub — will be implemented"
+license.workspace = true
+rust-version.workspace = true
+description = "Container format demuxing/muxing (libavformat equivalent)"
+
 [lints]
 workspace = true
+
 [dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+rsmpeg-codec = { path = "../rsmpeg-codec" }
+bytes.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
