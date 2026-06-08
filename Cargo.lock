@@ -81,6 +81,12 @@ dependencies = [
 [[package]]
 name = "rsmpeg-filter"
 version = "0.1.0"
+dependencies = [
+ "rsmpeg-codec",
+ "rsmpeg-util",
+ "serde",
+ "tracing",
+]
 
 [[package]]
 name = "rsmpeg-format"

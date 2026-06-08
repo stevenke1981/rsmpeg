@@ -2,7 +2,15 @@
 name = "rsmpeg-filter"
 version.workspace = true
 edition.workspace = true
-description = "Stub — will be implemented"
+license.workspace = true
+rust-version.workspace = true
+description = "Media filtering and filter graphs (libavfilter equivalent)"
+
 [lints]
 workspace = true
+
 [dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+rsmpeg-codec = { path = "../rsmpeg-codec" }
+tracing.workspace = true
+serde.workspace = true
