@@ -10,6 +10,8 @@ pub enum CodecId {
     Theora,
     Mpeg4,
     H263,
+    H264,
+    Hevc,
     Mjpeg,
     Ffv1,
     JpegXl,
@@ -43,6 +45,8 @@ impl CodecId {
             CodecId::Theora => "theora",
             CodecId::Mpeg4 => "mpeg4",
             CodecId::H263 => "h263",
+            CodecId::H264 => "h264",
+            CodecId::Hevc => "hevc",
             CodecId::Mjpeg => "mjpeg",
             CodecId::Ffv1 => "ffv1",
             CodecId::JpegXl => "jpegxl",
@@ -72,6 +76,8 @@ impl CodecId {
             "theora" => Some(CodecId::Theora),
             "mpeg4" => Some(CodecId::Mpeg4),
             "h263" => Some(CodecId::H263),
+            "h264" => Some(CodecId::H264),
+            "hevc" => Some(CodecId::Hevc),
             "mjpeg" => Some(CodecId::Mjpeg),
             "ffv1" => Some(CodecId::Ffv1),
             "jpegxl" => Some(CodecId::JpegXl),
@@ -102,6 +108,8 @@ impl CodecId {
             | CodecId::Theora
             | CodecId::Mpeg4
             | CodecId::H263
+            | CodecId::H264
+            | CodecId::Hevc
             | CodecId::Mjpeg
             | CodecId::Ffv1
             | CodecId::JpegXl
