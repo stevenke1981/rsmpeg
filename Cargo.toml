@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "rsmpeg-util",
+    "rsmpeg-codec",
+    "rsmpeg-format",
+    "rsmpeg-filter",
+    "rsmpeg-scale",
+    "rsmpeg-resample",
+    "rsmpeg",
+    "rsmpeg-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+authors = ["rsmpeg Contributors"]
+description = "Pure Rust FFmpeg clone — patent-free multimedia processing"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "allow"
+
+[workspace.dependencies]
+thiserror = "2"
+bytes = "1"
+tracing = "0.1"
+bitflags = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

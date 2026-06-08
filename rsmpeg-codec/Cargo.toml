@@ -1,0 +1,8 @@
+[package]
+name = "rsmpeg-codec"
+version.workspace = true
+edition.workspace = true
+description = "Stub — will be implemented"
+[lints]
+workspace = true
+[dependencies]
