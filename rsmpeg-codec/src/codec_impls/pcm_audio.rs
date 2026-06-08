@@ -87,6 +87,7 @@ impl PCMAudioDecoder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_parameters(&mut self, params: CodecParameters) {
         if let Some(ch) = params.channels {
             self.channels = ch;
@@ -144,6 +145,7 @@ impl Decoder for PCMAudioDecoder {
 
 /// Encoder for PCM audio — each frame becomes one packet.
 pub struct PCMAudioEncoder {
+    #[allow(dead_code)]
     sample_format: SampleFormat,
     params: Option<CodecParameters>,
 }
@@ -156,6 +158,7 @@ impl PCMAudioEncoder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_parameters(&mut self, params: CodecParameters) {
         self.params = Some(params);
     }

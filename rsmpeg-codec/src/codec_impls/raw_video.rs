@@ -51,6 +51,7 @@ impl RawVideoDecoder {
         RawVideoDecoder { params: None }
     }
 
+    #[allow(dead_code)]
     pub fn set_parameters(&mut self, params: CodecParameters) {
         self.params = Some(params);
     }
@@ -113,6 +114,7 @@ impl RawVideoEncoder {
         RawVideoEncoder { params: None }
     }
 
+    #[allow(dead_code)]
     pub fn set_parameters(&mut self, params: CodecParameters) {
         self.params = Some(params);
     }
@@ -192,7 +194,7 @@ mod tests {
             stream_index: 0,
             flags: PacketFlags::KEY,
             pos: 0,
-            time_base: Default::default(),
+            time_base: test_time_base(),
         };
         let frames = decoder.decode(&packet).unwrap();
         assert_eq!(frames.len(), 1);
@@ -217,7 +219,6 @@ mod tests {
 
     #[test]
     fn test_raw_video_decode_with_params() {
-        let codec = RawVideoCodec;
         let mut decoder = RawVideoDecoder::new();
         decoder.set_parameters(make_params());
 
