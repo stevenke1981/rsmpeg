@@ -107,6 +107,12 @@ version = "0.1.0"
 [[package]]
 name = "rsmpeg-scale"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "rsmpeg-codec",
+ "rsmpeg-util",
+ "tracing",
+]
 
 [[package]]
 name = "rsmpeg-util"
