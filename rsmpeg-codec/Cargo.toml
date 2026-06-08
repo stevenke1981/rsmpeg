@@ -2,7 +2,16 @@
 name = "rsmpeg-codec"
 version.workspace = true
 edition.workspace = true
-description = "Stub — will be implemented"
+license.workspace = true
+rust-version.workspace = true
+description = "Codec interface and types (libavcodec equivalent)"
+
 [lints]
 workspace = true
+
 [dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+bytes.workspace = true
+bitflags.workspace = true
+tracing.workspace = true
+serde.workspace = true
