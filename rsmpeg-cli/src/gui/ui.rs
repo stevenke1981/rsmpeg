@@ -4,6 +4,7 @@
 //! - **Welcome screen** — shown when no file is loaded.
 //! - **Player view** — video display + control bar.
 
+use super::state;
 use super::MediaApp;
 use eframe::egui::{self, vec2, Color32, Frame, Margin, Rounding};
 
@@ -54,9 +55,8 @@ fn render_welcome(app: &mut MediaApp, ctx: &egui::Context) {
 // ---------------------------------------------------------------------------
 
 fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
-    // Read shared state
-    let state = app.state.clone();
-    let state_ref = state.lock().unwrap();
+    // Read shared state (poison-safe)
+    let state_ref = state::lock_state(&app.state);
     let playing = state_ref.playing;
     let pos = state_ref.position_sec;
     let dur = state_ref.duration_sec;
@@ -124,13 +124,13 @@ fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
                             "\u{25B6} Play"
                         };
                         if ui.button(play_label).clicked() {
-                            let mut s = app.state.lock().unwrap();
+                            let mut s = state::lock_state(&app.state);
                             s.playing = !s.playing;
                         }
 
                         // --- Stop ---
                         if ui.button("\u{23F9} Stop").clicked() {
-                            let mut s = app.state.lock().unwrap();
+                            let mut s = state::lock_state(&app.state);
                             s.playing = false;
                             s.position_sec = 0.0;
                             app._latest_frame = None;
@@ -167,7 +167,7 @@ fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
                         let resp = ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).text(""));
                         if resp.changed() {
                             app.volume = vol;
-                            let mut s = app.state.lock().unwrap();
+                            let mut s = state::lock_state(&app.state);
                             s.volume = vol;
                         }
 

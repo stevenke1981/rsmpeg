@@ -3,6 +3,15 @@
 //! These types are accessed from both the UI thread (egui) and the
 //! background engine thread.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+/// Lock a `Mutex<PlaybackState>` safely, recovering from a poisoned mutex
+/// (e.g., if the engine thread panicked while holding the lock).
+/// Calling `.unwrap()` on a poisoned mutex panics, which crashes the UI.
+pub fn lock_state(state: &Arc<Mutex<PlaybackState>>) -> MutexGuard<'_, PlaybackState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Shared playback state (read/written by both engine thread and UI).
 #[derive(Clone)]
 pub struct PlaybackState {

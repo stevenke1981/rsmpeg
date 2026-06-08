@@ -11,7 +11,7 @@ mod playback;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -68,21 +68,24 @@ fn main() {
 
     let cli = Cli::parse();
 
-    match &cli.command {
+    // No subcommand → default to launching the GUI
+    let command = cli.command.unwrap_or(Commands::Gui { input: None });
+
+    match command {
         Commands::Probe {
             input,
             json,
             verbose,
-        } => cmd_probe(input, *json, *verbose),
+        } => cmd_probe(&input, json, verbose),
         Commands::Transcode {
             input,
             output,
             vcodec,
             acodec,
         } => {
-            cmd_transcode(input, output, vcodec.as_deref(), acodec.as_deref());
+            cmd_transcode(&input, &output, vcodec.as_deref(), acodec.as_deref());
         }
-        Commands::Play { input, info } => cmd_play(input, *info),
+        Commands::Play { input, info } => cmd_play(&input, info),
         Commands::ListFormats => cmd_list_formats(),
         Commands::ListCodecs => cmd_list_codecs(),
         Commands::Gui { input } => cmd_gui(input.as_deref()),

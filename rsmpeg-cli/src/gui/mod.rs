@@ -7,10 +7,12 @@ pub mod engine;
 pub mod state;
 pub mod ui;
 
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+
 use eframe::egui;
 use engine::PlaybackEngine;
 use state::FrameData;
-use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Application
@@ -78,7 +80,9 @@ impl eframe::App for MediaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain decoded video frames from the engine
         if let Some(ref engine) = self.engine {
+            let mut got_any_frame = false;
             while let Ok(frame) = engine.frame_rx.try_recv() {
+                got_any_frame = true;
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     [frame.width as usize, frame.height as usize],
                     &frame.rgba,
@@ -91,9 +95,29 @@ impl eframe::App for MediaApp {
                 self._latest_frame = Some(frame);
             }
 
-            // Check if playback ended
-            {
-                let s = self.state.lock().unwrap();
+            // Check if engine thread exited without ever sending a frame
+            if !got_any_frame && self._latest_frame.is_none() {
+                match engine.frame_rx.try_recv() {
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Engine died before producing any output
+                        let s = state::lock_state(&self.state);
+                        if s.status != "ended" && !s.status.is_empty() {
+                            self.status = format!("Playback error: {}", s.status);
+                        } else {
+                            self.status =
+                                "Error: Could not open or decode file. Try another file.".into();
+                        }
+                        self.file_path = None;
+                        self.engine = None;
+                        ctx.request_repaint();
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check if playback ended (poison-safe)
+            if self.engine.is_some() {
+                let s = state::lock_state(&self.state);
                 if s.status == "ended" {
                     self.status = "Playback complete".into();
                 }

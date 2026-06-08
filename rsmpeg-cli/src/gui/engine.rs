@@ -113,7 +113,7 @@ fn run_engine(
     // n_frames is codec-specific.  Try to get duration from the format
     // context if possible.
     {
-        let mut s = state.lock().unwrap();
+        let mut s = super::state::lock_state(&state);
         if let Some(ref t) = video_track.as_ref().or(audio_track.as_ref()) {
             s.duration_sec = t.codec_params.n_frames.unwrap_or(0) as f64;
         }
@@ -162,7 +162,7 @@ fn run_engine(
     if sink.is_some() && has_audio {
         // Apply initial volume
         {
-            let s = state.lock().unwrap();
+            let s = super::state::lock_state(&state);
             sink.as_ref().unwrap().set_volume(s.volume);
         }
     }
@@ -171,7 +171,7 @@ fn run_engine(
     loop {
         // Pause check
         {
-            let s = state.lock().unwrap();
+            let s = super::state::lock_state(&state);
             if !s.playing && s.status != "ended" {
                 drop(s);
                 thread::sleep(Duration::from_millis(16));
@@ -240,7 +240,7 @@ fn run_engine(
 
                             // Rough position update (~30 fps assumed)
                             {
-                                let mut s = state.lock().unwrap();
+                                let mut s = super::state::lock_state(&state);
                                 s.position_sec += 1.0 / 30.0;
                             }
                         }
@@ -316,7 +316,7 @@ fn run_engine(
         snk.sleep_until_end();
     }
 
-    state.lock().unwrap().status = "ended".into();
+    super::state::lock_state(&state).status = "ended".into();
 
     Ok(())
 }
