@@ -74,5 +74,16 @@ pub fn global_format_registry() -> &'static RwLock<FormatRegistry> {
 }
 
 pub fn register_builtin_formats() {
-    tracing::info!("No built-in formats registered yet");
+    use crate::demuxers::*;
+    let mut registry = global_format_registry()
+        .write()
+        .expect("format registry lock poisoned");
+
+    registry.register_demuxer(Box::new(MP4Demuxer));
+    registry.register_demuxer(Box::new(MKVDemuxer));
+    registry.register_demuxer(Box::new(AVIDemuxer));
+    registry.register_demuxer(Box::new(FLACDemuxer));
+    registry.register_demuxer(Box::new(WAVDemuxer));
+    registry.register_demuxer(Box::new(RawVideoDemuxer));
+    tracing::info!("Registered 6 built-in demuxers");
 }

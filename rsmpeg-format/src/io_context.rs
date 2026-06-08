@@ -50,6 +50,12 @@ impl IOContext {
         Ok(u64::from_be_bytes(buf))
     }
 
+    pub fn read_u16_le(&mut self) -> RsResult<u16> {
+        let mut buf = [0u8; 2];
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
     pub fn read_u32_le(&mut self) -> RsResult<u32> {
         let mut buf = [0u8; 4];
         self.read_exact(&mut buf)?;

@@ -21,6 +21,11 @@ pub struct FormatContext {
 }
 
 impl FormatContext {
+    /// Open a media file for reading and detect the container format.
+    ///
+    /// This peeks at the first bytes, probes registered demuxers and
+    /// magic-byte heuristics, and sets `format_name`. Use [`read_header`]
+    /// afterwards to actually parse the container headers and discover streams.
     pub fn open_input(path: impl AsRef<Path>) -> RsResult<Self> {
         let path = path.as_ref();
         let mut io = IOContext::open_file(path)?;
@@ -57,6 +62,7 @@ impl FormatContext {
         Ok(ctx)
     }
 
+    /// Open an output path (muxing).
     pub fn open_output(path: impl AsRef<Path>) -> RsResult<Self> {
         let path = path.as_ref();
         let ext = path
@@ -83,6 +89,57 @@ impl FormatContext {
         })
     }
 
+    /// Read the container header to discover streams.
+    ///
+    /// Must be called after [`open_input`]. Uses the detected `format_name`
+    /// to instantiate the appropriate built-in demuxer and parse the headers.
+    pub fn read_header(&mut self) -> RsResult<()> {
+        let format_name = self.format_name.clone().ok_or_else(|| {
+            RsError::InvalidData("No format detected, call open_input first".into())
+        })?;
+
+        let mut demuxer: Option<Box<dyn InputFormat>> = None;
+
+        // Match on format name to create a fresh demuxer instance.
+        // (Box<dyn InputFormat> is not Clone, so we cannot reuse a registry entry.)
+        match format_name.as_str() {
+            "mp4" | "mov" | "m4a" | "m4v" => {
+                demuxer = Some(Box::new(crate::demuxers::MP4Demuxer));
+            }
+            "matroska" | "mkv" | "webm" | "mka" | "mks" => {
+                demuxer = Some(Box::new(crate::demuxers::MKVDemuxer));
+            }
+            "avi" => {
+                demuxer = Some(Box::new(crate::demuxers::AVIDemuxer));
+            }
+            "flac" => {
+                demuxer = Some(Box::new(crate::demuxers::FLACDemuxer));
+            }
+            "wav" => {
+                demuxer = Some(Box::new(crate::demuxers::WAVDemuxer));
+            }
+            "rawvideo" | "raw" | "yuv" => {
+                demuxer = Some(Box::new(crate::demuxers::RawVideoDemuxer));
+            }
+            other => {
+                tracing::warn!("No built-in demuxer registered for format: {}", other);
+            }
+        }
+
+        if let Some(mut d) = demuxer {
+            d.read_header(self)?;
+            self.input = Some(d);
+            tracing::info!(
+                "Read header for '{}': {} stream(s)",
+                format_name,
+                self.streams.len()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Read one frame from the input.
     pub fn read_frame(&mut self) -> RsResult<Option<Packet>> {
         if let Some(mut input) = self.input.take() {
             let result = input.read_frame(self);
@@ -94,6 +151,7 @@ impl FormatContext {
         }
     }
 
+    /// Write a frame to the output.
     pub fn write_frame(&mut self, packet: &Packet) -> RsResult<()> {
         if let Some(mut output) = self.output.take() {
             let result = output.write_frame(self, packet);
@@ -105,14 +163,17 @@ impl FormatContext {
         }
     }
 
+    /// Add a stream to the context.
     pub fn add_stream(&mut self, stream: Stream) {
         self.streams.push(stream);
     }
 
+    /// Return the number of streams.
     pub fn nb_streams(&self) -> usize {
         self.streams.len()
     }
 
+    /// Find the index of the best stream of a given media type.
     pub fn find_best_stream(&self, media_type: rsmpeg_util::MediaType) -> Option<usize> {
         self.streams.iter().position(|s| s.media_type == media_type)
     }
