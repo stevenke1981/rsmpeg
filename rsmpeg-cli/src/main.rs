@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use rsmpeg::format::FormatContext;
 
 #[derive(Parser)]
 #[command(
@@ -20,6 +21,9 @@ enum Commands {
         /// Show JSON output
         #[arg(short, long)]
         json: bool,
+        /// Verbose output (show all codec parameters)
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Transcode media file from one format to another
     Transcode {
@@ -39,105 +43,257 @@ enum Commands {
         /// Input file path
         input: String,
     },
+    /// List registered demuxer formats
+    ListFormats,
+    /// List registered codecs
+    ListCodecs,
 }
 
 fn main() {
     tracing_subscriber::fmt::init();
 
+    // Register built-in components so the registries are populated
+    rsmpeg::format::format_registry::register_builtin_formats();
+    rsmpeg::codec::codec_registry::register_builtin_codecs();
+
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Probe { input, json } => cmd_probe(input, *json),
+        Commands::Probe {
+            input,
+            json,
+            verbose,
+        } => cmd_probe(input, *json, *verbose),
         Commands::Transcode {
             input,
             output,
             vcodec,
             acodec,
-        } => {
-            cmd_transcode(input, output, vcodec.as_deref(), acodec.as_deref());
-        }
+        } => cmd_transcode(input, output, vcodec.as_deref(), acodec.as_deref()),
         Commands::Play { input } => cmd_play(input),
+        Commands::ListFormats => cmd_list_formats(),
+        Commands::ListCodecs => cmd_list_codecs(),
     }
 }
 
-fn cmd_probe(input: &str, json: bool) {
-    match rsmpeg::format::FormatContext::open_input(input) {
-        Ok(ctx) => {
-            if json {
-                let info = serde_json::json!({
-                    "filename": ctx.filename,
-                    "format": ctx.format_name,
-                    "nb_streams": ctx.streams.len(),
-                    "duration": ctx.duration,
-                    "streams": ctx.streams.iter().map(|s| serde_json::json!({
-                        "index": s.index,
-                        "codec": format!("{:?}", s.codec_id),
-                        "media_type": format!("{:?}", s.media_type),
-                        "duration": s.duration,
-                    })).collect::<Vec<_>>(),
-                });
-                println!("{}", serde_json::to_string_pretty(&info).unwrap());
-            } else {
-                println!("File: {}", ctx.filename.as_deref().unwrap_or("unknown"));
-                println!(
-                    "Format: {}",
-                    ctx.format_name.as_deref().unwrap_or("unknown")
-                );
-                println!("Streams: {}", ctx.streams.len());
-                for stream in &ctx.streams {
-                    println!(
-                        "  Stream #{}: {:?} ({:?})",
-                        stream.index, stream.codec_id, stream.media_type
-                    );
-                }
-            }
-        }
+fn cmd_probe(input: &str, json: bool, verbose: bool) {
+    let mut ctx = match FormatContext::open_input(input) {
+        Ok(ctx) => ctx,
         Err(e) => {
             eprintln!("Error probing file: {}", e);
             std::process::exit(1);
+        }
+    };
+
+    // Read the container header to discover streams
+    if let Err(e) = ctx.read_header() {
+        eprintln!("Warning: could not read header: {}", e);
+    }
+
+    if json {
+        let streams: Vec<serde_json::Value> = ctx
+            .streams
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "index": s.index,
+                    "codec": format!("{:?}", s.codec_id),
+                    "media_type": format!("{:?}", s.media_type),
+                    "duration_ms": s.duration,
+                    "duration_sec": s.duration_seconds(),
+                })
+            })
+            .collect();
+
+        let info = serde_json::json!({
+            "filename": ctx.filename,
+            "format": ctx.format_name,
+            "nb_streams": ctx.streams.len(),
+            "duration_ms": ctx.duration,
+            "bit_rate": ctx.bit_rate,
+            "streams": streams,
+        });
+        println!("{}", serde_json::to_string_pretty(&info).unwrap());
+    } else {
+        println!();
+        println!("═══ Media Info ═══");
+        println!(
+            "  File:    {}",
+            ctx.filename.as_deref().unwrap_or("unknown")
+        );
+        println!(
+            "  Format:  {}",
+            ctx.format_name.as_deref().unwrap_or("unknown")
+        );
+        if ctx.duration > 0 {
+            println!(
+                "  Duration: {:.3}s ({} ms)",
+                ctx.duration as f64 / 1000.0,
+                ctx.duration
+            );
+        }
+        if ctx.bit_rate > 0 {
+            println!("  Bitrate: {} bps", ctx.bit_rate);
+        }
+        println!("  Streams: {}", ctx.streams.len());
+        println!();
+
+        for stream in &ctx.streams {
+            let icon = match stream.media_type {
+                rsmpeg::util::MediaType::Video => "🎬",
+                rsmpeg::util::MediaType::Audio => "🎵",
+                rsmpeg::util::MediaType::Subtitle => "📝",
+                _ => "📦",
+            };
+            let codec_name = format!("{:?}", stream.codec_id);
+            let media_name = format!("{:?}", stream.media_type);
+
+            if verbose {
+                println!("  {} Stream #{}", icon, stream.index);
+                println!("     Codec:     {}", codec_name);
+                println!("     Type:      {}", media_name);
+                println!(
+                    "     Duration:  {} ms ({:.3}s)",
+                    stream.duration,
+                    stream.duration_seconds()
+                );
+                if stream.codec_params.bit_rate.unwrap_or(0) > 0 {
+                    println!(
+                        "     Bitrate:   {} bps",
+                        stream.codec_params.bit_rate.unwrap()
+                    );
+                }
+                if stream.codec_params.width.unwrap_or(0) > 0 {
+                    println!("     Width:     {}", stream.codec_params.width.unwrap());
+                }
+                if stream.codec_params.height.unwrap_or(0) > 0 {
+                    println!("     Height:    {}", stream.codec_params.height.unwrap());
+                }
+                if stream.codec_params.sample_rate.unwrap_or(0) > 0 {
+                    println!(
+                        "     SampleRate: {} Hz",
+                        stream.codec_params.sample_rate.unwrap()
+                    );
+                }
+                if stream.codec_params.channels.unwrap_or(0) > 0 {
+                    println!("     Channels:  {}", stream.codec_params.channels.unwrap());
+                }
+                if let Some(fmt) = stream.codec_params.sample_format {
+                    println!("     SampleFmt: {:?}", fmt);
+                }
+                if stream.codec_params.pixel_format.is_some() {
+                    println!(
+                        "     PixelFmt:  {:?}",
+                        stream.codec_params.pixel_format.unwrap()
+                    );
+                }
+                if !stream.metadata.is_empty() {
+                    for (k, v) in stream.metadata.iter() {
+                        println!("     Metadata:  {} = {}", k, v);
+                    }
+                }
+            } else {
+                println!(
+                    "  {} Stream #{}: {} ({}) — {:.3}s",
+                    icon,
+                    stream.index,
+                    codec_name,
+                    media_name,
+                    stream.duration_seconds()
+                );
+            }
+            println!();
         }
     }
 }
 
 fn cmd_transcode(input: &str, output: &str, _vcodec: Option<&str>, _acodec: Option<&str>) {
-    eprintln!("Transcoding {} -> {}", input, output);
-    match rsmpeg::format::FormatContext::open_input(input) {
-        Ok(ctx) => {
-            println!(
-                "Input: {} ({} streams)",
-                ctx.filename.as_deref().unwrap_or("?"),
-                ctx.streams.len()
-            );
-            println!("Transcoding to: {}", output);
-            println!("Note: Full transcoding pipeline not yet implemented.");
-            println!(
-                "This is a skeleton — actual frame processing will be added in a future release."
-            );
-        }
+    let mut ctx = match FormatContext::open_input(input) {
+        Ok(ctx) => ctx,
         Err(e) => {
             eprintln!("Error opening input: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let _ = ctx.read_header();
+    println!(
+        "Input: {} ({}) — {} streams",
+        ctx.filename.as_deref().unwrap_or("?"),
+        ctx.format_name.as_deref().unwrap_or("?"),
+        ctx.streams.len()
+    );
+    println!("Output: {}", output);
+    println!("Note: Full transcoding pipeline not yet implemented.");
+    println!("This is a skeleton — actual frame processing will be added in a future release.");
+}
+
+fn cmd_play(input: &str) {
+    let mut ctx = match FormatContext::open_input(input) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            eprintln!("Error opening input: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let _ = ctx.read_header();
+    println!(
+        "Input: {} ({}) — {} streams",
+        ctx.filename.as_deref().unwrap_or("?"),
+        ctx.format_name.as_deref().unwrap_or("?"),
+        ctx.streams.len()
+    );
+    println!("Playback: audio device output not yet implemented (skeleton).");
+    println!(
+        "Run `rsmpeg probe \"{}\"` to inspect the file instead.",
+        input
+    );
+}
+
+fn cmd_list_formats() {
+    println!();
+    println!("═══ Registered Demuxers ═══");
+    let registry = rsmpeg::format::format_registry::global_format_registry();
+    match registry.read() {
+        Ok(reg) => {
+            for demuxer in reg.demuxers() {
+                println!(
+                    "  {} — {} ({})",
+                    demuxer.name(),
+                    demuxer.description(),
+                    demuxer.extensions().join(", ")
+                );
+            }
+            println!("  (Total: {} demuxers)", reg.demuxers().len());
+        }
+        Err(e) => {
+            eprintln!("Error reading format registry: {}", e);
             std::process::exit(1);
         }
     }
 }
 
-fn cmd_play(input: &str) {
-    eprintln!("Playing: {}", input);
-    match rsmpeg::format::FormatContext::open_input(input) {
-        Ok(ctx) => {
-            println!(
-                "Input: {} ({} streams)",
-                ctx.filename.as_deref().unwrap_or("?"),
-                ctx.streams.len()
-            );
-            println!("Playback: audio device output not yet implemented (skeleton).");
-            println!(
-                "Run `rsmpeg probe \"{}\"` to inspect the file instead.",
-                input
-            );
+fn cmd_list_codecs() {
+    println!();
+    println!("═══ Registered Codecs ═══");
+    let registry = rsmpeg::codec::codec_registry::global_codec_registry();
+    match registry.read() {
+        Ok(reg) => {
+            for codec in reg.list() {
+                let caps = if codec.capabilities().can_decode && codec.capabilities().can_encode {
+                    "dec/enc"
+                } else if codec.capabilities().can_decode {
+                    "decode"
+                } else if codec.capabilities().can_encode {
+                    "encode"
+                } else {
+                    "none"
+                };
+                println!("  {} — {} [{}]", codec.name(), codec.long_name(), caps);
+            }
+            println!("  (Total: {} codecs)", reg.len());
         }
         Err(e) => {
-            eprintln!("Error opening input: {}", e);
+            eprintln!("Error reading codec registry: {}", e);
             std::process::exit(1);
         }
     }

@@ -8,6 +8,10 @@
 fn main() {
     println!("=== rsmpeg Pipeline Example ===\n");
 
+    // Register built-in components
+    rsmpeg::format::format_registry::register_builtin_formats();
+    rsmpeg::codec::codec_registry::register_builtin_codecs();
+
     // 1. Version info
     println!("{}", rsmpeg::version_info());
     println!();

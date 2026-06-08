@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CodecId {
     // ── Video ──
+    RawVideo,
     Av1,
     Vp9,
     Vp8,
@@ -39,6 +40,7 @@ pub enum CodecId {
 impl CodecId {
     pub fn name(self) -> &'static str {
         match self {
+            CodecId::RawVideo => "rawvideo",
             CodecId::Av1 => "av1",
             CodecId::Vp9 => "vp9",
             CodecId::Vp8 => "vp8",
@@ -70,6 +72,7 @@ impl CodecId {
 
     pub fn from_name(s: &str) -> Option<Self> {
         match s {
+            "rawvideo" => Some(CodecId::RawVideo),
             "av1" => Some(CodecId::Av1),
             "vp9" => Some(CodecId::Vp9),
             "vp8" => Some(CodecId::Vp8),
@@ -102,7 +105,8 @@ impl CodecId {
     pub fn media_type(self) -> rsmpeg_util::MediaType {
         use rsmpeg_util::MediaType;
         match self {
-            CodecId::Av1
+            CodecId::RawVideo
+            | CodecId::Av1
             | CodecId::Vp9
             | CodecId::Vp8
             | CodecId::Theora

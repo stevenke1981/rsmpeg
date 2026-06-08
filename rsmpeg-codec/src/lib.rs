@@ -3,6 +3,7 @@
 pub mod codec;
 pub mod codec_context;
 pub mod codec_id;
+pub mod codec_impls;
 pub mod codec_parameters;
 pub mod codec_registry;
 pub mod frame;

@@ -55,9 +55,29 @@ pub fn global_codec_registry() -> &'static RwLock<CodecRegistry> {
 }
 
 pub fn register_builtin_codecs() {
-    // Built-in codecs will be registered here as they are implemented.
-    // For now, this is a placeholder.
-    tracing::info!("No built-in codecs registered — register with global_codec_registry().write()");
+    use crate::codec_impls::*;
+    use rsmpeg_util::SampleFormat;
+
+    let mut registry = global_codec_registry()
+        .write()
+        .expect("codec registry lock poisoned");
+
+    // Register raw video codec
+    registry.register(Box::new(RawVideoCodec));
+
+    // Register PCM audio codecs for common formats
+    for sample_fmt in &[
+        SampleFormat::U8,
+        SampleFormat::S16,
+        SampleFormat::S32,
+        SampleFormat::F32,
+    ] {
+        if let Some(codec) = PCMAudioCodec::new(*sample_fmt) {
+            registry.register(Box::new(codec));
+        }
+    }
+
+    tracing::info!("Registered {} built-in codecs", registry.len());
 }
 
 #[cfg(test)]
