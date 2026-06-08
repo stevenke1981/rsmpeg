@@ -1,20 +1,38 @@
 //! Media type enumeration.
 
-/// The type of a media stream.
-///
-/// Analogous to `AVMediaType` in FFmpeg.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+
+/// Media stream type, equivalent to FFmpeg's AVMediaType.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MediaType {
-    /// Video stream.
     Video,
-    /// Audio stream.
     Audio,
-    /// Subtitle stream.
     Subtitle,
-    /// Data stream.
     Data,
-    /// Attachment stream.
     Attachment,
-    /// Unknown stream type.
-    Unknown,
+}
+
+impl MediaType {
+    /// Return the string name of this media type.
+    pub fn name(self) -> &'static str {
+        match self {
+            MediaType::Video => "video",
+            MediaType::Audio => "audio",
+            MediaType::Subtitle => "subtitle",
+            MediaType::Data => "data",
+            MediaType::Attachment => "attachment",
+        }
+    }
+
+    /// Parse a media type from its string name.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "video" => Some(MediaType::Video),
+            "audio" => Some(MediaType::Audio),
+            "subtitle" => Some(MediaType::Subtitle),
+            "data" => Some(MediaType::Data),
+            "attachment" => Some(MediaType::Attachment),
+            _ => None,
+        }
+    }
 }
