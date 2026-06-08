@@ -2,7 +2,14 @@
 name = "rsmpeg-resample"
 version.workspace = true
 edition.workspace = true
-description = "Stub — will be implemented"
+license.workspace = true
+rust-version.workspace = true
+description = "Audio resampling, format conversion, and channel remapping (libswresample equivalent)"
+
 [lints]
 workspace = true
+
 [dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+rsmpeg-codec = { path = "../rsmpeg-codec" }
+tracing.workspace = true

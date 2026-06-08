@@ -103,6 +103,11 @@ dependencies = [
 [[package]]
 name = "rsmpeg-resample"
 version = "0.1.0"
+dependencies = [
+ "rsmpeg-codec",
+ "rsmpeg-util",
+ "tracing",
+]
 
 [[package]]
 name = "rsmpeg-scale"
