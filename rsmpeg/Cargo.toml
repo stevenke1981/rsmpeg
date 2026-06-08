@@ -2,7 +2,19 @@
 name = "rsmpeg"
 version.workspace = true
 edition.workspace = true
-description = "Stub — will be implemented"
+license.workspace = true
+rust-version.workspace = true
+description = "Pure Rust multimedia framework (FFmpeg equivalent)"
+
 [lints]
 workspace = true
+
 [dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+rsmpeg-codec = { path = "../rsmpeg-codec" }
+rsmpeg-format = { path = "../rsmpeg-format" }
+rsmpeg-filter = { path = "../rsmpeg-filter" }
+rsmpeg-scale = { path = "../rsmpeg-scale" }
+rsmpeg-resample = { path = "../rsmpeg-resample" }
+tracing.workspace = true
+serde_json.workspace = true
