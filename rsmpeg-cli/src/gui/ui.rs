@@ -130,12 +130,18 @@ fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
 
                         // --- Stop ---
                         if ui.button("\u{23F9} Stop").clicked() {
-                            let mut s = state::lock_state(&app.state);
-                            s.playing = false;
-                            s.position_sec = 0.0;
+                            {
+                                let mut s = state::lock_state(&app.state);
+                                s.playing = false;
+                                s.stop_requested = true;
+                                s.position_sec = 0.0;
+                            }
+                            if let Some(engine) = app.engine.take() {
+                                engine.stop();
+                                drop(engine);
+                            }
                             app._latest_frame = None;
                             app.texture = None;
-                            app.engine = None;
                             app.file_path = None;
                             app.status = "Stopped. Open a media file to start playback.".into();
                         }
@@ -148,7 +154,7 @@ fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
                         };
                         ui.add(
                             egui::ProgressBar::new(seek_f)
-                                .desired_width(ui.available_width().max(80.0).min(300.0)),
+                                .desired_width(ui.available_width().clamp(80.0, 300.0)),
                         );
 
                         // --- Time display ---

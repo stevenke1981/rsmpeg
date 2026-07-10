@@ -190,11 +190,8 @@ fn cmd_probe(input: &str, json: bool, verbose: bool) {
                         if let Some(fmt) = stream.codec_params.sample_format {
                             println!("     SampleFmt: {:?}", fmt);
                         }
-                        if stream.codec_params.pixel_format.is_some() {
-                            println!(
-                                "     PixelFmt:  {:?}",
-                                stream.codec_params.pixel_format.unwrap()
-                            );
+                        if let Some(pixel_format) = stream.codec_params.pixel_format {
+                            println!("     PixelFmt:  {:?}", pixel_format);
                         }
                         if !stream.metadata.is_empty() {
                             for (k, v) in stream.metadata.iter() {

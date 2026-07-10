@@ -56,11 +56,13 @@ impl PlaybackEngine {
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let (frame_tx, frame_rx) = mpsc::channel::<FrameData>();
         let state = Arc::new(Mutex::new(PlaybackState::default()));
-        let state_clone = state.clone();
+        let state_for_engine = state.clone();
+        let state_for_error = state.clone();
 
         let path_owned = path.to_string();
         let handle = thread::spawn(move || {
-            if let Err(e) = run_engine(&path_owned, frame_tx, state_clone) {
+            if let Err(e) = run_engine(&path_owned, frame_tx, state_for_engine) {
+                super::state::lock_state(&state_for_error).status = e.to_string();
                 eprintln!("  [gui] Engine error: {}", e);
             }
         });
@@ -70,6 +72,22 @@ impl PlaybackEngine {
             state,
             handle: Some(handle),
         })
+    }
+
+    /// Ask the playback thread to stop at the next safe packet boundary.
+    pub fn stop(&self) {
+        let mut state = super::state::lock_state(&self.state);
+        state.playing = false;
+        state.stop_requested = true;
+    }
+}
+
+impl Drop for PlaybackEngine {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -114,14 +132,18 @@ fn run_engine(
     // context if possible.
     {
         let mut s = super::state::lock_state(&state);
-        if let Some(ref t) = video_track.as_ref().or(audio_track.as_ref()) {
+        if let Some(t) = video_track.as_ref().or(audio_track.as_ref()) {
             s.duration_sec = t.codec_params.n_frames.unwrap_or(0) as f64;
         }
     }
 
     // ── OpenH264 decoder ──
     let mut h264 = if has_video {
-        match openh264::decoder::Decoder::new() {
+        match openh264::decoder::Decoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::decoder::DecoderConfig::new()
+                .flush_after_decode(openh264::decoder::Flush::NoFlush),
+        ) {
             Ok(d) => Some(d),
             Err(e) => {
                 eprintln!("  [gui] Warning: could not create H.264 decoder: {:?}", e);
@@ -159,19 +181,40 @@ fn run_engine(
         .ok()
         .and_then(|(_, handle)| Sink::try_new(handle).ok());
 
-    if sink.is_some() && has_audio {
+    if let (Some(sink), true) = (sink.as_ref(), has_audio) {
         // Apply initial volume
         {
             let s = super::state::lock_state(&state);
-            sink.as_ref().unwrap().set_volume(s.volume);
+            sink.set_volume(s.volume);
         }
     }
+
+    // ── Pre-extract H.264 extradata (SPS/PPS) to prepend to first frame ──
+    // OpenH264 requires SPS and PPS to appear as Annex B NAL units *inline*
+    // in the bitstream before any slice data.  For MP4 files these are stored
+    // in the avcC box, not in the sample data.  We prepend them to the first
+    // packet so the decoder sees SPS/PPS + slice data in one `decode()` call.
+    let (sps_pps_prefix, nal_length_size) = if h264.is_some() {
+        rsmpeg_cli::extract_avcc_from_mp4(path)
+            .map(|avcc| {
+                let nal_length_size = rsmpeg_cli::avcc_nal_length_size(&avcc).unwrap_or(4);
+                let annex_b = rsmpeg_cli::avcc_extradata_to_annex_b(&avcc);
+                (Some(annex_b), nal_length_size)
+            })
+            .unwrap_or((None, 4))
+    } else {
+        (None, 4)
+    };
+    let mut sps_pps_sent = false;
 
     // ── Playback loop ──
     loop {
         // Pause check
         {
             let s = super::state::lock_state(&state);
+            if s.stop_requested {
+                break;
+            }
             if !s.playing && s.status != "ended" {
                 drop(s);
                 thread::sleep(Duration::from_millis(16));
@@ -195,34 +238,24 @@ fn run_engine(
         let track_id = packet.track_id();
 
         // ── Video ──
-        let is_video = has_video
-            && h264.is_some()
-            && video_track.as_ref().map_or(false, |vt| vt.id == track_id);
+        let is_video =
+            has_video && h264.is_some() && video_track.as_ref().is_some_and(|vt| vt.id == track_id);
 
         if is_video {
             // AVCC (4-byte length prefix) -> Annex B (start-code prefix)
             let data: &[u8] = &packet.data;
-            let mut annex_b = Vec::with_capacity(data.len() + 32);
-            let mut i = 0;
-            while i + 4 <= data.len() {
-                let nal_size =
-                    u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-                i += 4;
-                if i + nal_size <= data.len() {
-                    annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                    annex_b.extend_from_slice(&data[i..i + nal_size]);
-                    i += nal_size;
-                } else {
-                    break;
-                }
-            }
+            let prefix = (!sps_pps_sent)
+                .then_some(sps_pps_prefix.as_deref())
+                .flatten();
+            let annex_b = rsmpeg_cli::avcc_packet_to_annex_b(data, nal_length_size, prefix);
+            sps_pps_sent = true;
 
             if !annex_b.is_empty() {
                 match h264.as_mut().unwrap().decode(&annex_b) {
                     Ok(Some(yuv)) => {
                         let (w, h) = yuv.dimensions();
                         if w > 0 && h > 0 {
-                            let rgb_len = (w * h * 3) as usize;
+                            let rgb_len = w * h * 3;
                             let mut rgb_buf = vec![0u8; rgb_len];
                             yuv.write_rgb8(&mut rgb_buf);
 
@@ -234,8 +267,8 @@ fn run_engine(
 
                             let _ = frame_tx.send(FrameData {
                                 rgba,
-                                width: w as usize,
-                                height: h as usize,
+                                width: w,
+                                height: h,
                             });
 
                             // Rough position update (~30 fps assumed)
@@ -249,7 +282,6 @@ fn run_engine(
                         // OpenH264 buffers internally; no output yet
                     }
                     Err(e) => {
-                        // B-frame reordering etc. — skip
                         eprintln!("  [gui] H.264 decode error: {:?}", e);
                     }
                 }
@@ -257,9 +289,7 @@ fn run_engine(
         }
 
         // ── Audio ──
-        let is_audio = has_audio
-            && audio_decoder.is_some()
-            && audio_track_id.map_or(false, |id| id == track_id);
+        let is_audio = has_audio && audio_decoder.is_some() && (audio_track_id == Some(track_id));
 
         if is_audio {
             match audio_decoder.as_mut().unwrap().decode(&packet) {
@@ -288,35 +318,45 @@ fn run_engine(
         }
     }
 
+    let stop_requested = super::state::lock_state(&state).stop_requested;
+
     // ── Flush remaining video frames ──
-    if let Some(ref mut dec) = h264 {
-        if let Ok(frames) = dec.flush_remaining() {
-            for yuv in &frames {
-                let (w, h) = yuv.dimensions();
-                if w > 0 && h > 0 {
-                    let rgb_len = (w * h * 3) as usize;
-                    let mut rgb_buf = vec![0u8; rgb_len];
-                    yuv.write_rgb8(&mut rgb_buf);
-                    let rgba: Vec<u8> = rgb_buf
-                        .chunks(3)
-                        .flat_map(|c| [c[0], c[1], c[2], 255])
-                        .collect();
-                    let _ = frame_tx.send(FrameData {
-                        rgba,
-                        width: w as usize,
-                        height: h as usize,
-                    });
+    if !stop_requested {
+        if let Some(ref mut dec) = h264 {
+            if let Ok(frames) = dec.flush_remaining() {
+                for yuv in &frames {
+                    let (w, h) = yuv.dimensions();
+                    if w > 0 && h > 0 {
+                        let rgb_len = w * h * 3;
+                        let mut rgb_buf = vec![0u8; rgb_len];
+                        yuv.write_rgb8(&mut rgb_buf);
+                        let rgba: Vec<u8> = rgb_buf
+                            .chunks(3)
+                            .flat_map(|c| [c[0], c[1], c[2], 255])
+                            .collect();
+                        let _ = frame_tx.send(FrameData {
+                            rgba,
+                            width: w,
+                            height: h,
+                        });
+                    }
                 }
             }
         }
     }
 
     // ── Wait for audio to finish ──
-    if let Some(ref snk) = sink {
-        snk.sleep_until_end();
+    if !stop_requested {
+        if let Some(ref snk) = sink {
+            snk.sleep_until_end();
+        }
     }
 
-    super::state::lock_state(&state).status = "ended".into();
+    if stop_requested {
+        super::state::lock_state(&state).status = "stopped".into();
+    } else {
+        super::state::lock_state(&state).status = "ended".into();
+    }
 
     Ok(())
 }

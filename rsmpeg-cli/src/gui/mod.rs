@@ -58,7 +58,10 @@ impl MediaApp {
     /// Load (or reload) a media file, stopping any current playback.
     pub fn load_file(&mut self, path: &str) {
         // Stop existing playback
-        self.engine = None;
+        if let Some(engine) = self.engine.take() {
+            engine.stop();
+            drop(engine);
+        }
         self._latest_frame = None;
         self.texture = None;
 
@@ -79,49 +82,59 @@ impl MediaApp {
 impl eframe::App for MediaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain decoded video frames from the engine
-        if let Some(ref engine) = self.engine {
+        let mut clear_engine = false;
+        if let Some(engine) = self.engine.as_ref() {
             let mut got_any_frame = false;
-            while let Ok(frame) = engine.frame_rx.try_recv() {
-                got_any_frame = true;
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                self.texture = Some(ctx.load_texture(
-                    "video_frame",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
-                self._latest_frame = Some(frame);
+            let mut disconnected = false;
+            loop {
+                match engine.frame_rx.try_recv() {
+                    Ok(frame) => {
+                        got_any_frame = true;
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                            [frame.width, frame.height],
+                            &frame.rgba,
+                        );
+                        self.texture = Some(ctx.load_texture(
+                            "video_frame",
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        self._latest_frame = Some(frame);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
 
             // Check if engine thread exited without ever sending a frame
-            if !got_any_frame && self._latest_frame.is_none() {
-                match engine.frame_rx.try_recv() {
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        // Engine died before producing any output
-                        let s = state::lock_state(&self.state);
-                        if s.status != "ended" && !s.status.is_empty() {
-                            self.status = format!("Playback error: {}", s.status);
-                        } else {
-                            self.status =
-                                "Error: Could not open or decode file. Try another file.".into();
-                        }
-                        self.file_path = None;
-                        self.engine = None;
-                        ctx.request_repaint();
-                    }
-                    _ => {}
+            if disconnected && !got_any_frame && self._latest_frame.is_none() {
+                // Engine died before producing any output
+                let s = state::lock_state(&self.state);
+                if s.status != "ended" && s.status != "stopped" && !s.status.is_empty() {
+                    self.status = format!("Playback error: {}", s.status);
+                } else {
+                    self.status = "Error: Could not open or decode file. Try another file.".into();
                 }
+                self.file_path = None;
+                clear_engine = true;
             }
 
             // Check if playback ended (poison-safe)
-            if self.engine.is_some() {
-                let s = state::lock_state(&self.state);
-                if s.status == "ended" {
-                    self.status = "Playback complete".into();
-                }
+            let s = state::lock_state(&self.state);
+            if s.status == "ended" {
+                self.status = "Playback complete".into();
+                clear_engine = disconnected;
+            } else if s.status == "stopped" {
+                clear_engine = disconnected;
             }
+        }
+
+        if clear_engine {
+            self.engine = None;
+            ctx.request_repaint();
         }
 
         // Render the UI

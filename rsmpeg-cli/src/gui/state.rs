@@ -16,6 +16,7 @@ pub fn lock_state(state: &Arc<Mutex<PlaybackState>>) -> MutexGuard<'_, PlaybackS
 #[derive(Clone)]
 pub struct PlaybackState {
     pub playing: bool,
+    pub stop_requested: bool,
     pub position_sec: f64,
     pub duration_sec: f64,
     pub status: String,
@@ -26,6 +27,7 @@ impl Default for PlaybackState {
     fn default() -> Self {
         Self {
             playing: true,
+            stop_requested: false,
             position_sec: 0.0,
             duration_sec: 0.0,
             status: String::new(),

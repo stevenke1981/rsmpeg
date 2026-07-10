@@ -35,11 +35,11 @@ fn track_is_video(t: &Track) -> bool {
         || (t.codec_params.sample_rate.is_none() && t.codec_params.codec != CODEC_TYPE_NULL)
 }
 
-fn find_audio_track<'a>(tracks: &'a [Track]) -> Option<&'a Track> {
+fn find_audio_track(tracks: &[Track]) -> Option<&Track> {
     tracks.iter().find(|t| track_is_audio(t))
 }
 
-fn find_video_track<'a>(tracks: &'a [Track]) -> Option<&'a Track> {
+fn find_video_track(tracks: &[Track]) -> Option<&Track> {
     tracks.iter().find(|t| track_is_video(t))
 }
 
@@ -49,6 +49,7 @@ fn find_video_track<'a>(tracks: &'a [Track]) -> Option<&'a Track> {
 
 /// Play a media file with both audio and video.
 pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path_str = path.to_string();
     let path = std::path::Path::new(path);
     let file = Box::new(File::open(path)?);
 
@@ -78,7 +79,11 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup OpenH264 decoder if we have video
     let mut h264_decoder = if has_video {
-        match openh264::decoder::Decoder::new() {
+        match openh264::decoder::Decoder::with_api_config(
+            openh264::OpenH264API::from_source(),
+            openh264::decoder::DecoderConfig::new()
+                .flush_after_decode(openh264::decoder::Flush::NoFlush),
+        ) {
             Ok(d) => Some(d),
             Err(e) => {
                 eprintln!("  Warning: could not create H.264 decoder: {:?}", e);
@@ -182,6 +187,23 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // ── Pre-extract H.264 extradata (SPS/PPS) to prepend to first frame ──
+    // OpenH264 requires SPS/PPS inline; MP4 stores them in avcC box.
+    // We prepend them to the first packet so the decoder sees SPS/PPS + slice
+    // data in one `decode()` call instead of a separate feed.
+    let (sps_pps_prefix, nal_length_size) = if h264_decoder.is_some() {
+        rsmpeg_cli::extract_avcc_from_mp4(&path_str)
+            .map(|avcc| {
+                let nal_length_size = rsmpeg_cli::avcc_nal_length_size(&avcc).unwrap_or(4);
+                let annex_b = rsmpeg_cli::avcc_extradata_to_annex_b(&avcc);
+                (Some(annex_b), nal_length_size)
+            })
+            .unwrap_or((None, 4))
+    } else {
+        (None, 4)
+    };
+    let mut sps_pps_sent = false;
+
     // Pixel buffer for display (RGBA32 format, 0x00RRGGBB)
     let mut pixel_buffer: Vec<u32> = vec![0; window_width * window_height];
 
@@ -214,29 +236,18 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Process video packet
         let is_video_packet = has_video
             && h264_decoder.is_some()
-            && video_track.map_or(false, |vt| vt.id == packet_track_id);
+            && video_track.is_some_and(|vt| vt.id == packet_track_id);
 
         if is_video_packet {
-            // MP4 stores H.264 in AVCC format (4-byte length prefixes).
+            // MP4 stores H.264 in AVCC format (length-prefixed NAL units).
             // OpenH264 handles both AVCC and Annex B, but Annex B is more
             // universal. Convert AVCC → Annex B:
             let data: &[u8] = &packet.data;
-            let mut annex_b = Vec::with_capacity(data.len() + 32);
-            let mut i = 0;
-            while i + 4 <= data.len() {
-                let nal_size =
-                    u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-                i += 4;
-                if i + nal_size <= data.len() {
-                    // Write start code
-                    annex_b.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                    // Write NAL unit
-                    annex_b.extend_from_slice(&data[i..i + nal_size]);
-                    i += nal_size;
-                } else {
-                    break;
-                }
-            }
+            let prefix = (!sps_pps_sent)
+                .then_some(sps_pps_prefix.as_deref())
+                .flatten();
+            let annex_b = rsmpeg_cli::avcc_packet_to_annex_b(data, nal_length_size, prefix);
+            sps_pps_sent = true;
 
             // Decode H.264
             if !annex_b.is_empty() {
@@ -281,9 +292,8 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Process audio packet
-        let is_audio_packet = has_audio
-            && audio_decoder.is_some()
-            && audio_track_id.map_or(false, |id| id == packet_track_id);
+        let is_audio_packet =
+            has_audio && audio_decoder.is_some() && (audio_track_id == Some(packet_track_id));
 
         if is_audio_packet {
             match audio_decoder.as_mut().unwrap().decode(&packet) {
@@ -370,6 +380,7 @@ fn play_audio_from_channel(
 }
 
 /// Play only audio (no video window) — used when there's no video track.
+#[allow(dead_code)]
 pub fn play_audio_file(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(path);
     let file = Box::new(File::open(path)?);
