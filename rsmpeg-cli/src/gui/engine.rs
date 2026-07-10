@@ -8,7 +8,7 @@ use std::fs::File;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openh264::formats::YUVSource;
 use rodio::{OutputStream, Sink};
@@ -125,6 +125,19 @@ fn run_engine(
 
     let has_video = video_track.is_some();
     let has_audio = audio_track.is_some();
+
+    // Video timing basis for frame pacing.  Frames are sent to the UI at their
+    // presentation timestamp so the video plays at its native rate and stays
+    // in sync with the real-time audio sink (instead of racing ahead at decode
+    // speed).  Falls back to the declared frame rate, then 30 fps.
+    let video_time_base = video_track.as_ref().and_then(|t| t.codec_params.time_base);
+    let sec_per_tick = video_time_base
+        .map(|tb| tb.numer as f64 / tb.denom.max(1) as f64)
+        .filter(|s| s.is_finite() && *s > 0.0);
+    let assumed_frame_dur = 1.0 / 30.0;
+    let mut playback_start: Option<Instant> = None;
+    let mut first_video_pts: u64 = 0;
+    let mut video_frame_index: u64 = 0;
 
     // ── Duration ──
     // Symphonia doesn't expose total duration directly from the probe;
@@ -243,6 +256,7 @@ fn run_engine(
 
         if is_video {
             // AVCC (4-byte length prefix) -> Annex B (start-code prefix)
+            let packet_pts = packet.ts();
             let data: &[u8] = &packet.data;
             let prefix = (!sps_pps_sent)
                 .then_some(sps_pps_prefix.as_deref())
@@ -265,16 +279,48 @@ fn run_engine(
                                 .flat_map(|c| [c[0], c[1], c[2], 255])
                                 .collect();
 
+                            // ── Pace this frame to its presentation time ──
+                            // Anchor the clock on the first frame, then sleep
+                            // until the frame's PTS-relative target so the UI
+                            // receives frames at the correct rate.
+                            let target_delay = match sec_per_tick {
+                                Some(spt) => {
+                                    if playback_start.is_none() {
+                                        first_video_pts = packet_pts;
+                                    }
+                                    let ticks = packet_pts.saturating_sub(first_video_pts) as f64;
+                                    Duration::from_secs_f64(ticks * spt)
+                                }
+                                None => Duration::from_secs_f64(
+                                    video_frame_index as f64 * assumed_frame_dur,
+                                ),
+                            };
+                            if playback_start.is_none() {
+                                playback_start = Some(Instant::now());
+                            }
+                            if let Some(t0) = playback_start {
+                                let elapsed = t0.elapsed();
+                                if target_delay > elapsed {
+                                    thread::sleep(target_delay - elapsed);
+                                }
+                            }
+                            video_frame_index += 1;
+
                             let _ = frame_tx.send(FrameData {
                                 rgba,
                                 width: w,
                                 height: h,
                             });
 
-                            // Rough position update (~30 fps assumed)
+                            // Update playhead from the real presentation time.
                             {
                                 let mut s = super::state::lock_state(&state);
-                                s.position_sec += 1.0 / 30.0;
+                                s.position_sec = match sec_per_tick {
+                                    Some(spt) => {
+                                        packet_pts.saturating_sub(first_video_pts) as f64 * spt
+                                    }
+                                    None => video_frame_index as f64 * assumed_frame_dur,
+                                };
                             }
                         }
                     }

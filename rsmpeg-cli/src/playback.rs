@@ -154,6 +154,16 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let window_width: usize = 640;
     let window_height: usize = 480;
 
+    // Video timing basis for frame pacing.  We present each decoded frame at
+    // its presentation timestamp (PTS) so playback runs at the correct real
+    // rate and stays in sync with the audio sink.  When PTS/timebase are
+    // missing we fall back to the declared frame rate, then 30 fps.
+    let video_time_base = video_track.and_then(|t| t.codec_params.time_base);
+    let sec_per_tick = video_time_base
+        .map(|tb| tb.numer as f64 / tb.denom.max(1) as f64)
+        .filter(|s| s.is_finite() && *s > 0.0);
+    let assumed_frame_dur = 1.0 / 30.0;
+
     let file_name = path
         .file_name()
         .unwrap_or_default()
@@ -167,8 +177,7 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             window_height,
             minifb::WindowOptions::default(),
         ) {
-            Ok(mut w) => {
-                w.set_target_fps(60);
+            Ok(w) => {
                 println!(
                     "  Video window: {}x{} (stream may differ)",
                     window_width, window_height
@@ -207,6 +216,12 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Pixel buffer for display (RGBA32 format, 0x00RRGGBB)
     let mut pixel_buffer: Vec<u32> = vec![0; window_width * window_height];
 
+    // Frame pacing state.  `start` is anchored to the first presented frame;
+    // subsequent frames sleep until their PTS-relative target time.
+    let mut playback_start: Option<Instant> = None;
+    let mut first_video_pts: u64 = 0;
+    let mut video_frame_index: u64 = 0;
+
     // Playback loop — read packets, decode, display
     let mut video_frame_count = 0u64;
     let start_time = Instant::now();
@@ -218,6 +233,8 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 break 'playback;
             }
         }
+
+        let mut new_frame_decoded = false;
 
         // Read next packet
         let packet = match format.next_packet() {
@@ -242,6 +259,7 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             // MP4 stores H.264 in AVCC format (length-prefixed NAL units).
             // OpenH264 handles both AVCC and Annex B, but Annex B is more
             // universal. Convert AVCC → Annex B:
+            let packet_pts = packet.ts();
             let data: &[u8] = &packet.data;
             let prefix = (!sps_pps_sent)
                 .then_some(sps_pps_prefix.as_deref())
@@ -262,21 +280,52 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                             let mut rgb_buf = vec![0u8; rgb_len];
                             yuv.write_rgb8(&mut rgb_buf);
 
-                            // Convert RGB8 (3 bytes per pixel) to RGBA32 (u32 per pixel)
+                            // Convert RGB8 (3 bytes/pixel) -> RGBA32 (u32/pixel).
+                            // copy_w/copy_h are bounded by w/h, so the source
+                            // indices are always in range; the per-pixel bounds
+                            // check is dropped for speed.
                             let copy_w = w.min(window_width);
                             let copy_h = h.min(window_height);
                             for y in 0..copy_h {
+                                let src_row = y * w;
+                                let dst_row = y * window_width;
                                 for x in 0..copy_w {
-                                    let src_idx = (y * w + x) * 3;
-                                    let dst_idx = y * window_width + x;
-                                    if src_idx + 2 < rgb_buf.len() {
-                                        let r = rgb_buf[src_idx] as u32;
-                                        let g = rgb_buf[src_idx + 1] as u32;
-                                        let b = rgb_buf[src_idx + 2] as u32;
-                                        pixel_buffer[dst_idx] = (r << 16) | (g << 8) | b;
-                                    }
+                                    let si = (src_row + x) * 3;
+                                    let di = dst_row + x;
+                                    pixel_buffer[di] = ((rgb_buf[si] as u32) << 16)
+                                        | ((rgb_buf[si + 1] as u32) << 8)
+                                        | (rgb_buf[si + 2] as u32);
                                 }
                             }
+
+                            // ── Pace this frame to its presentation time ──
+                            // Anchor the clock on the first presented frame, then
+                            // sleep until the frame's target delay has elapsed so
+                            // the video plays at its native rate and stays in sync
+                            // with the real-time audio sink.
+                            let target_delay = match sec_per_tick {
+                                Some(spt) => {
+                                    if playback_start.is_none() {
+                                        first_video_pts = packet_pts;
+                                    }
+                                    let ticks = packet_pts.saturating_sub(first_video_pts) as f64;
+                                    std::time::Duration::from_secs_f64(ticks * spt)
+                                }
+                                None => std::time::Duration::from_secs_f64(
+                                    video_frame_index as f64 * assumed_frame_dur,
+                                ),
+                            };
+                            if playback_start.is_none() {
+                                playback_start = Some(Instant::now());
+                            }
+                            if let Some(t0) = playback_start {
+                                let elapsed = t0.elapsed();
+                                if target_delay > elapsed {
+                                    thread::sleep(target_delay - elapsed);
+                                }
+                            }
+                            video_frame_index += 1;
+                            new_frame_decoded = true;
                         }
                     }
                     Ok(None) => {
@@ -319,9 +368,16 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Update window
+        // Update window — render a fresh frame only when one was decoded.
+        // For audio-only packets we just pump the event loop (no buffer
+        // re-upload, no fps throttle) so the picture stays put and the
+        // window stays responsive without slowing the video down.
         if let Some(ref mut w) = window {
-            let _ = w.update_with_buffer(&pixel_buffer, window_width, window_height);
+            if new_frame_decoded {
+                let _ = w.update_with_buffer(&pixel_buffer, window_width, window_height);
+            } else {
+                let _ = w.update();
+            }
         }
     }
 
@@ -356,26 +412,26 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Play audio from a channel feed (runs in a separate thread).
-/// Collects all samples from the channel, then plays them through rodio.
+/// Starts the rodio output immediately and appends each decoded chunk as it
+/// arrives, so audio plays in real time and stays aligned with the
+/// PTS-paced video instead of buffering the whole file up front.
 fn play_audio_from_channel(
     rx: mpsc::Receiver<Vec<i16>>,
     channels: u16,
     sample_rate: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Collect all audio samples from the channel
-    let mut all_samples: Vec<i16> = Vec::new();
+    let (_stream, stream_handle) = OutputStream::try_default()?;
+    let sink = Sink::try_new(&stream_handle)?;
+
     while let Ok(samples) = rx.recv() {
-        all_samples.extend(samples);
-    }
-
-    if !all_samples.is_empty() {
-        let (_stream, stream_handle) = OutputStream::try_default()?;
-        let sink = Sink::try_new(&stream_handle)?;
-        let source = rodio::buffer::SamplesBuffer::new(channels, sample_rate, all_samples);
+        if samples.is_empty() {
+            continue;
+        }
+        let source = rodio::buffer::SamplesBuffer::new(channels, sample_rate, samples);
         sink.append(source);
-        sink.sleep_until_end();
     }
 
+    sink.sleep_until_end();
     Ok(())
 }
 
