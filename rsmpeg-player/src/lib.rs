@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio_convert;
+pub mod audio_ring_buffer;
 pub mod backend;
 pub mod clock;
 pub mod codec_detect;
@@ -16,6 +17,7 @@ pub mod h264_bitstream;
 pub mod native_pipeline;
 pub mod player;
 pub mod queue;
+pub mod scaler_cache;
 pub mod video_convert;
 pub mod video_scheduler;
 

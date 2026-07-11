@@ -562,21 +562,21 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 不再以 rodio source 數量當作 queue 長度
-- [ ] 建立固定容量 sample ring buffer
-- [ ] 容量以毫秒或 sample 數表示
-- [ ] 預設目標 buffer 約 100–250 ms
+- [x] 不再以 rodio source 數量當作 queue 長度（改以 PcmRingBuffer 樣本數估算 + rodio backstop）
+- [x] 建立固定容量 sample ring buffer
+- [x] 容量以毫秒或 sample 數表示（200 ms 目標）
+- [x] 預設目標 buffer 約 100–250 ms
 - [ ] 設定低水位
 - [ ] 設定高水位
-- [ ] 防止 overflow
-- [ ] 偵測 underflow
+- [x] 防止 overflow
+- [x] 偵測 underflow
 - [ ] underflow 時輸出 silence 並回報統計
-- [ ] seek 時清空 ring buffer
+- [x] seek 時清空 ring buffer
 - [ ] pause 時停止讀取
 - [ ] resume 時重新預填
 - [ ] 支援取得已播放 sample 數
 - [ ] 支援取得 queued sample 數
-- [ ] 建立 thread-safe lock-free 或低鎖設計
+- [x] 建立 thread-safe lock-free 或低鎖設計
 - [ ] 新增長時間記憶體穩定測試
 
 ---
@@ -620,7 +620,7 @@ pub trait Decoder: Send {
 - [ ] 支援 gamma／transfer metadata
 - [x] 對未知色彩資訊使用合理預設並記錄警告
 - [x] Scaler 可重用 context
-- [ ] 解析度不變時不得每 frame 重建 scaler（video_convert 目前每 frame new）
+- [x] 解析度不變時不得每 frame 重建 scaler（ScalerCache 按 (w,h) 重用）
 - [ ] resolution change 時可重新配置
 - [x] 新增色彩準確度測試
 - [ ] 新增 stride 非等於 width 的測試
@@ -748,7 +748,7 @@ Seek 時必須：
 - [ ] reset A/V clocks
 - [ ] demux seek 到 target 前最近 keyframe
 - [ ] 解碼 target 前必要的 reference frames
-- [ ] 丟棄 PTS < target 的視訊 frame
+- [x] 丟棄 PTS < target 的視訊 frame（VideoScheduler::drop_before_seek，native + fallback）
 - [ ] 丟棄或裁切 target 前的音訊 samples
 - [ ] 顯示第一個 PTS >= target 的畫面
 - [ ] 恢復播放或保持 pause 狀態

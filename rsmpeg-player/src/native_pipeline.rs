@@ -86,7 +86,7 @@ fn run_native_inner(
     use crate::audio_convert::frame_to_s16_device;
     use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
     use crate::backend::OpenH264Decoder;
-    use crate::video_convert::yuv420p_frame_to_rgba;
+    use crate::video_convert::yuv420p_frame_to_rgba_cached;
 
     emit(
         event_tx,
@@ -485,7 +485,7 @@ fn run_native_inner(
                                     video_frame_index += 1;
                                     position = frame_pts;
                                     if present || force_one_frame {
-                                        if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                                        if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
                                             emit(
                                                 event_tx,
                                                 PlayerEvent::VideoFrame {
@@ -591,7 +591,7 @@ fn run_native_inner(
                 loop {
                     match dec.receive_frame() {
                         Ok(DecodeStatus::Frame(f)) => {
-                            if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                            if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
                                 let w = f.width;
                                 let h = f.height;
                                 if w > 0 && h > 0 {

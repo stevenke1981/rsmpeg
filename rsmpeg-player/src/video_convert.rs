@@ -38,6 +38,13 @@ pub fn yuv420p_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
         .ok_or_else(|| RsError::Bug("scaler produced empty RGBA plane list".into()))
 }
 
+/// Cached variant of [`yuv420p_frame_to_rgba`] that reuses a per-resolution
+/// [`rsmpeg_scale::Scaler`] (see [`crate::scaler_cache`]). Byte-identical
+/// output to [`yuv420p_frame_to_rgba`] for the same input frame.
+pub fn yuv420p_frame_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
+    crate::scaler_cache::yuv420p_to_rgba_cached(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +87,12 @@ mod tests {
         let mut frame = solid_yuv420p(4, 4, 16, 128, 128);
         frame.pixel_format = PixelFormat::Rgb24;
         assert!(yuv420p_frame_to_rgba(&frame).is_err());
+    }
+
+    #[test]
+    fn cached_convert_to_rgba_len() {
+        let frame = solid_yuv420p(16, 10, 16, 128, 128);
+        let rgba = yuv420p_frame_to_rgba_cached(&frame).unwrap();
+        assert_eq!(rgba.len(), 16 * 10 * 4);
     }
 }

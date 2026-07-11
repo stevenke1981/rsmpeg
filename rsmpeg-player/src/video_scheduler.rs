@@ -107,6 +107,15 @@ impl VideoScheduler {
     pub fn mark_displayed(&mut self) {
         self.stats.displayed = self.stats.displayed.saturating_add(1);
     }
+
+    /// Returns `true` if a frame at `frame_pts` should be DROPPED because a seek
+    /// targeted `target` and this frame plays before it.
+    ///
+    /// Used after a Seek to discard pre-roll frames whose presentation timestamp
+    /// is earlier than the seek position. Frames exactly at `target` are kept.
+    pub fn drop_before_seek(&self, frame_pts: Duration, target: Duration) -> bool {
+        frame_pts < target
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +182,18 @@ mod tests {
         assert_eq!(s.stats().displayed, 1);
         s.reset_stats();
         assert_eq!(s.stats().displayed, 0);
+    }
+
+    #[test]
+    fn drop_when_before_target() {
+        let s = VideoScheduler::new();
+        assert!(s.drop_before_seek(Duration::from_millis(100), Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn keep_when_at_or_after_target() {
+        let s = VideoScheduler::new();
+        assert!(!s.drop_before_seek(Duration::from_millis(500), Duration::from_millis(500)));
+        assert!(!s.drop_before_seek(Duration::from_millis(900), Duration::from_millis(500)));
     }
 }

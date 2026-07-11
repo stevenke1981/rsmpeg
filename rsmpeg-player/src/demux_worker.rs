@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::audio_convert::frame_to_s16_device;
+use crate::audio_ring_buffer::PcmRingBuffer;
 use crate::codec_detect::{
     classify_track, find_audio_track, find_h264_video_track, find_unsupported_video, TrackKind,
 };
@@ -321,6 +322,14 @@ fn run_worker(
     let mut base_video_pts: Option<i64> = None;
     let mut video_frame_index = 0u64;
 
+    // ── Sample-based audio throttle ──
+    const AUDIO_TARGET_MS: u64 = 200;
+    let mut audio_target_samples: usize = 0;
+    let mut audio_ring = PcmRingBuffer::new(0);
+    let mut audio_play_start: Option<Instant> = None;
+    let mut audio_played_base: u64 = 0;
+    let mut drop_until: Option<Duration> = None;
+
     // ── Video decoder (OpenH264 backend) ──
     let avcc_blob = video_track
         .as_ref()
@@ -497,6 +506,12 @@ fn run_worker(
                                 }
                             };
                             position = Duration::from_secs_f64(capped);
+                            drop_until = Some(position);
+                            // Reset the approximate sample throttle so a seek
+                            // while paused can never leave the ring permanently full.
+                            audio_ring.clear();
+                            audio_play_start = None;
+                            audio_played_base = 0;
                             let _ = format.seek(
                                 SeekMode::Coarse,
                                 SeekTo::Time {
@@ -581,6 +596,19 @@ fn run_worker(
         }
 
         if let Some(ref s) = sink {
+            // Sample-based throttle (approximate, rodio backstop below is authoritative).
+            if let Some(t0) = audio_play_start {
+                if playing {
+                    let played = (t0.elapsed().as_secs_f64() * audio_rate as f64) as u64
+                        * audio_channels as u64;
+                    audio_ring.consume(played.saturating_sub(audio_played_base) as usize);
+                    audio_played_base = played;
+                }
+            }
+            if !audio_ring.is_empty() && audio_ring.len() >= audio_ring.capacity() {
+                thread::sleep(Duration::from_millis(4));
+                continue;
+            }
             if s.len() >= MAX_AUDIO_QUEUE_SOURCES {
                 thread::sleep(Duration::from_millis(4));
                 continue;
@@ -663,26 +691,39 @@ fn run_worker(
                                     }
                                     video_frame_index += 1;
                                     position = Duration::from_secs_f64(abs_pos.max(0.0));
+                                    let mut emit_frame = true;
+                                    if let Some(t) = drop_until {
+                                        if video_scheduler.drop_before_seek(position, t) {
+                                            emit_frame = false;
+                                        } else {
+                                            drop_until = None;
+                                        }
+                                    }
+                                    if force_one_frame {
+                                        emit_frame = true;
+                                    }
                                     if present || force_one_frame {
-                                        if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
-                                            emit(
-                                                &event_tx,
-                                                PlayerEvent::VideoFrame {
-                                                    width: w,
-                                                    height: h,
-                                                    rgba,
-                                                    pts: position,
-                                                    generation,
-                                                },
-                                            );
-                                            force_one_frame = false;
-                                            emit(
-                                                &event_tx,
-                                                PlayerEvent::PositionChanged {
-                                                    position,
-                                                    generation,
-                                                },
-                                            );
+                                        if emit_frame {
+                                            if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                                                emit(
+                                                    &event_tx,
+                                                    PlayerEvent::VideoFrame {
+                                                        width: w,
+                                                        height: h,
+                                                        rgba,
+                                                        pts: position,
+                                                        generation,
+                                                    },
+                                                );
+                                                force_one_frame = false;
+                                                emit(
+                                                    &event_tx,
+                                                    PlayerEvent::PositionChanged {
+                                                        position,
+                                                        generation,
+                                                    },
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -718,6 +759,13 @@ fn run_worker(
                                 if f.sample_rate > 0 {
                                     audio_rate = f.sample_rate;
                                 }
+                                if audio_target_samples == 0 && audio_rate > 0 && audio_channels > 0
+                                {
+                                    audio_target_samples =
+                                        (AUDIO_TARGET_MS * audio_rate as u64 / 1000) as usize
+                                            * audio_channels as usize;
+                                    audio_ring = PcmRingBuffer::new(audio_target_samples);
+                                }
                                 let samples = frame_to_s16_device(
                                     &f,
                                     audio_rate.max(1),
@@ -725,12 +773,16 @@ fn run_worker(
                                 )
                                 .unwrap_or_default();
                                 if !samples.is_empty() {
+                                    audio_ring.push(&samples);
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
                                             audio_channels,
                                             audio_rate,
                                             samples,
                                         ));
+                                    }
+                                    if audio_play_start.is_none() && playing {
+                                        audio_play_start = Some(Instant::now());
                                     }
                                 }
                                 // Drive position from audio when no video.
