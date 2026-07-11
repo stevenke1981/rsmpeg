@@ -263,6 +263,7 @@ mod tests {
             sample_format: Some(sample_format),
             bit_rate: None,
             extradata: None,
+            h264_bitstream_format: Default::default(),
         });
 
         let packet = Packet {

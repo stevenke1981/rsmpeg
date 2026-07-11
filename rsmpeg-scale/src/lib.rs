@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-pub mod scaler;
 pub mod colorspace;
+pub mod scaler;
 
-pub use scaler::{Scaler, ScalerConfig, ScalerFlags, InterpolationMethod};
-pub use colorspace::{ColorSpace, ColorRange, ColorConversion};
+pub use colorspace::{ColorConversion, ColorRange, ColorSpace};
+pub use scaler::{InterpolationMethod, Scaler, ScalerConfig, ScalerFlags};

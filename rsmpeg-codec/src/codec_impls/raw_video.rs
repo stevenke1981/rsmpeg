@@ -214,6 +214,7 @@ mod tests {
             sample_format: None,
             bit_rate: None,
             extradata: None,
+            h264_bitstream_format: Default::default(),
         }
     }
 

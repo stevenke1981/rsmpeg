@@ -109,10 +109,7 @@ fn render_welcome(app: &mut MediaApp, ctx: &egui::Context) {
                     "Release to open media file",
                 );
             } else {
-                ui.colored_label(
-                    Color32::GRAY,
-                    "or drag & drop a video / audio file here",
-                );
+                ui.colored_label(Color32::GRAY, "or drag & drop a video / audio file here");
             }
         });
     });

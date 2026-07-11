@@ -104,6 +104,7 @@ impl InputFormat for WAVDemuxer {
             channels: Some(channels),
             bit_rate: Some(bit_rate),
             extradata: None,
+            h264_bitstream_format: Default::default(),
         };
         stream.duration = duration_ms;
         ctx.duration = duration_ms;

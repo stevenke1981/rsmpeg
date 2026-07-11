@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-pub mod resampler;
 pub mod channel_mapping;
 pub mod dither;
+pub mod resampler;
 
-pub use resampler::{Resampler, ResamplerConfig, ResamplerFlags};
 pub use channel_mapping::ChannelMapping;
 pub use dither::{DitherMethod, NoiseShaping};
+pub use resampler::{Resampler, ResamplerConfig, ResamplerFlags};

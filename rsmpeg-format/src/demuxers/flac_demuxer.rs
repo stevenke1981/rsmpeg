@@ -127,6 +127,7 @@ impl InputFormat for FLACDemuxer {
             channels: Some(channels),
             bit_rate: None,
             extradata: None,
+            h264_bitstream_format: Default::default(),
         };
         stream.duration = duration_ms;
         ctx.duration = duration_ms;

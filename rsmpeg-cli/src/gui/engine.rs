@@ -12,9 +12,15 @@ use std::time::{Duration, Instant};
 
 use openh264::formats::YUVSource;
 use rodio::{OutputStream, Sink};
+use rsmpeg_cli::codec_detect::{
+    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video, TrackKind,
+};
+use rsmpeg_cli::h264_bitstream::{
+    avcc_extradata_to_annex_b, avcc_nal_length_size, extract_avcc_streaming, packet_for_decoder,
+    H264BitstreamFormat,
+};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::codecs::CODEC_TYPE_NULL;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, Track};
 use symphonia::core::io::MediaSourceStream;
@@ -79,19 +85,6 @@ fn yuv_frame_to_rgba(yuv: &openh264::decoder::DecodedYUV<'_>) -> Vec<u8> {
     let mut rgba = vec![0u8; w * h * 4];
     yuv.write_rgba8(&mut rgba);
     rgba
-}
-
-// ---------------------------------------------------------------------------
-// Track detection helpers
-// ---------------------------------------------------------------------------
-
-fn track_is_audio(t: &Track) -> bool {
-    t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some()
-}
-
-fn track_is_video(t: &Track) -> bool {
-    t.codec_params.codec == CODEC_TYPE_NULL
-        || (t.codec_params.sample_rate.is_none() && t.codec_params.codec != CODEC_TYPE_NULL)
 }
 
 // ---------------------------------------------------------------------------
@@ -174,14 +167,41 @@ fn run_engine(
     let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
     let mut format = probed.format;
 
-    // ── Find tracks ──
+    // ── Find tracks (explicit codec detection — never assume NULL ⇒ H.264) ──
     let tracks = format.tracks().to_vec();
 
-    let video_track: Option<Track> = tracks.iter().find(|t| track_is_video(t)).cloned();
-    let audio_track: Option<Track> = tracks.iter().find(|t| track_is_audio(t)).cloned();
+    let audio_track: Option<Track> = find_audio_track(&tracks).cloned();
+    let mut video_track: Option<Track> = find_h264_video_track(&tracks).cloned();
+    let has_audio = audio_track.is_some();
+
+    // Container-level avcC probe (streaming, not whole-file) when Symphonia
+    // did not expose a clear H.264 track but the path is MP4-like.
+    let mut stream_avcc: Option<Vec<u8>> = None;
+    if video_track.is_none() {
+        if let Some(unsupported) = find_unsupported_video(&tracks) {
+            let msg = format!(
+                "Unsupported video codec '{}' — video disabled (audio may continue)",
+                unsupported.name()
+            );
+            eprintln!("  [gui] {}", msg);
+            super::state::lock_state(&state).status = msg;
+        } else if let Some(avcc) = extract_avcc_streaming(path) {
+            // Treat first non-audio track as H.264 only when avcC is proven.
+            video_track = tracks
+                .iter()
+                .find(|t| !matches!(classify_track(t), TrackKind::Audio))
+                .cloned();
+            stream_avcc = Some(avcc);
+            if video_track.is_none() {
+                eprintln!("  [gui] Found avcC but no video track object");
+            }
+        }
+    }
 
     let has_video = video_track.is_some();
-    let has_audio = audio_track.is_some();
+    if !has_video && !has_audio {
+        return Err("No playable audio or H.264 video tracks found".into());
+    }
 
     // Video timing basis for frame pacing.
     let video_time_base = video_track.as_ref().and_then(|t| t.codec_params.time_base);
@@ -246,24 +266,37 @@ fn run_engine(
         sink.set_volume(s.volume);
     }
 
-    // ── Pre-extract H.264 extradata (SPS/PPS) ──
-    let (sps_pps_prefix, nal_length_size) = if h264.is_some() {
-        rsmpeg_cli::extract_avcc_from_mp4(path)
-            .map(|avcc| {
-                let nal_length_size = rsmpeg_cli::avcc_nal_length_size(&avcc).unwrap_or(4);
-                let annex_b = rsmpeg_cli::avcc_extradata_to_annex_b(&avcc);
-                (Some(annex_b), nal_length_size)
-            })
-            .unwrap_or((None, 4))
-    } else {
-        (None, 4)
-    };
+    // ── H.264 bitstream format + SPS/PPS (from track extradata or streaming avcC) ──
+    let track_extra = video_track
+        .as_ref()
+        .and_then(|t| t.codec_params.extra_data.as_ref().map(|e| e.to_vec()));
+    let avcc_blob = track_extra.or(stream_avcc);
+
+    let (sps_pps_prefix, bitstream_format): (Option<Vec<u8>>, H264BitstreamFormat) =
+        if h264.is_some() {
+            if let Some(ref avcc) = avcc_blob {
+                match (avcc_nal_length_size(avcc), avcc_extradata_to_annex_b(avcc)) {
+                    (Ok(nls), Ok(annex_b)) => (
+                        Some(annex_b),
+                        H264BitstreamFormat::Avcc {
+                            nal_length_size: nls,
+                        },
+                    ),
+                    (Err(e), _) | (_, Err(e)) => {
+                        eprintln!("  [gui] avcC parse warning: {}", e);
+                        (None, H264BitstreamFormat::Avcc { nal_length_size: 4 })
+                    }
+                }
+            } else {
+                // No avcC — assume Annex B elementary stream (do not AVCC-convert).
+                (None, H264BitstreamFormat::AnnexB)
+            }
+        } else {
+            (None, H264BitstreamFormat::AnnexB)
+        };
     let mut sps_pps_sent = false;
 
-    let seek_track_id = video_track
-        .as_ref()
-        .or(audio_track.as_ref())
-        .map(|t| t.id);
+    let seek_track_id = video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
 
     // ── Playback loop ──
     loop {
@@ -274,10 +307,18 @@ fn run_engine(
                 break;
             }
 
-            // Re-anchor wall clock after unpause so frames don't race ahead.
+            // Pause / resume audio sink + re-anchor wall clock.
             if s.playing && !was_playing {
                 let pos = s.position_sec.max(0.0);
                 playback_start = Some(Instant::now() - Duration::from_secs_f64(pos));
+                if let Some(ref snk) = sink {
+                    snk.play();
+                }
+            } else if !s.playing && was_playing {
+                // Pause audio immediately; do not keep demuxing into the queue.
+                if let Some(ref snk) = sink {
+                    snk.pause();
+                }
             }
             was_playing = s.playing;
 
@@ -285,11 +326,7 @@ fn run_engine(
             if let Some(target) = s.seek_to_sec.take() {
                 let target = target.max(0.0);
                 let dur = s.duration_sec;
-                let target = if dur > 0.0 {
-                    target.min(dur)
-                } else {
-                    target
-                };
+                let target = if dur > 0.0 { target.min(dur) } else { target };
                 s.position_sec = target;
                 let playing_now = s.playing;
                 drop(s);
@@ -328,6 +365,10 @@ fn run_engine(
 
                 let s = super::state::lock_state(&state);
                 if !s.playing && !force_one_frame && s.status != "ended" {
+                    if let Some(ref snk) = sink {
+                        snk.pause();
+                        snk.set_volume(s.volume);
+                    }
                     drop(s);
                     thread::sleep(Duration::from_millis(16));
                     continue;
@@ -338,7 +379,12 @@ fn run_engine(
                 drop(s);
             } else {
                 if !s.playing && !force_one_frame && s.status != "ended" {
+                    if let Some(ref snk) = sink {
+                        snk.pause();
+                        snk.set_volume(s.volume);
+                    }
                     drop(s);
+                    // Do not demux/decode while paused — prevents audio queue growth.
                     thread::sleep(Duration::from_millis(16));
                     continue;
                 }
@@ -375,11 +421,26 @@ fn run_engine(
         if is_video {
             let packet_pts = packet.ts();
             let data: &[u8] = &packet.data;
-            let prefix = (!sps_pps_sent)
-                .then_some(sps_pps_prefix.as_deref())
-                .flatten();
-            let annex_b = rsmpeg_cli::avcc_packet_to_annex_b(data, nal_length_size, prefix);
-            sps_pps_sent = true;
+            let annex_b = match packet_for_decoder(
+                data,
+                bitstream_format,
+                sps_pps_prefix.as_deref(),
+                sps_pps_sent,
+            ) {
+                Ok(buf) => {
+                    sps_pps_sent = true;
+                    buf
+                }
+                Err(e) => {
+                    // One-shot warning; do not spam decode errors for bad NALs.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("  [gui] H.264 bitstream convert: {}", e);
+                    }
+                    Vec::new()
+                }
+            };
 
             if !annex_b.is_empty() {
                 match h264.as_mut().unwrap().decode(&annex_b) {
@@ -414,8 +475,7 @@ fn run_engine(
                                     } else if delta > 0.001 {
                                         // Early — sleep in short slices so audio demux
                                         // can resume soon (avoids long A/V stalls).
-                                        let mut remaining =
-                                            Duration::from_secs_f64(delta.min(0.5));
+                                        let mut remaining = Duration::from_secs_f64(delta.min(0.5));
                                         while remaining > Duration::ZERO {
                                             let slice = remaining.min(MAX_PACE_SLEEP);
                                             thread::sleep(slice);

@@ -1,0 +1,19 @@
+[package]
+name = "rsmpeg-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Unified playback core for rsmpeg (CLI + GUI)"
+
+[lints]
+workspace = true
+
+[dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+rsmpeg-codec = { path = "../rsmpeg-codec" }
+rsmpeg-format = { path = "../rsmpeg-format" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

@@ -3347,6 +3347,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsmpeg-player"
+version = "0.1.0"
+dependencies = [
+ "rsmpeg-codec",
+ "rsmpeg-format",
+ "rsmpeg-util",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rsmpeg-resample"
 version = "0.1.0"
 dependencies = [

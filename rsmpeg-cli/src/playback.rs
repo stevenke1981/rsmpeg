@@ -11,37 +11,19 @@ use openh264::formats::YUVSource;
 use rodio::{OutputStream, Sink};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::codecs::CODEC_TYPE_NULL;
 use symphonia::core::errors::Error;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::formats::Track;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-// ---------------------------------------------------------------------------
-// Track heuristics — Symphonia 0.5 only supports audio codecs natively,
-// so video tracks appear as "unknown" (CODEC_TYPE_NULL).
-// ---------------------------------------------------------------------------
-
-fn track_is_audio(t: &Track) -> bool {
-    t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some()
-}
-
-fn track_is_video(t: &Track) -> bool {
-    // Symphonia doesn't know H.264 — video tracks have CODEC_TYPE_NULL
-    // but no audio parameters.
-    t.codec_params.codec == CODEC_TYPE_NULL
-        || (t.codec_params.sample_rate.is_none() && t.codec_params.codec != CODEC_TYPE_NULL)
-}
-
-fn find_audio_track(tracks: &[Track]) -> Option<&Track> {
-    tracks.iter().find(|t| track_is_audio(t))
-}
-
-fn find_video_track(tracks: &[Track]) -> Option<&Track> {
-    tracks.iter().find(|t| track_is_video(t))
-}
+use rsmpeg_cli::codec_detect::{
+    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video, TrackKind,
+};
+use rsmpeg_cli::h264_bitstream::{
+    avcc_extradata_to_annex_b, avcc_nal_length_size, extract_avcc_streaming, packet_for_decoder,
+    H264BitstreamFormat,
+};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -70,14 +52,32 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let tracks = format.tracks().to_vec();
 
-    let has_video = find_video_track(&tracks).is_some();
-    let has_audio = find_audio_track(&tracks).is_some();
+    let audio_track = find_audio_track(&tracks);
+    let mut video_track = find_h264_video_track(&tracks);
+    let mut stream_avcc: Option<Vec<u8>> = None;
 
-    if !has_video && !has_audio {
-        return Err("No playable audio or video tracks found".into());
+    if video_track.is_none() {
+        if let Some(unsupported) = find_unsupported_video(&tracks) {
+            eprintln!(
+                "  Unsupported video codec '{}' — playing audio only",
+                unsupported.name()
+            );
+        } else if let Some(avcc) = extract_avcc_streaming(&path_str) {
+            video_track = tracks
+                .iter()
+                .find(|t| !matches!(classify_track(t), TrackKind::Audio));
+            stream_avcc = Some(avcc);
+        }
     }
 
-    // Setup OpenH264 decoder if we have video
+    let has_video = video_track.is_some();
+    let has_audio = audio_track.is_some();
+
+    if !has_video && !has_audio {
+        return Err("No playable audio or H.264 video tracks found".into());
+    }
+
+    // OpenH264 only for proven H.264
     let mut h264_decoder = if has_video {
         match openh264::decoder::Decoder::with_api_config(
             openh264::OpenH264API::from_source(),
@@ -93,9 +93,6 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-
-    // Audio params
-    let audio_track = find_audio_track(&tracks);
     let audio_sample_rate = audio_track
         .and_then(|t| t.codec_params.sample_rate)
         .unwrap_or(0);
@@ -149,7 +146,6 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Video window — use generous default size; OpenH264 will decode at
     // the actual stream resolution regardless.
-    let video_track = find_video_track(&tracks);
     let _have_known_video_dims = false;
     let window_width: usize = 640;
     let window_height: usize = 480;
@@ -196,21 +192,28 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // ── Pre-extract H.264 extradata (SPS/PPS) to prepend to first frame ──
-    // OpenH264 requires SPS/PPS inline; MP4 stores them in avcC box.
-    // We prepend them to the first packet so the decoder sees SPS/PPS + slice
-    // data in one `decode()` call instead of a separate feed.
-    let (sps_pps_prefix, nal_length_size) = if h264_decoder.is_some() {
-        rsmpeg_cli::extract_avcc_from_mp4(&path_str)
-            .map(|avcc| {
-                let nal_length_size = rsmpeg_cli::avcc_nal_length_size(&avcc).unwrap_or(4);
-                let annex_b = rsmpeg_cli::avcc_extradata_to_annex_b(&avcc);
-                (Some(annex_b), nal_length_size)
-            })
-            .unwrap_or((None, 4))
-    } else {
-        (None, 4)
-    };
+    // ── H.264 bitstream format + SPS/PPS (streaming avcC, no whole-file read) ──
+    let track_extra =
+        video_track.and_then(|t| t.codec_params.extra_data.as_ref().map(|e| e.to_vec()));
+    let avcc_blob = track_extra.or(stream_avcc);
+    let (sps_pps_prefix, bitstream_format): (Option<Vec<u8>>, H264BitstreamFormat) =
+        if h264_decoder.is_some() {
+            if let Some(ref avcc) = avcc_blob {
+                match (avcc_nal_length_size(avcc), avcc_extradata_to_annex_b(avcc)) {
+                    (Ok(nls), Ok(annex_b)) => (
+                        Some(annex_b),
+                        H264BitstreamFormat::Avcc {
+                            nal_length_size: nls,
+                        },
+                    ),
+                    _ => (None, H264BitstreamFormat::Avcc { nal_length_size: 4 }),
+                }
+            } else {
+                (None, H264BitstreamFormat::AnnexB)
+            }
+        } else {
+            (None, H264BitstreamFormat::AnnexB)
+        };
     let mut sps_pps_sent = false;
 
     // Pixel buffer for display (RGBA32 format, 0x00RRGGBB)
@@ -261,11 +264,18 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             // universal. Convert AVCC → Annex B:
             let packet_pts = packet.ts();
             let data: &[u8] = &packet.data;
-            let prefix = (!sps_pps_sent)
-                .then_some(sps_pps_prefix.as_deref())
-                .flatten();
-            let annex_b = rsmpeg_cli::avcc_packet_to_annex_b(data, nal_length_size, prefix);
-            sps_pps_sent = true;
+            let annex_b = match packet_for_decoder(
+                data,
+                bitstream_format,
+                sps_pps_prefix.as_deref(),
+                sps_pps_sent,
+            ) {
+                Ok(buf) => {
+                    sps_pps_sent = true;
+                    buf
+                }
+                Err(_) => Vec::new(),
+            };
 
             // Decode H.264
             if !annex_b.is_empty() {
@@ -455,11 +465,7 @@ pub fn play_audio_file(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
     let mut format = probed.format;
 
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| track_is_audio(t))
-        .ok_or("No audio track found")?;
+    let track = find_audio_track(format.tracks()).ok_or("No audio track found")?;
 
     let sample_rate = track
         .codec_params
