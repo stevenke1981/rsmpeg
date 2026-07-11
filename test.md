@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第十刀 multi-agent round 6）
+日期：2026-07-11（第十一刀 multi-agent round 7）
 
 ## 指令
 
@@ -16,13 +16,13 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 | 項目 | 結果 |
 |------|------|
 | workspace tests | **PASS** |
-| rsmpeg-player | **76**（+10：openh264 reset 3 / symphonia reset+fmt 3 / clock pause-resume 4） |
+| rsmpeg-player | **80**（+4：sync controller 4） |
 | rsmpeg-codec | 27 |
-| rsmpeg-scale | 8 |
+| rsmpeg-scale | 10（+2：bgr24） |
 | rsmpeg-util | 12 |
 | rsmpeg-resample | 11 |
 | rsmpeg-format | 10 |
-| rsmpeg-filter | 4 |
+| rsmpeg-filter | 7（+3：grayscale） |
 | release build | **PASS** |
 | fmt --check | **PASS** |
 
@@ -42,9 +42,14 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - SymphoniaAudioDecoder：`reset()` 顯式清 pending/eof；新增 `map_sample_format`（Symphonia→rsmpeg_util）+ 3 單測（含 reset 清幀）
 - MasterClock：新增 `pause()/resume()/is_paused()/seek_to()`，pause 凍結位置（wall + audio-master 雙路徑）+ 4 單測
 
+## round 7 重點
+- SyncController（player/src/sync.rs）：A/V drift 決策 Render/Drop/Duplicate（預設 40ms 容差）+ 4 單測
+- rsmpeg-scale：新增 `yuv420p_frame_to_bgr24`（BGR 序、3 bytes/pixel，複用 BT.601 數學）+ 2 單測
+- rsmpeg-filter：新增 `GrayscaleFilter`（RGBA→灰階，保留 alpha，符合 Filter trait）+ 3 單測
+
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做
 - VFR 仍依賴解碼幀 PTS，若上游未帶 PTS 始終退回固定幀率
-- FramePool 尚未接入事件路徑（目前 RGBA buffer 直接 move 進 PlayerEvent，需未來事件重構）
+- FramePool / SyncController 尚未接入播放主迴圈（demux_worker / native_pipeline）
 - `map_sample_format` 為未來多格式輸出的 building block，尚未接入解碼路徑
 - Clippy 仍有預存 style warning（soft）

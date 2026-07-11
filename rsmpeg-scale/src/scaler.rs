@@ -344,6 +344,91 @@ fn clone_frame_metadata(frame: &Frame, data: Vec<Vec<u8>>, linesize: Vec<usize>)
     }
 }
 
+/// Convert a YUV420P [`Frame`] into packed BGR24 (`Vec<u8>`, 3 bytes/pixel, B,G,R order).
+///
+/// This mirrors the YUV → RGB math used by the `Yuv420P` → `Rgba` path in [`Scaler::scale`]
+/// (BT.601, limited range by default): the same `yuv_to_rgb_bt601` conversion and clamping are
+/// applied per pixel. The only differences are that output is 3 bytes/pixel written in
+/// **B,G,R** order (no alpha byte), matching FFmpeg's `bgr24` layout.
+pub fn yuv420p_frame_to_bgr24(frame: &Frame) -> RsResult<Vec<u8>> {
+    if frame.pixel_format != PixelFormat::Yuv420P {
+        return Err(RsError::InvalidData(
+            format!(
+                "yuv420p_frame_to_bgr24 expects Yuv420P, got {:?}",
+                frame.pixel_format
+            )
+            .into(),
+        ));
+    }
+    if frame.data.len() < 3 || frame.linesize.len() < 3 {
+        return Err(RsError::InvalidData(
+            "YUV420P frame requires 3 planes (Y, U, V)".into(),
+        ));
+    }
+
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 {
+        return Err(RsError::InvalidData(
+            "yuv420p_frame_to_bgr24 requires non-zero width/height".into(),
+        ));
+    }
+
+    let y_plane = &frame.data[0];
+    let u_plane = &frame.data[1];
+    let v_plane = &frame.data[2];
+    let y_stride = frame.linesize[0];
+    let u_stride = frame.linesize[1];
+    let v_stride = frame.linesize[2];
+
+    // Chroma dimensions for 4:2:0 (matches the Yuv420P → Rgba path).
+    let chroma_w = (w + 1) / 2;
+    let chroma_h = (h + 1) / 2;
+
+    // Validate plane capacity (allow extra padding in linesize), same as scale_yuv420p_to_packed.
+    let y_need = y_stride
+        .checked_mul(h.saturating_sub(1))
+        .and_then(|o| o.checked_add(w));
+    let u_need = u_stride
+        .checked_mul(chroma_h.saturating_sub(1))
+        .and_then(|o| o.checked_add(chroma_w));
+    let v_need = v_stride
+        .checked_mul(chroma_h.saturating_sub(1))
+        .and_then(|o| o.checked_add(chroma_w));
+    match (y_need, u_need, v_need) {
+        (Some(yn), Some(un), Some(vn))
+            if y_plane.len() >= yn && u_plane.len() >= un && v_plane.len() >= vn => {}
+        _ => {
+            return Err(RsError::InvalidData(
+                "YUV420P plane buffers are too small for declared size/linesize".into(),
+            ));
+        }
+    }
+
+    // BT.601 limited range, matching the default Scaler Yuv420P → Rgba conversion.
+    let limited = true;
+    let mut out = vec![0u8; w * h * 3];
+
+    for y in 0..h {
+        let cy = y / 2;
+        for x in 0..w {
+            let cx = x / 2;
+            let yv = y_plane[y * y_stride + x];
+            let u = u_plane[cy * u_stride + cx];
+            let v = v_plane[cy * v_stride + cx];
+
+            let (r, g, b) = yuv_to_rgb_bt601(yv, u, v, limited);
+            let off = (y * w + x) * 3;
+            // BGR order, no alpha.
+            out[off] = b;
+            out[off + 1] = g;
+            out[off + 2] = r;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Build a correctly sized synthetic YUV420P frame (not using broken `Frame::new_video` plane sizes).
 #[cfg(test)]
 pub(crate) fn make_yuv420p_frame(width: usize, height: usize, y: u8, u: u8, v: u8) -> Frame {
@@ -547,5 +632,28 @@ mod tests {
         assert_eq!(o1.data[0].len(), 4 * 4 * 4);
         assert_eq!(o2.data[0].len(), 4 * 4 * 4);
         assert!(o2.data[0][0] > o1.data[0][0]);
+    }
+
+    #[test]
+    fn test_yuv420p_to_bgr24_buffer_len_and_black() {
+        let w = 2usize;
+        let h = 2usize;
+        // Y=0 (limited-range black), neutral chroma U=V=128 → near-black.
+        let frame = make_yuv420p_frame(w, h, 0, 128, 128);
+        let out = yuv420p_frame_to_bgr24(&frame).unwrap();
+        assert_eq!(out.len(), w * h * 3);
+        // First pixel ≈ black. Order is B,G,R, but all channels are small.
+        assert!(out[0] < 16, "B={}", out[0]);
+        assert!(out[1] < 16, "G={}", out[1]);
+        assert!(out[2] < 16, "R={}", out[2]);
+    }
+
+    #[test]
+    fn test_yuv420p_to_bgr24_rejects_wrong_format() {
+        let mut frame = make_yuv420p_frame(2, 2, 16, 128, 128);
+        // Not a Yuv420P frame — must be rejected.
+        frame.pixel_format = PixelFormat::Rgb24;
+        let res = yuv420p_frame_to_bgr24(&frame);
+        assert!(res.is_err());
     }
 }

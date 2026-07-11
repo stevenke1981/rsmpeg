@@ -19,6 +19,7 @@ pub mod native_pipeline;
 pub mod player;
 pub mod queue;
 pub mod scaler_cache;
+pub mod sync;
 pub mod video_convert;
 pub mod video_scheduler;
 
