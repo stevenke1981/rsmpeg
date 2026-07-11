@@ -16,13 +16,70 @@ use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::codecs::CODEC_TYPE_NULL;
 use symphonia::core::errors::Error;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::formats::Track;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, Track};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 
 use super::state::{FrameData, PlaybackState};
+
+/// Max pending decoded frames.  When full the engine drops the newest frame
+/// instead of blocking demux/audio (keeps A/V flowing smoothly).
+const FRAME_QUEUE_CAP: usize = 2;
+
+/// Drop a frame if it is this far behind the wall clock (avoids cascading lag).
+const LATE_DROP_SEC: f64 = 0.050;
+
+/// Do not sleep longer than this in one shot so audio demux can resume soon.
+const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
+
+/// Soft cap on rodio queued sources — prevents runaway memory if video stalls.
+const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
+
+/// Estimate track duration in seconds from codec parameters.
+fn track_duration_sec(t: &Track) -> f64 {
+    let n_frames = match t.codec_params.n_frames {
+        Some(n) if n > 0 => n as f64,
+        _ => return 0.0,
+    };
+    // Audio: frames / sample rate
+    if let Some(sr) = t.codec_params.sample_rate {
+        if sr > 0 {
+            return n_frames / f64::from(sr);
+        }
+    }
+    // Video / timed tracks: frames × time base
+    if let Some(tb) = t.codec_params.time_base {
+        let sec_per_tick = tb.numer as f64 / tb.denom.max(1) as f64;
+        if sec_per_tick.is_finite() && sec_per_tick > 0.0 {
+            return n_frames * sec_per_tick;
+        }
+    }
+    0.0
+}
+
+fn create_h264_decoder() -> Option<openh264::decoder::Decoder> {
+    match openh264::decoder::Decoder::with_api_config(
+        openh264::OpenH264API::from_source(),
+        openh264::decoder::DecoderConfig::new()
+            .flush_after_decode(openh264::decoder::Flush::NoFlush),
+    ) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("  [gui] Warning: could not create H.264 decoder: {:?}", e);
+            None
+        }
+    }
+}
+
+/// Convert YUV → RGBA with OpenH264's SIMD path (no intermediate RGB buffer).
+fn yuv_frame_to_rgba(yuv: &openh264::decoder::DecodedYUV<'_>) -> Vec<u8> {
+    let (w, h) = yuv.dimensions();
+    let mut rgba = vec![0u8; w * h * 4];
+    yuv.write_rgba8(&mut rgba);
+    rgba
+}
 
 // ---------------------------------------------------------------------------
 // Track detection helpers
@@ -54,7 +111,7 @@ pub struct PlaybackEngine {
 impl PlaybackEngine {
     /// Open a media file and start playback in a background thread.
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let (frame_tx, frame_rx) = mpsc::channel::<FrameData>();
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<FrameData>(FRAME_QUEUE_CAP);
         let state = Arc::new(Mutex::new(PlaybackState::default()));
         let state_for_engine = state.clone();
         let state_for_error = state.clone();
@@ -97,7 +154,7 @@ impl Drop for PlaybackEngine {
 
 fn run_engine(
     path: &str,
-    frame_tx: mpsc::Sender<FrameData>,
+    frame_tx: mpsc::SyncSender<FrameData>,
     state: Arc<Mutex<PlaybackState>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ── Open file ──
@@ -126,43 +183,35 @@ fn run_engine(
     let has_video = video_track.is_some();
     let has_audio = audio_track.is_some();
 
-    // Video timing basis for frame pacing.  Frames are sent to the UI at their
-    // presentation timestamp so the video plays at its native rate and stays
-    // in sync with the real-time audio sink (instead of racing ahead at decode
-    // speed).  Falls back to the declared frame rate, then 30 fps.
+    // Video timing basis for frame pacing.
     let video_time_base = video_track.as_ref().and_then(|t| t.codec_params.time_base);
     let sec_per_tick = video_time_base
         .map(|tb| tb.numer as f64 / tb.denom.max(1) as f64)
         .filter(|s| s.is_finite() && *s > 0.0);
     let assumed_frame_dur = 1.0 / 30.0;
     let mut playback_start: Option<Instant> = None;
-    let mut first_video_pts: u64 = 0;
+    // Absolute timeline base: first video PTS ever seen (not reset on seek).
+    let mut base_video_pts: Option<u64> = None;
     let mut video_frame_index: u64 = 0;
+    // After a seek while paused, decode until one frame is painted.
+    let mut force_one_frame = false;
+    let mut was_playing = true;
 
     // ── Duration ──
-    // Symphonia doesn't expose total duration directly from the probe;
-    // n_frames is codec-specific.  Try to get duration from the format
-    // context if possible.
     {
         let mut s = super::state::lock_state(&state);
-        if let Some(t) = video_track.as_ref().or(audio_track.as_ref()) {
-            s.duration_sec = t.codec_params.n_frames.unwrap_or(0) as f64;
-        }
+        let audio_dur = audio_track.as_ref().map(track_duration_sec).unwrap_or(0.0);
+        let video_dur = video_track.as_ref().map(track_duration_sec).unwrap_or(0.0);
+        s.duration_sec = if audio_dur > 0.0 {
+            audio_dur
+        } else {
+            video_dur
+        };
     }
 
     // ── OpenH264 decoder ──
     let mut h264 = if has_video {
-        match openh264::decoder::Decoder::with_api_config(
-            openh264::OpenH264API::from_source(),
-            openh264::decoder::DecoderConfig::new()
-                .flush_after_decode(openh264::decoder::Flush::NoFlush),
-        ) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                eprintln!("  [gui] Warning: could not create H.264 decoder: {:?}", e);
-                None
-            }
-        }
+        create_h264_decoder()
     } else {
         None
     };
@@ -186,8 +235,6 @@ fn run_engine(
         .unwrap_or(44100);
 
     // ── rodio audio output ──
-    // Keep OutputStream alive for the entire engine lifetime (it drives
-    // audio).  If output cannot be created we continue without audio.
     let _rodio_result = OutputStream::try_default();
     let sink: Option<Sink> = _rodio_result
         .as_ref()
@@ -195,18 +242,11 @@ fn run_engine(
         .and_then(|(_, handle)| Sink::try_new(handle).ok());
 
     if let (Some(sink), true) = (sink.as_ref(), has_audio) {
-        // Apply initial volume
-        {
-            let s = super::state::lock_state(&state);
-            sink.set_volume(s.volume);
-        }
+        let s = super::state::lock_state(&state);
+        sink.set_volume(s.volume);
     }
 
-    // ── Pre-extract H.264 extradata (SPS/PPS) to prepend to first frame ──
-    // OpenH264 requires SPS and PPS to appear as Annex B NAL units *inline*
-    // in the bitstream before any slice data.  For MP4 files these are stored
-    // in the avcC box, not in the sample data.  We prepend them to the first
-    // packet so the decoder sees SPS/PPS + slice data in one `decode()` call.
+    // ── Pre-extract H.264 extradata (SPS/PPS) ──
     let (sps_pps_prefix, nal_length_size) = if h264.is_some() {
         rsmpeg_cli::extract_avcc_from_mp4(path)
             .map(|avcc| {
@@ -220,24 +260,102 @@ fn run_engine(
     };
     let mut sps_pps_sent = false;
 
+    let seek_track_id = video_track
+        .as_ref()
+        .or(audio_track.as_ref())
+        .map(|t| t.id);
+
     // ── Playback loop ──
     loop {
-        // Pause check
+        // Pause / stop / seek / volume
         {
-            let s = super::state::lock_state(&state);
+            let mut s = super::state::lock_state(&state);
             if s.stop_requested {
                 break;
             }
-            if !s.playing && s.status != "ended" {
+
+            // Re-anchor wall clock after unpause so frames don't race ahead.
+            if s.playing && !was_playing {
+                let pos = s.position_sec.max(0.0);
+                playback_start = Some(Instant::now() - Duration::from_secs_f64(pos));
+            }
+            was_playing = s.playing;
+
+            // Apply pending seek from the UI timeline.
+            if let Some(target) = s.seek_to_sec.take() {
+                let target = target.max(0.0);
+                let dur = s.duration_sec;
+                let target = if dur > 0.0 {
+                    target.min(dur)
+                } else {
+                    target
+                };
+                s.position_sec = target;
+                let playing_now = s.playing;
                 drop(s);
-                thread::sleep(Duration::from_millis(16));
+
+                let seek_result = format.seek(
+                    SeekMode::Coarse,
+                    SeekTo::Time {
+                        time: Time::from(target),
+                        track_id: seek_track_id,
+                    },
+                );
+
+                match seek_result {
+                    Ok(_) => {
+                        if let Some(ref mut dec) = audio_decoder {
+                            dec.reset();
+                        }
+                        if has_video {
+                            h264 = create_h264_decoder();
+                            sps_pps_sent = false;
+                        }
+                        if let Some(ref snk) = sink {
+                            snk.clear();
+                            snk.play();
+                        }
+                        playback_start =
+                            Some(Instant::now() - Duration::from_secs_f64(target.max(0.0)));
+                        video_frame_index = 0;
+                        force_one_frame = true;
+                        was_playing = playing_now;
+                    }
+                    Err(e) => {
+                        eprintln!("  [gui] Seek failed: {:?}", e);
+                    }
+                }
+
+                let s = super::state::lock_state(&state);
+                if !s.playing && !force_one_frame && s.status != "ended" {
+                    drop(s);
+                    thread::sleep(Duration::from_millis(16));
+                    continue;
+                }
+                if let Some(ref snk) = sink {
+                    snk.set_volume(s.volume);
+                }
+                drop(s);
+            } else {
+                if !s.playing && !force_one_frame && s.status != "ended" {
+                    drop(s);
+                    thread::sleep(Duration::from_millis(16));
+                    continue;
+                }
+                if let Some(ref snk) = sink {
+                    snk.set_volume(s.volume);
+                }
+                drop(s);
+            }
+        }
+
+        // Soft audio backpressure: if the sink is overloaded, yield briefly so
+        // rodio can drain instead of growing unbounded.
+        if let Some(ref snk) = sink {
+            if snk.len() >= MAX_AUDIO_QUEUE_SOURCES {
+                thread::sleep(Duration::from_millis(4));
                 continue;
             }
-            // Apply volume changes periodically
-            if let Some(ref snk) = sink {
-                snk.set_volume(s.volume);
-            }
-            drop(s);
         }
 
         // Read next packet
@@ -255,7 +373,6 @@ fn run_engine(
             has_video && h264.is_some() && video_track.as_ref().is_some_and(|vt| vt.id == track_id);
 
         if is_video {
-            // AVCC (4-byte length prefix) -> Annex B (start-code prefix)
             let packet_pts = packet.ts();
             let data: &[u8] = &packet.data;
             let prefix = (!sps_pps_sent)
@@ -269,58 +386,97 @@ fn run_engine(
                     Ok(Some(yuv)) => {
                         let (w, h) = yuv.dimensions();
                         if w > 0 && h > 0 {
-                            let rgb_len = w * h * 3;
-                            let mut rgb_buf = vec![0u8; rgb_len];
-                            yuv.write_rgb8(&mut rgb_buf);
-
-                            // RGB -> RGBA
-                            let rgba: Vec<u8> = rgb_buf
-                                .chunks(3)
-                                .flat_map(|c| [c[0], c[1], c[2], 255])
-                                .collect();
-
-                            // ── Pace this frame to its presentation time ──
-                            // Anchor the clock on the first frame, then sleep
-                            // until the frame's PTS-relative target so the UI
-                            // receives frames at the correct rate.
-                            let target_delay = match sec_per_tick {
+                            // Absolute presentation time (seconds) for this frame.
+                            let abs_pos = match sec_per_tick {
                                 Some(spt) => {
-                                    if playback_start.is_none() {
-                                        first_video_pts = packet_pts;
+                                    if base_video_pts.is_none() {
+                                        base_video_pts = Some(packet_pts);
                                     }
-                                    let ticks = packet_pts.saturating_sub(first_video_pts) as f64;
-                                    Duration::from_secs_f64(ticks * spt)
+                                    let base = base_video_pts.unwrap_or(packet_pts);
+                                    packet_pts.saturating_sub(base) as f64 * spt
                                 }
-                                None => Duration::from_secs_f64(
-                                    video_frame_index as f64 * assumed_frame_dur,
-                                ),
+                                None => video_frame_index as f64 * assumed_frame_dur,
                             };
-                            if playback_start.is_none() {
-                                playback_start = Some(Instant::now());
-                            }
-                            if let Some(t0) = playback_start {
-                                let elapsed = t0.elapsed();
-                                if target_delay > elapsed {
-                                    thread::sleep(target_delay - elapsed);
+
+                            // ── Pace / drop relative to wall clock ──
+                            let mut present = true;
+                            if !force_one_frame {
+                                if playback_start.is_none() {
+                                    playback_start = Some(Instant::now());
+                                }
+                                if let Some(t0) = playback_start {
+                                    let elapsed = t0.elapsed().as_secs_f64();
+                                    let delta = abs_pos - elapsed;
+
+                                    if delta < -LATE_DROP_SEC {
+                                        // Too late — drop to catch up (no convert/send).
+                                        present = false;
+                                    } else if delta > 0.001 {
+                                        // Early — sleep in short slices so audio demux
+                                        // can resume soon (avoids long A/V stalls).
+                                        let mut remaining =
+                                            Duration::from_secs_f64(delta.min(0.5));
+                                        while remaining > Duration::ZERO {
+                                            let slice = remaining.min(MAX_PACE_SLEEP);
+                                            thread::sleep(slice);
+                                            remaining = remaining.saturating_sub(slice);
+
+                                            // Bail early if user seeked / stopped / paused.
+                                            let s = super::state::lock_state(&state);
+                                            if s.stop_requested
+                                                || s.seek_to_sec.is_some()
+                                                || (!s.playing && !force_one_frame)
+                                            {
+                                                present = false;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             video_frame_index += 1;
 
-                            let _ = frame_tx.send(FrameData {
-                                rgba,
-                                width: w,
-                                height: h,
-                            });
+                            if present {
+                                // Direct YUV → RGBA (SIMD when width % 8 == 0).
+                                let rgba = yuv_frame_to_rgba(&yuv);
 
-                            // Update playhead from the real presentation time.
-                            {
-                                let mut s = super::state::lock_state(&state);
-                                s.position_sec = match sec_per_tick {
-                                    Some(spt) => {
-                                        packet_pts.saturating_sub(first_video_pts) as f64 * spt
+                                // Non-blocking send: if UI is behind, drop this
+                                // frame rather than blocking demux/audio.
+                                match frame_tx.try_send(FrameData {
+                                    rgba,
+                                    width: w,
+                                    height: h,
+                                }) {
+                                    Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
+                                    Err(mpsc::TrySendError::Full(_)) => {
+                                        // UI still has pending frames; skip this one.
                                     }
-                                    None => video_frame_index as f64 * assumed_frame_dur,
-                                };
+                                }
+                                force_one_frame = false;
+
+                                let mut s = super::state::lock_state(&state);
+                                if s.seek_to_sec.is_none() {
+                                    s.position_sec = abs_pos;
+                                }
+                            } else if force_one_frame {
+                                // Still need a scrub preview frame.
+                                let rgba = yuv_frame_to_rgba(&yuv);
+                                let _ = frame_tx.try_send(FrameData {
+                                    rgba,
+                                    width: w,
+                                    height: h,
+                                });
+                                force_one_frame = false;
+                                let mut s = super::state::lock_state(&state);
+                                if s.seek_to_sec.is_none() {
+                                    s.position_sec = abs_pos;
+                                }
+                            } else {
+                                // Dropped for catch-up — still advance playhead.
+                                let mut s = super::state::lock_state(&state);
+                                if s.seek_to_sec.is_none() {
+                                    s.position_sec = abs_pos;
+                                }
                             }
                         }
                     }
@@ -338,6 +494,12 @@ fn run_engine(
         let is_audio = has_audio && audio_decoder.is_some() && (audio_track_id == Some(track_id));
 
         if is_audio {
+            // While force-decoding a scrubbed frame while paused, skip audio.
+            let playing_now = super::state::lock_state(&state).playing;
+            if force_one_frame && !playing_now {
+                continue;
+            }
+
             match audio_decoder.as_mut().unwrap().decode(&packet) {
                 Ok(audio_buf) => {
                     let spec = *audio_buf.spec();
@@ -373,14 +535,8 @@ fn run_engine(
                 for yuv in &frames {
                     let (w, h) = yuv.dimensions();
                     if w > 0 && h > 0 {
-                        let rgb_len = w * h * 3;
-                        let mut rgb_buf = vec![0u8; rgb_len];
-                        yuv.write_rgb8(&mut rgb_buf);
-                        let rgba: Vec<u8> = rgb_buf
-                            .chunks(3)
-                            .flat_map(|c| [c[0], c[1], c[2], 255])
-                            .collect();
-                        let _ = frame_tx.send(FrameData {
+                        let rgba = yuv_frame_to_rgba(yuv);
+                        let _ = frame_tx.try_send(FrameData {
                             rgba,
                             width: w,
                             height: h,

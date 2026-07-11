@@ -21,6 +21,9 @@ pub struct PlaybackState {
     pub duration_sec: f64,
     pub status: String,
     pub volume: f32,
+    /// When set by the UI, the engine seeks to this absolute time (seconds)
+    /// then clears the field.  `None` means no pending seek.
+    pub seek_to_sec: Option<f64>,
 }
 
 impl Default for PlaybackState {
@@ -32,6 +35,7 @@ impl Default for PlaybackState {
             duration_sec: 0.0,
             status: String::new(),
             volume: 0.8,
+            seek_to_sec: None,
         }
     }
 }

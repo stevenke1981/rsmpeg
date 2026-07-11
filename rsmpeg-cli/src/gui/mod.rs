@@ -1,7 +1,8 @@
 //! egui/eframe GUI media player for rsmpeg.
 //!
 //! Provides a native window with video display, play/pause/stop controls,
-//! seek progress, volume, and an open-file dialog.
+//! a draggable seek timeline, volume, open-file dialog, and drag-and-drop
+//! file loading.
 
 pub mod engine;
 pub mod state;
@@ -81,25 +82,17 @@ impl MediaApp {
 
 impl eframe::App for MediaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain decoded video frames from the engine
+        // Drain decoded video frames from the engine — only upload the *latest*
+        // to the GPU (uploading every intermediate frame causes stutter).
         let mut clear_engine = false;
+        let mut got_new_frame = false;
         if let Some(engine) = self.engine.as_ref() {
-            let mut got_any_frame = false;
+            let mut latest: Option<state::FrameData> = None;
             let mut disconnected = false;
             loop {
                 match engine.frame_rx.try_recv() {
                     Ok(frame) => {
-                        got_any_frame = true;
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                            [frame.width, frame.height],
-                            &frame.rgba,
-                        );
-                        self.texture = Some(ctx.load_texture(
-                            "video_frame",
-                            color_image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                        self._latest_frame = Some(frame);
+                        latest = Some(frame);
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -109,9 +102,31 @@ impl eframe::App for MediaApp {
                 }
             }
 
+            if let Some(frame) = latest {
+                got_new_frame = true;
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [frame.width, frame.height],
+                    &frame.rgba,
+                );
+                // Reuse GPU texture when resolution is unchanged (much cheaper
+                // than load_texture every frame).
+                match self.texture.as_mut() {
+                    Some(tex) if tex.size() == [frame.width, frame.height] => {
+                        tex.set(color_image, egui::TextureOptions::LINEAR);
+                    }
+                    _ => {
+                        self.texture = Some(ctx.load_texture(
+                            "video_frame",
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
+                self._latest_frame = Some(frame);
+            }
+
             // Check if engine thread exited without ever sending a frame
-            if disconnected && !got_any_frame && self._latest_frame.is_none() {
-                // Engine died before producing any output
+            if disconnected && self._latest_frame.is_none() {
                 let s = state::lock_state(&self.state);
                 if s.status != "ended" && s.status != "stopped" && !s.status.is_empty() {
                     self.status = format!("Playback error: {}", s.status);
@@ -140,9 +155,14 @@ impl eframe::App for MediaApp {
         // Render the UI
         ui::render_ui(self, ctx);
 
-        // Keep repainting while playing (drives video updates)
+        // Cap UI refresh ~60–120 Hz while playing.  Continuous request_repaint()
+        // maxes out a core and fights the decoder thread.
         if self.engine.is_some() {
-            ctx.request_repaint();
+            if got_new_frame {
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+            }
         }
     }
 }
@@ -158,7 +178,8 @@ pub fn run_gui(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(egui::vec2(960.0, 600.0))
-            .with_min_inner_size(egui::vec2(480.0, 320.0)),
+            .with_min_inner_size(egui::vec2(480.0, 320.0))
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
