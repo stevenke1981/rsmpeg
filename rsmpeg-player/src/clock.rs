@@ -123,6 +123,10 @@ pub struct MasterClock {
     audio_sample_rate: u32,
     /// Samples accounted for when `use_audio` is true (device-reported).
     audio_samples_played: u64,
+    /// When paused, the reported position is frozen at `paused_position`.
+    paused: bool,
+    /// Snapshot of the reported position taken at pause time.
+    paused_position: Duration,
 }
 
 impl MasterClock {
@@ -172,6 +176,9 @@ impl MasterClock {
     }
 
     pub fn now(&self) -> Duration {
+        if self.paused {
+            return self.paused_position;
+        }
         if self.use_audio && self.audio_sample_rate > 0 {
             PlaybackClock::duration_from_audio_samples(
                 self.audio_samples_played,
@@ -180,6 +187,59 @@ impl MasterClock {
         } else {
             self.inner.now()
         }
+    }
+
+    /// Freeze the reported playback position at its current value.
+    ///
+    /// Subsequent calls to [`Self::now`] return the position captured at pause
+    /// time until [`Self::resume`] (or a seek) is called. Calling `pause` while
+    /// already paused is a no-op.
+    pub fn pause(&mut self) {
+        if self.paused {
+            return;
+        }
+        self.paused_position = self.now();
+        self.paused = true;
+        self.inner.pause();
+    }
+
+    /// Resume advancing the reported playback position from where it was
+    /// frozen. Calling `resume` while not paused is a no-op.
+    pub fn resume(&mut self) {
+        if !self.paused {
+            return;
+        }
+        self.paused = false;
+        self.paused_position = Duration::ZERO;
+        self.inner.resume();
+    }
+
+    /// Whether the clock is currently paused (position frozen).
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Reset the reported playback position to `pos`, clearing any paused state
+    /// and re-anchoring the underlying clock so playback continues from `pos`.
+    pub fn seek_to(&mut self, pos: Duration) {
+        self.paused = false;
+        self.paused_position = Duration::ZERO;
+        self.inner.seek(pos);
+        if self.use_audio && self.audio_sample_rate > 0 {
+            self.audio_samples_played =
+                Self::duration_to_audio_samples(pos, self.audio_sample_rate);
+        }
+    }
+
+    /// Convert a media timeline [`Duration`] into a played sample count for the
+    /// configured audio sample rate.
+    ///
+    /// Returns 0 when `sample_rate` is 0.
+    pub fn duration_to_audio_samples(position: Duration, sample_rate: u32) -> u64 {
+        if sample_rate == 0 {
+            return 0;
+        }
+        (position.as_secs_f64() * f64::from(sample_rate)) as u64
     }
 }
 
@@ -243,5 +303,79 @@ mod tests {
         let n = m.now().as_secs_f64();
         assert!((n - 0.5).abs() < 1e-9);
         assert_eq!(m.audio_samples_played(), 24_000);
+    }
+
+    #[test]
+    fn pause_freezes_position() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        thread::sleep(Duration::from_millis(20));
+        assert!(m.now().as_secs_f64() > 0.0);
+
+        m.pause();
+        let p = m.now();
+        thread::sleep(Duration::from_millis(30));
+        // Frozen during pause.
+        assert!((m.now().as_secs_f64() - p.as_secs_f64()).abs() < 0.005);
+
+        m.resume();
+        thread::sleep(Duration::from_millis(20));
+        // Advances again, and never goes backwards past the paused value.
+        let after = m.now().as_secs_f64();
+        assert!(after >= p.as_secs_f64());
+        assert!(after - p.as_secs_f64() > 0.005);
+    }
+
+    #[test]
+    fn seek_to_resets() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        m.seek_to(Duration::from_secs(5));
+        assert!(m.now() >= Duration::from_secs(4));
+
+        // Also resets the audio-master position.
+        let mut a = MasterClock::new();
+        a.set_audio_master(true);
+        a.set_audio_sample_rate(48_000);
+        a.set_audio_samples_played(24_000);
+        a.seek_to(Duration::from_secs(5));
+        assert!(a.now() >= Duration::from_secs(4));
+    }
+
+    #[test]
+    fn double_pause_idempotent() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        thread::sleep(Duration::from_millis(10));
+        m.pause();
+        let p = m.now();
+        // Second pause must not panic or double-count.
+        m.pause();
+        assert!(m.is_paused());
+        thread::sleep(Duration::from_millis(20));
+        assert!((m.now().as_secs_f64() - p.as_secs_f64()).abs() < 0.005);
+
+        m.resume();
+        m.resume(); // no-op, no panic
+        assert!(!m.is_paused());
+    }
+
+    #[test]
+    fn pause_freezes_audio_master_position() {
+        // When paused, updates from the audio backend must not move the clock.
+        let mut m = MasterClock::new();
+        m.set_audio_master(true);
+        m.set_audio_sample_rate(48_000);
+        m.set_audio_samples_played(24_000); // 0.5s
+        m.pause();
+        let p = m.now();
+        assert!((p.as_secs_f64() - 0.5).abs() < 1e-9);
+        m.set_audio_samples_played(48_000); // backend advances while paused
+        assert!((m.now().as_secs_f64() - p.as_secs_f64()).abs() < 1e-9);
+
+        m.resume();
+        // After resume, audio-driven position is reported again.
+        m.set_audio_samples_played(96_000);
+        assert!((m.now().as_secs_f64() - 2.0).abs() < 1e-9);
     }
 }

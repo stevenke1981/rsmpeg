@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第九刀 multi-agent round 5）
+日期：2026-07-11（第十刀 multi-agent round 6）
 
 ## 指令
 
@@ -16,7 +16,7 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 | 項目 | 結果 |
 |------|------|
 | workspace tests | **PASS** |
-| rsmpeg-player | **66**（+6：B-frame reorder 2 / FramePool 4） |
+| rsmpeg-player | **76**（+10：openh264 reset 3 / symphonia reset+fmt 3 / clock pause-resume 4） |
 | rsmpeg-codec | 27 |
 | rsmpeg-scale | 8 |
 | rsmpeg-util | 12 |
@@ -37,8 +37,14 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - OpenH264Decoder：`take_display_order` 按 PTS 升冪出幀（B-frame 顯示序），缺 PTS 退回 FIFO
 - FramePool 獨立元件（Mutex+VecDeque 緩衝池，max_bytes 預算）+ 4 項單測
 
+## round 6 重點
+- OpenH264Decoder：`reset()` 先清 pending/pts_queue/eof/sps_pps_sent 再重建 decoder；單包解碼失敗改 `warn!`+跳過（不再殺播放）+ 3 單測
+- SymphoniaAudioDecoder：`reset()` 顯式清 pending/eof；新增 `map_sample_format`（Symphonia→rsmpeg_util）+ 3 單測（含 reset 清幀）
+- MasterClock：新增 `pause()/resume()/is_paused()/seek_to()`，pause 凍結位置（wall + audio-master 雙路徑）+ 4 單測
+
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做
 - VFR 仍依賴解碼幀 PTS，若上游未帶 PTS 始終退回固定幀率
 - FramePool 尚未接入事件路徑（目前 RGBA buffer 直接 move 進 PlayerEvent，需未來事件重構）
+- `map_sample_format` 為未來多格式輸出的 building block，尚未接入解碼路徑
 - Clippy 仍有預存 style warning（soft）

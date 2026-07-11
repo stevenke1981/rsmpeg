@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use openh264::formats::YUVSource;
 use rsmpeg_codec::{CodecId, CodecParameters, DecodeStatus, Decoder, Frame, Packet, PictureType};
 use rsmpeg_util::{PixelFormat, Rational, RsError, RsResult, SampleFormat};
+use tracing::warn;
 
 use crate::h264_bitstream::{
     avcc_extradata_to_annex_b, avcc_nal_length_size, packet_for_decoder, H264BitstreamFormat,
@@ -107,11 +108,11 @@ impl OpenH264Decoder {
             }
             Ok(None) => Ok(()),
             Err(e) => {
-                // Drop the PTS we just queued; failed decode produced no frame.
+                // A single corrupt packet must not kill playback: drop the PTS
+                // we just queued and warn instead of propagating a hard error.
                 let _ = self.pts_queue.pop_back();
-                Err(RsError::Codec(
-                    format!("OpenH264 decode failed: {e}").into(),
-                ))
+                warn!("OpenH264 decode failed (corrupt packet?); skipping: {e}");
+                Ok(())
             }
         }
     }
@@ -149,11 +150,11 @@ impl OpenH264Decoder {
     }
 
     fn recreate_decoder(&mut self) -> RsResult<()> {
-        self.decoder = create_decoder()?;
-        self.sps_pps_sent = false;
         self.pending.clear();
         self.pts_queue.clear();
         self.eof = false;
+        self.sps_pps_sent = false;
+        self.decoder = create_decoder()?;
         Ok(())
     }
 }
@@ -506,5 +507,79 @@ mod tests {
         assert_eq!(take_display_order(&mut pending).unwrap().pts, None);
         assert_eq!(take_display_order(&mut pending).unwrap().pts, Some(1));
         assert!(take_display_order(&mut pending).is_none());
+    }
+
+    #[test]
+    fn reset_clears_pending_and_pts() {
+        let mut dec = OpenH264Decoder::new().expect("create decoder");
+        // Simulate queued output/state that must NOT survive a reset.
+        let mut f = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        f.pts = Some(5);
+        dec.pending.push_back(f);
+        dec.pts_queue.push_back(Some(5));
+        dec.eof = true;
+
+        // Precondition: state is non-empty before reset.
+        assert!(!dec.pending.is_empty());
+        assert!(!dec.pts_queue.is_empty());
+        assert!(dec.eof);
+
+        dec.reset().unwrap();
+
+        assert!(dec.pending.is_empty(), "reset() must clear pending frames");
+        assert!(dec.pts_queue.is_empty(), "reset() must clear the PTS FIFO");
+        assert_eq!(dec.eof, false, "reset() must clear the EOF flag");
+
+        // After a clean reset, a fresh receive must need more input rather
+        // than replaying a stale frame.
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::NeedMoreInput
+        ));
+    }
+
+    #[test]
+    fn reset_after_flush_clears_eof() {
+        let mut dec = OpenH264Decoder::new().unwrap();
+        dec.send_packet(None).unwrap();
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
+
+        // reset() must undo the EOF set during the flush so playback can
+        // resume after a seek.
+        dec.reset().unwrap();
+        assert_eq!(dec.eof, false);
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::NeedMoreInput
+        ));
+    }
+
+    #[test]
+    fn submit_annex_b_swallows_corrupt_packet() {
+        use rsmpeg_codec::H264BitstreamFormat;
+
+        let mut params = CodecParameters::new(CodecId::H264);
+        params.h264_bitstream_format = H264BitstreamFormat::AnnexB;
+        let mut dec = OpenH264Decoder::from_params(&params).unwrap();
+
+        // Garbage Annex B that cannot decode into a picture.
+        let garbage = [0u8, 0, 0, 1, 0x88, 0x84, 0x21, 0x00];
+
+        // A single corrupt packet must be tolerated (no panic, no hard
+        // error) so it does not kill playback.
+        let res = dec.submit_annex_b(&garbage, Some(99));
+        assert!(
+            res.is_ok(),
+            "corrupt packet should be tolerated, not propagated as an error"
+        );
+
+        // Decoder must remain usable afterwards.
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::NeedMoreInput
+        ));
     }
 }

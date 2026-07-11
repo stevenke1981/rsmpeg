@@ -14,6 +14,7 @@ use symphonia::core::codecs::{
     CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8,
 };
 use symphonia::core::formats::Packet as SymPacket;
+use symphonia::core::sample::SampleFormat as SymphoniaSampleFormat;
 use symphonia::core::units::TimeBase;
 
 /// Packet-in Symphonia audio decoder implementing the rsmpeg send/receive model.
@@ -188,8 +189,13 @@ impl Decoder for SymphoniaAudioDecoder {
     }
 
     fn reset(&mut self) -> RsResult<()> {
+        // Drop any buffered (already-decoded but not yet emitted) frames so a
+        // seek doesn't leak stale audio across the discontinuity.
         self.pending.clear();
+        // Forget end-of-stream so the decoder can accept fresh input again.
         self.eof = false;
+        // Reset the underlying Symphonia decoder state (e.g. priming,
+        // concealment history) so the next packet decodes from a clean slate.
         self.decoder.reset();
         Ok(())
     }
@@ -226,6 +232,29 @@ fn channels_mask(channels: u16) -> Channels {
                 | Channels::REAR_LEFT
                 | Channels::REAR_RIGHT
         }
+    }
+}
+
+/// Map Symphonia's [`SymphoniaSampleFormat`] to our internal sample-format
+/// enum ([`rsmpeg_util::SampleFormat`]).
+///
+/// Returns `None` for formats we don't yet support, so future sample-format
+/// additions remain explicit and opt-in (rather than silently picked up).
+///
+/// Building block for future multi-format audio output; exercised by the
+/// `map_sample_format_*` tests. Not yet wired into the decode path because
+/// `audio_buffer_to_frame` currently normalizes everything to interleaved S16.
+#[allow(dead_code)]
+pub(crate) fn map_sample_format(fmt: SymphoniaSampleFormat) -> Option<rsmpeg_util::SampleFormat> {
+    use rsmpeg_util::SampleFormat as R;
+    use SymphoniaSampleFormat as S;
+    match fmt {
+        S::F32 => Some(R::F32),
+        S::F64 => Some(R::F64),
+        S::S32 => Some(R::S32),
+        S::S16 => Some(R::S16),
+        S::U8 => Some(R::U8),
+        _ => None,
     }
 }
 
@@ -411,6 +440,70 @@ mod tests {
             dec.receive_frame().unwrap(),
             DecodeStatus::NeedMoreInput
         ));
+    }
+
+    #[test]
+    fn reset_clears_buffered_samples() {
+        let mut dec = SymphoniaAudioDecoder::try_new(&pcm_params()).expect("pcm");
+
+        // Push a couple of already-decoded frames into the internal pending
+        // buffer, then mark end-of-stream.
+        for i in 0..2 {
+            dec.pending.push_back(Frame {
+                data: vec![vec![0u8, 1, 2, 3]],
+                linesize: vec![4],
+                width: 0,
+                height: 0,
+                pixel_format: PixelFormat::None,
+                sample_format: SampleFormat::S16,
+                sample_rate: 44_100,
+                channels: 2,
+                samples: 1,
+                pts: Some(i),
+                duration: 1,
+                time_base: Rational::new(1, 44_100),
+                key_frame: true,
+                pict_type: PictureType::I,
+            });
+        }
+        assert_eq!(dec.pending.len(), 2);
+        dec.eof = true;
+
+        // Reset and verify buffered state is fully cleared.
+        dec.reset().unwrap();
+        assert!(
+            dec.pending.is_empty(),
+            "pending buffer must be empty after reset (no stale audio across seek)"
+        );
+        assert!(!dec.eof, "eof must be false after reset");
+
+        // After reset the decoder is ready for fresh input again.
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::NeedMoreInput
+        ));
+    }
+
+    #[test]
+    fn map_sample_format_known() {
+        use rsmpeg_util::SampleFormat as R;
+        use SymphoniaSampleFormat as S;
+        assert_eq!(map_sample_format(S::F32), Some(R::F32));
+        assert_eq!(map_sample_format(S::F64), Some(R::F64));
+        assert_eq!(map_sample_format(S::S32), Some(R::S32));
+        assert_eq!(map_sample_format(S::S16), Some(R::S16));
+        assert_eq!(map_sample_format(S::U8), Some(R::U8));
+    }
+
+    #[test]
+    fn map_sample_format_unsupported_is_none() {
+        use SymphoniaSampleFormat as S;
+        // Formats we don't yet carry in rsmpeg_util::SampleFormat map to None.
+        assert_eq!(map_sample_format(S::U16), None);
+        assert_eq!(map_sample_format(S::U24), None);
+        assert_eq!(map_sample_format(S::U32), None);
+        assert_eq!(map_sample_format(S::S8), None);
+        assert_eq!(map_sample_format(S::S24), None);
     }
 
     #[test]
