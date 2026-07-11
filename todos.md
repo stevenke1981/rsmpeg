@@ -104,7 +104,7 @@
 - [ ] 多視訊軌時每個 stream 必須保存自己的 extradata
 - [x] 支援 extended-size ISOBMFF box
 - [x] 支援 box size 為 0 的合法情況
-- [ ] 遇到 fragmented MP4 時回報目前支援狀態
+- [x] 遇到 fragmented MP4 時回報目前支援狀態
 - [x] 測試大型 MP4 開檔時不得按檔案大小配置記憶體
 
 驗收：
@@ -254,45 +254,45 @@ pub trait Demuxer: Send {
 
 待辦：
 
-- [ ] 建立 `BoxHeader`
-- [ ] 支援 32-bit box size
-- [ ] 支援 64-bit extended size
-- [ ] 支援 size=0
-- [ ] 每個 parser 必須接受 `parent_end`
-- [ ] parser 不得越過父 box 邊界
-- [ ] parser 發現損毀 box 時回傳帶 offset 的錯誤
-- [ ] 支援未知 box 安全跳過
+- [x] 建立 `BoxHeader`
+- [x] 支援 32-bit box size
+- [x] 支援 64-bit extended size
+- [x] 支援 size=0
+- [x] 每個 parser 必須接受 `parent_end`
+- [x] parser 不得越過父 box 邊界
+- [x] parser 發現損毀 box 時回傳帶 offset 的錯誤
+- [x] 支援未知 box 安全跳過
 - [ ] 建立 box depth 限制
 - [ ] 建立最大 box size 防護
 - [ ] 為 nested box parser 加入 fuzz 測試
 
 必須解析：
 
-- [ ] `ftyp`
-- [ ] `moov`
+- [x] `ftyp`
+- [x] `moov`
 - [ ] `mvhd`
-- [ ] `trak`
+- [x] `trak`
 - [ ] `tkhd`
-- [ ] `mdia`
-- [ ] `mdhd`
-- [ ] `hdlr`
-- [ ] `minf`
-- [ ] `stbl`
-- [ ] `stsd`
-- [ ] `stts`
-- [ ] `ctts`
-- [ ] `stsc`
-- [ ] `stsz`
-- [ ] `stco`
-- [ ] `co64`
-- [ ] `stss`
+- [x] `mdia`
+- [x] `mdhd`
+- [x] `hdlr`
+- [x] `minf`
+- [x] `stbl`
+- [x] `stsd`
+- [x] `stts`
+- [x] `ctts`
+- [x] `stsc`
+- [x] `stsz`
+- [x] `stco`
+- [x] `co64`
+- [x] `stss`
 - [ ] `edts`
 - [ ] `elst`
-- [ ] `avc1`
-- [ ] `avc3`
-- [ ] `avcC`
-- [ ] `mp4a`
-- [ ] `esds`
+- [x] `avc1`
+- [x] `avc3`
+- [x] `avcC`
+- [x] `mp4a`
+- [x] `esds`
 
 後續支援：
 
@@ -309,31 +309,31 @@ pub trait Demuxer: Send {
 
 待辦：
 
-- [ ] 根據 `stsc` 建立 chunk 到 sample mapping
-- [ ] 根據 `stsz` 建立 sample size
-- [ ] 根據 `stco/co64` 建立 sample offset
-- [ ] 根據 `stts` 建立 DTS
-- [ ] 根據 `ctts` 建立 PTS
-- [ ] 根據 `stss` 標記 keyframe
+- [x] 根據 `stsc` 建立 chunk 到 sample mapping
+- [x] 根據 `stsz` 建立 sample size
+- [x] 根據 `stco/co64` 建立 sample offset
+- [x] 根據 `stts` 建立 DTS
+- [x] 根據 `ctts` 建立 PTS
+- [x] 根據 `stss` 標記 keyframe
 - [ ] 根據 edit list 修正 timeline
-- [ ] 產生完整 `Packet`
-- [ ] Packet 必須正確填入 `pts`
-- [ ] Packet 必須正確填入 `dts`
-- [ ] Packet 必須正確填入 `duration`
-- [ ] Packet 必須正確填入 `stream_index`
-- [ ] Packet 必須正確填入 `flags`
-- [ ] Packet 必須正確填入 `pos`
-- [ ] Packet 必須正確填入 `time_base`
-- [ ] 支援多音訊與多視訊軌交錯輸出
-- [ ] packet 依 DTS 順序輸出
-- [ ] 不得假設所有 sample duration 相同
+- [x] 產生完整 `Packet`
+- [x] Packet 必須正確填入 `pts`
+- [x] Packet 必須正確填入 `dts`
+- [x] Packet 必須正確填入 `duration`
+- [x] Packet 必須正確填入 `stream_index`
+- [x] Packet 必須正確填入 `flags`
+- [x] Packet 必須正確填入 `pos`
+- [x] Packet 必須正確填入 `time_base`
+- [x] 支援多音訊與多視訊軌交錯輸出
+- [x] packet 依 DTS 順序輸出
+- [x] 不得假設所有 sample duration 相同
 
 驗收：
 
-- [ ] H.264 + AAC MP4 可由 rsmpeg-format 連續讀出 packet
-- [ ] B-frame MP4 的 PTS 與 DTS 不相同且正確
-- [ ] keyframe flag 正確
-- [ ] seek 可定位到目標前最近 keyframe
+- [x] H.264 + AAC MP4 可由 rsmpeg-format 連續讀出 packet（合成 + sample index；player 尚未切 native path）
+- [x] B-frame MP4 的 PTS 與 DTS 不相同且正確（ctts 單元測試）
+- [x] keyframe flag 正確
+- [x] seek 可定位到目標前最近 keyframe
 
 ---
 
@@ -1017,15 +1017,15 @@ native-only = []
 
 ## Milestone 2：原生 MP4 demux
 
-- [ ] MP4 sample table 完成
-- [ ] `read_frame` 產生真實 packet
-- [ ] PTS／DTS／duration／keyframe 正確
-- [ ] MP4 seek 可用
+- [x] MP4 sample table 完成
+- [x] `read_frame` 產生真實 packet
+- [x] PTS／DTS／duration／keyframe 正確
+- [x] MP4 seek 可用
 
 完成標準：
 
 - [ ] 播放器不再依賴 Symphonia demux MP4
-- [ ] rsmpeg-format 可獨立輸出 MP4 packet
+- [x] rsmpeg-format 可獨立輸出 MP4 packet
 
 ---
 

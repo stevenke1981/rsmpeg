@@ -104,7 +104,7 @@ impl FormatContext {
         // (Box<dyn InputFormat> is not Clone, so we cannot reuse a registry entry.)
         match format_name.as_str() {
             "mp4" | "mov" | "m4a" | "m4v" => {
-                demuxer = Some(Box::new(crate::demuxers::MP4Demuxer));
+                demuxer = Some(Box::new(crate::demuxers::MP4Demuxer::default()));
             }
             "matroska" | "mkv" | "webm" | "mka" | "mks" => {
                 demuxer = Some(Box::new(crate::demuxers::MKVDemuxer));
