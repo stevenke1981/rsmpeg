@@ -1,0 +1,33 @@
+[package]
+name = "rsmpeg-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Unified playback core for rsmpeg (CLI + GUI)"
+
+[lints]
+workspace = true
+
+[features]
+default = ["backend-symphonia", "backend-openh264", "audio-rodio"]
+backend-symphonia = ["dep:symphonia"]
+backend-openh264 = ["dep:openh264"]
+audio-rodio = ["dep:rodio"]
+
+[dependencies]
+rsmpeg-util = { path = "../rsmpeg-util" }
+rsmpeg-codec = { path = "../rsmpeg-codec" }
+rsmpeg-format = { path = "../rsmpeg-format" }
+rsmpeg-scale = { path = "../rsmpeg-scale" }
+rsmpeg-resample = { path = "../rsmpeg-resample" }
+thiserror.workspace = true
+tracing.workspace = true
+
+symphonia = { version = "0.5", optional = true, default-features = false, features = [
+    "mp3", "isomp4", "aac", "vorbis", "flac", "mkv", "ogg", "wav", "pcm", "alac", "adpcm",
+] }
+openh264 = { version = "0.9", optional = true }
+rodio = { version = "0.20", optional = true }
+
+[dev-dependencies]

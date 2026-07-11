@@ -23,6 +23,7 @@ pub enum CodecId {
     Vorbis,
     Flac,
     Mp3,
+    Aac,
     Pcm,
     Alac,
     // ── Image ──
@@ -58,6 +59,7 @@ impl CodecId {
             CodecId::Vorbis => "vorbis",
             CodecId::Flac => "flac",
             CodecId::Mp3 => "mp3",
+            CodecId::Aac => "aac",
             CodecId::Pcm => "pcm",
             CodecId::Alac => "alac",
             CodecId::Png => "png",
@@ -90,6 +92,7 @@ impl CodecId {
             "vorbis" => Some(CodecId::Vorbis),
             "flac" => Some(CodecId::Flac),
             "mp3" => Some(CodecId::Mp3),
+            "aac" => Some(CodecId::Aac),
             "pcm" => Some(CodecId::Pcm),
             "alac" => Some(CodecId::Alac),
             "png" => Some(CodecId::Png),
@@ -127,6 +130,7 @@ impl CodecId {
             | CodecId::Vorbis
             | CodecId::Flac
             | CodecId::Mp3
+            | CodecId::Aac
             | CodecId::Pcm
             | CodecId::Alac => MediaType::Audio,
             CodecId::Srt | CodecId::WebVtt => MediaType::Subtitle,

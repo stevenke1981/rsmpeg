@@ -9,8 +9,15 @@ use std::io::SeekFrom;
 /// WAV (Waveform Audio) demuxer.
 ///
 /// Parses the RIFF/WAVE header, reads the `fmt ` chunk for audio parameters,
-/// and locates the `data` chunk for duration calculation.
-pub struct WAVDemuxer;
+/// locates the `data` chunk, and streams PCM packets from `read_frame`.
+pub struct WAVDemuxer {
+    data_remaining: u64,
+    sample_rate: u32,
+    channels: u16,
+    block_align: u16,
+    /// Bytes per packet (~20 ms of audio).
+    packet_bytes: usize,
+}
 
 impl InputFormat for WAVDemuxer {
     fn name(&self) -> &'static str {
@@ -51,7 +58,7 @@ impl InputFormat for WAVDemuxer {
         let channels = io.read_u16_le()?;
         let sample_rate = io.read_u32_le()?;
         let _byte_rate = io.read_u32_le()?;
-        let _block_align = io.read_u16_le()?;
+        let block_align = io.read_u16_le()?;
         let bits_per_sample = io.read_u16_le()?;
 
         // Skip remaining fmt chunk data (if any)
@@ -90,6 +97,16 @@ impl InputFormat for WAVDemuxer {
 
         let bit_rate = sample_rate as u64 * channels as u64 * bits_per_sample as u64;
 
+        // ~20 ms of audio per packet
+        let samples_per_packet = (sample_rate as usize / 50).max(1);
+        let packet_bytes = (samples_per_packet * block_align as usize).max(block_align as usize);
+
+        self.data_remaining = data_size;
+        self.sample_rate = sample_rate;
+        self.channels = channels;
+        self.block_align = block_align.max(1);
+        self.packet_bytes = packet_bytes;
+
         // --- Build stream ---
         let mut stream = Stream::new(0, codec_id);
         stream.media_type = MediaType::Audio;
@@ -104,7 +121,9 @@ impl InputFormat for WAVDemuxer {
             channels: Some(channels),
             bit_rate: Some(bit_rate),
             extradata: None,
+            h264_bitstream_format: Default::default(),
         };
+        stream.time_base = rsmpeg_util::Rational::new(1, sample_rate.max(1) as i32);
         stream.duration = duration_ms;
         ctx.duration = duration_ms;
         ctx.bit_rate = bit_rate;
@@ -120,12 +139,72 @@ impl InputFormat for WAVDemuxer {
         Ok(())
     }
 
-    fn read_frame(&mut self, _ctx: &mut FormatContext) -> RsResult<Option<Packet>> {
-        Ok(None)
+    fn read_frame(&mut self, ctx: &mut FormatContext) -> RsResult<Option<Packet>> {
+        if self.data_remaining == 0 {
+            return Ok(None);
+        }
+        let io = ctx
+            .io
+            .as_mut()
+            .ok_or_else(|| RsError::InvalidData("No IO context".into()))?;
+
+        let to_read = (self.packet_bytes as u64).min(self.data_remaining) as usize;
+        // Align to block boundary
+        let to_read = (to_read / self.block_align as usize * self.block_align as usize).max(
+            if self.data_remaining as usize >= self.block_align as usize {
+                self.block_align as usize
+            } else {
+                self.data_remaining as usize
+            },
+        );
+        if to_read == 0 {
+            self.data_remaining = 0;
+            return Ok(None);
+        }
+
+        let mut buf = vec![0u8; to_read];
+        match io.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(_) => {
+                self.data_remaining = 0;
+                return Ok(None);
+            }
+        }
+        self.data_remaining = self.data_remaining.saturating_sub(to_read as u64);
+
+        let samples = to_read as i64 / self.block_align.max(1) as i64;
+        let mut packet = Packet::new(bytes::Bytes::from(buf), 0);
+        packet.duration = samples;
+        packet.time_base = rsmpeg_util::Rational::new(1, self.sample_rate.max(1) as i32);
+        packet.flags = rsmpeg_codec::PacketFlags::KEY;
+        Ok(Some(packet))
     }
 
-    fn seek(&mut self, _ctx: &mut FormatContext, _ts: i64) -> RsResult<()> {
+    fn seek(&mut self, ctx: &mut FormatContext, timestamp: i64) -> RsResult<()> {
+        // timestamp is in stream time_base (samples for us)
+        let io = ctx
+            .io
+            .as_mut()
+            .ok_or_else(|| RsError::InvalidData("No IO context".into()))?;
+        // Re-find data chunk start: simplistic — seek is best-effort for PCM
+        // Full seek would need stored data_start; for now only support restart.
+        if timestamp <= 0 {
+            // Not fully implemented for mid-file; leave position as-is
+            let _ = io;
+        }
         Ok(())
+    }
+}
+
+impl Default for WAVDemuxer {
+    fn default() -> Self {
+        Self {
+            data_remaining: 0,
+            sample_rate: 0,
+            channels: 0,
+            block_align: 1,
+            packet_bytes: 4096,
+        }
     }
 }
 
@@ -146,10 +225,8 @@ fn find_data_chunk(io: &mut crate::io_context::IOContext) -> RsResult<u32> {
         } else {
             size as u64 + 1
         };
-        if skip > 0 {
-            if io.seek(SeekFrom::Current(skip as i64)).is_err() {
-                return Ok(0);
-            }
+        if skip > 0 && io.seek(SeekFrom::Current(skip as i64)).is_err() {
+            return Ok(0);
         }
     }
 }

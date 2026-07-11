@@ -1,54 +1,36 @@
-//! egui/eframe GUI media player for rsmpeg.
+//! egui/eframe GUI — hosts only send commands and poll [`rsmpeg_player`] events.
 //!
-//! Provides a native window with video display, play/pause/stop controls,
-//! a draggable seek timeline, volume, open-file dialog, and drag-and-drop
-//! file loading.
+//! Demux / decode never run on the UI thread (todos.md Phase 0 / 9.1).
 
-pub mod engine;
-pub mod state;
 pub mod ui;
 
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-
 use eframe::egui;
-use engine::PlaybackEngine;
-use state::FrameData;
-
-// ---------------------------------------------------------------------------
-// Application
-// ---------------------------------------------------------------------------
+use rsmpeg_player::{Player, PlayerEvent, PlayerState};
 
 /// Main egui application state.
 pub struct MediaApp {
-    /// Current playback engine (None when stopped / no file).
-    engine: Option<PlaybackEngine>,
-    /// Shared playback state (cross-thread).
-    state: Arc<Mutex<state::PlaybackState>>,
-    /// Latest decoded frame for display.
-    _latest_frame: Option<FrameData>,
-    /// egui texture handle for the current video frame.
+    player: Option<Player>,
     texture: Option<egui::TextureHandle>,
-    /// Current file path (set when a file is loaded).
     file_path: Option<String>,
-    /// Status message shown in the UI.
     status: String,
-    /// Audio volume (0.0 – 1.0).
     volume: f32,
+    /// Cached playhead for UI (updated from events).
+    position_sec: f64,
+    duration_sec: f64,
+    playing: bool,
 }
 
 impl MediaApp {
-    /// Create a new media player.  If `path` is provided, immediately
-    /// starts loading that file.
     pub fn new(path: Option<String>) -> Self {
         let mut app = Self {
-            engine: None,
-            state: Arc::new(Mutex::new(state::PlaybackState::default())),
-            _latest_frame: None,
+            player: None,
             texture: None,
             file_path: None,
             status: "Open a media file to start playback".into(),
             volume: 0.8,
+            position_sec: 0.0,
+            duration_sec: 0.0,
+            playing: false,
         };
         if let Some(p) = path {
             app.load_file(&p);
@@ -56,62 +38,102 @@ impl MediaApp {
         app
     }
 
-    /// Load (or reload) a media file, stopping any current playback.
     pub fn load_file(&mut self, path: &str) {
-        // Stop existing playback
-        if let Some(engine) = self.engine.take() {
-            engine.stop();
-            drop(engine);
+        if let Some(mut p) = self.player.take() {
+            let _ = p.shutdown();
         }
-        self._latest_frame = None;
         self.texture = None;
+        self.position_sec = 0.0;
+        self.duration_sec = 0.0;
+        self.playing = false;
 
-        match PlaybackEngine::new(path) {
-            Ok(engine) => {
-                self.state = engine.state.clone();
+        match Player::builder()
+            .input(path)
+            .volume(self.volume)
+            .autoplay(true)
+            .build()
+        {
+            Ok(player) => {
                 self.file_path = Some(path.to_string());
                 self.status = format!("Playing: {}", path);
-                self.engine = Some(engine);
+                self.playing = true;
+                self.player = Some(player);
             }
             Err(e) => {
                 self.status = format!("Error: {}", e);
+                self.file_path = None;
             }
         }
+    }
+
+    pub fn stop_playback(&mut self) {
+        if let Some(mut p) = self.player.take() {
+            let _ = p.stop();
+            let _ = p.shutdown();
+        }
+        self.texture = None;
+        self.file_path = None;
+        self.playing = false;
+        self.position_sec = 0.0;
+        self.duration_sec = 0.0;
+        self.status = "Stopped. Open a media file to start playback.".into();
     }
 }
 
 impl eframe::App for MediaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain decoded video frames from the engine — only upload the *latest*
-        // to the GPU (uploading every intermediate frame causes stutter).
-        let mut clear_engine = false;
-        let mut got_new_frame = false;
-        if let Some(engine) = self.engine.as_ref() {
-            let mut latest: Option<state::FrameData> = None;
-            let mut disconnected = false;
-            loop {
-                match engine.frame_rx.try_recv() {
-                    Ok(frame) => {
-                        latest = Some(frame);
+        let mut got_frame = false;
+        let mut clear_player = false;
+
+        if let Some(player) = self.player.as_mut() {
+            let (events, latest_frame) = player.poll_all();
+            for ev in events {
+                match ev {
+                    PlayerEvent::Snapshot(s) => {
+                        self.playing = s.playing;
+                        self.position_sec = s.position.as_secs_f64();
+                        self.duration_sec = s.duration.as_secs_f64();
+                        self.volume = s.volume;
+                        if !s.status.is_empty() && s.status != "playing" {
+                            // keep path-based status unless error-ish
+                        }
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
+                    PlayerEvent::PositionChanged { position, .. } => {
+                        self.position_sec = position.as_secs_f64();
                     }
+                    PlayerEvent::SeekCompleted { position, .. } => {
+                        self.position_sec = position.as_secs_f64();
+                    }
+                    PlayerEvent::Ended { .. } => {
+                        self.status = "Playback complete".into();
+                        self.playing = false;
+                        clear_player = true;
+                    }
+                    PlayerEvent::Error { message, .. } => {
+                        self.status = format!("Playback error: {}", message);
+                        self.file_path = None;
+                        clear_player = true;
+                    }
+                    PlayerEvent::Warning { message, .. } => {
+                        self.status = message;
+                    }
+                    PlayerEvent::VideoFrame { .. } => {}
                 }
             }
 
-            if let Some(frame) = latest {
-                got_new_frame = true;
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width, frame.height],
-                    &frame.rgba,
-                );
-                // Reuse GPU texture when resolution is unchanged (much cheaper
-                // than load_texture every frame).
+            if let Some(PlayerEvent::VideoFrame {
+                width,
+                height,
+                rgba,
+                pts,
+                ..
+            }) = latest_frame
+            {
+                got_frame = true;
+                self.position_sec = pts.as_secs_f64();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                 match self.texture.as_mut() {
-                    Some(tex) if tex.size() == [frame.width, frame.height] => {
+                    Some(tex) if tex.size() == [width, height] => {
                         tex.set(color_image, egui::TextureOptions::LINEAR);
                     }
                     _ => {
@@ -122,43 +144,30 @@ impl eframe::App for MediaApp {
                         ));
                     }
                 }
-                self._latest_frame = Some(frame);
             }
 
-            // Check if engine thread exited without ever sending a frame
-            if disconnected && self._latest_frame.is_none() {
-                let s = state::lock_state(&self.state);
-                if s.status != "ended" && s.status != "stopped" && !s.status.is_empty() {
-                    self.status = format!("Playback error: {}", s.status);
-                } else {
-                    self.status = "Error: Could not open or decode file. Try another file.".into();
+            // Sync duration/playing from player cache
+            self.duration_sec = player.duration().as_secs_f64();
+            self.playing = player.is_playing();
+            if player.state() == PlayerState::Error {
+                if let Some(err) = player.last_error() {
+                    self.status = format!("Playback error: {}", err);
                 }
-                self.file_path = None;
-                clear_engine = true;
-            }
-
-            // Check if playback ended (poison-safe)
-            let s = state::lock_state(&self.state);
-            if s.status == "ended" {
-                self.status = "Playback complete".into();
-                clear_engine = disconnected;
-            } else if s.status == "stopped" {
-                clear_engine = disconnected;
+                clear_player = true;
             }
         }
 
-        if clear_engine {
-            self.engine = None;
+        if clear_player {
+            if let Some(mut p) = self.player.take() {
+                let _ = p.shutdown();
+            }
             ctx.request_repaint();
         }
 
-        // Render the UI
         ui::render_ui(self, ctx);
 
-        // Cap UI refresh ~60–120 Hz while playing.  Continuous request_repaint()
-        // maxes out a core and fights the decoder thread.
-        if self.engine.is_some() {
-            if got_new_frame {
+        if self.player.is_some() {
+            if got_frame {
                 ctx.request_repaint();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(8));
@@ -167,13 +176,7 @@ impl eframe::App for MediaApp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 /// Launch the egui GUI window.
-///
-/// If `path` is `Some(...)`, opens that media file on startup.
 pub fn run_gui(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -189,6 +192,5 @@ pub fn run_gui(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         options,
         Box::new(|_cc| Ok(Box::new(MediaApp::new(path_owned)))),
     )?;
-
     Ok(())
 }

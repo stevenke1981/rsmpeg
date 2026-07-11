@@ -1,0 +1,78 @@
+# Minimal CI for the rsmpeg workspace.
+#
+# openh264 (via openh264 / openh264-sys2 in rsmpeg-player and rsmpeg-cli) may
+# compile Cisco OpenH264 from source. That needs a C++ toolchain on the runner
+# (preinstalled on ubuntu-latest; windows-latest has MSVC via the Visual Studio
+# tools already on the image). OpenH264 builds can take a while — the Windows
+# job uses a longer timeout. If builds become too heavy or flaky, consider
+# skipping default features for those crates, e.g.:
+#   cargo test --workspace --exclude rsmpeg-player --exclude rsmpeg-cli
+# or testing with --no-default-features / without backend-openh264.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (ubuntu, stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+  test-windows:
+    name: test (windows, stable)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+  test-macos:
+    name: test (macos, stable)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+  clippy:
+    name: clippy (ubuntu, soft)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy workspace
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings

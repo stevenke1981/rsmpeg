@@ -2,14 +2,16 @@
 //!
 //! Supports common PCM formats: U8, S16LE, S32LE, F32.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 
-use crate::codec::{Codec, CodecCapabilities, Decoder, Encoder};
+use crate::codec::{Codec, CodecCapabilities, DecodeStatus, Decoder, Encoder};
 use crate::codec_id::CodecId;
 use crate::codec_parameters::CodecParameters;
 use crate::frame::Frame;
 use crate::packet::{Packet, PacketFlags};
-use rsmpeg_util::{MediaType, RsResult, SampleFormat};
+use rsmpeg_util::{MediaType, RsError, RsResult, SampleFormat};
 
 /// PCM audio codec — uncompressed audio passthrough.
 ///
@@ -75,6 +77,8 @@ pub struct PCMAudioDecoder {
     params: Option<CodecParameters>,
     channels: u16,
     sample_rate: u32,
+    pending: VecDeque<Frame>,
+    eof: bool,
 }
 
 impl PCMAudioDecoder {
@@ -84,6 +88,8 @@ impl PCMAudioDecoder {
             params: None,
             channels: 2,
             sample_rate: 44100,
+            pending: VecDeque::new(),
+            eof: false,
         }
     }
 
@@ -97,14 +103,8 @@ impl PCMAudioDecoder {
         }
         self.params = Some(params);
     }
-}
 
-impl Decoder for PCMAudioDecoder {
-    fn codec_id(&self) -> CodecId {
-        CodecId::Pcm
-    }
-
-    fn decode(&mut self, packet: &Packet) -> RsResult<Vec<Frame>> {
+    fn packet_to_frame(&self, packet: &Packet) -> Frame {
         let bytes_per_sample = self.sample_format.bytes();
         let frame_size = bytes_per_sample * self.channels as usize;
         let nb_samples = if frame_size > 0 {
@@ -113,7 +113,7 @@ impl Decoder for PCMAudioDecoder {
             0
         };
 
-        let frame = Frame {
+        Frame {
             data: vec![packet.data.to_vec()],
             linesize: vec![packet.data.len()],
             width: 0,
@@ -128,12 +128,47 @@ impl Decoder for PCMAudioDecoder {
             time_base: packet.time_base,
             key_frame: true,
             pict_type: crate::picture_type::PictureType::I,
-        };
-        Ok(vec![frame])
+        }
+    }
+}
+
+impl Decoder for PCMAudioDecoder {
+    fn codec_id(&self) -> CodecId {
+        CodecId::Pcm
     }
 
-    fn flush(&mut self) -> RsResult<Vec<Frame>> {
-        Ok(vec![])
+    fn send_packet(&mut self, packet: Option<&Packet>) -> RsResult<()> {
+        match packet {
+            Some(pkt) => {
+                if self.eof {
+                    return Err(RsError::Codec(
+                        "cannot send packet after end-of-stream; call reset() first".into(),
+                    ));
+                }
+                self.pending.push_back(self.packet_to_frame(pkt));
+                Ok(())
+            }
+            None => {
+                self.eof = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn receive_frame(&mut self) -> RsResult<DecodeStatus> {
+        if let Some(frame) = self.pending.pop_front() {
+            Ok(DecodeStatus::Frame(frame))
+        } else if self.eof {
+            Ok(DecodeStatus::EndOfStream)
+        } else {
+            Ok(DecodeStatus::NeedMoreInput)
+        }
+    }
+
+    fn reset(&mut self) -> RsResult<()> {
+        self.pending.clear();
+        self.eof = false;
+        Ok(())
     }
 
     fn get_parameters(&self) -> CodecParameters {
@@ -263,6 +298,7 @@ mod tests {
             sample_format: Some(sample_format),
             bit_rate: None,
             extradata: None,
+            h264_bitstream_format: Default::default(),
         });
 
         let packet = Packet {
@@ -281,6 +317,39 @@ mod tests {
         assert_eq!(frames[0].samples, 50);
         assert_eq!(frames[0].channels, 1);
         assert_eq!(frames[0].sample_rate, 48000);
+    }
+
+    #[test]
+    fn test_pcm_send_receive() {
+        let mut decoder = PCMAudioDecoder::new(SampleFormat::S16);
+        let packet = Packet {
+            data: Bytes::from(vec![0u8; 40]),
+            pts: Some(7),
+            dts: Some(7),
+            duration: 10,
+            stream_index: 0,
+            flags: PacketFlags::KEY,
+            pos: 0,
+            time_base: Rational::new(1, 44100),
+        };
+        decoder.send_packet(Some(&packet)).unwrap();
+        match decoder.receive_frame().unwrap() {
+            DecodeStatus::Frame(f) => {
+                // 40 / (2 * 2) = 10 samples
+                assert_eq!(f.samples, 10);
+                assert_eq!(f.pts, Some(7));
+            }
+            other => panic!("expected Frame, got {:?}", other),
+        }
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeStatus::NeedMoreInput
+        ));
+        decoder.send_packet(None).unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
     }
 
     #[test]

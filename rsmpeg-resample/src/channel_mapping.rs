@@ -20,8 +20,8 @@ impl ChannelMapping {
 
         // Build identity-like mixing matrix (default: passthrough for matching channels)
         let mut matrix = vec![vec![0.0_f64; nb_in]; nb_out];
-        for i in 0..nb_out.min(nb_in) {
-            matrix[i][i] = 1.0;
+        for (i, row) in matrix.iter_mut().enumerate().take(nb_out.min(nb_in)) {
+            row[i] = 1.0;
         }
 
         ChannelMapping {

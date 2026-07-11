@@ -88,7 +88,6 @@ mod tests {
     use crate::codec::Decoder;
     use crate::codec::Encoder;
     use crate::codec_parameters::CodecParameters;
-    use crate::frame::Frame;
     use crate::packet::Packet;
     use rsmpeg_util::{MediaType, RsResult};
 
@@ -126,11 +125,14 @@ mod tests {
         fn codec_id(&self) -> CodecId {
             CodecId::Mp3
         }
-        fn decode(&mut self, _packet: &Packet) -> RsResult<Vec<Frame>> {
-            Ok(vec![])
+        fn send_packet(&mut self, _packet: Option<&Packet>) -> RsResult<()> {
+            Ok(())
         }
-        fn flush(&mut self) -> RsResult<Vec<Frame>> {
-            Ok(vec![])
+        fn receive_frame(&mut self) -> RsResult<crate::codec::DecodeStatus> {
+            Ok(crate::codec::DecodeStatus::NeedMoreInput)
+        }
+        fn reset(&mut self) -> RsResult<()> {
+            Ok(())
         }
         fn get_parameters(&self) -> CodecParameters {
             CodecParameters::new(CodecId::Mp3)
