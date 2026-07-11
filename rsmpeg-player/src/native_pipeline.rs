@@ -11,6 +11,7 @@ use rsmpeg_codec::CodecId;
 use rsmpeg_format::FormatContext;
 use rsmpeg_util::MediaType;
 
+use crate::clock::MasterClock;
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
@@ -158,6 +159,9 @@ fn run_native_inner(
     let mut playing = true;
     let mut stop = false;
     let mut position = Duration::ZERO;
+    let mut audio_master = MasterClock::new();
+    audio_master.set_audio_master(true);
+    let mut appended_samples: u64 = 0;
     let mut force_one_frame = false;
     let mut was_playing = true;
     let mut playback_start: Option<Instant> = None;
@@ -537,6 +541,7 @@ fn run_native_inner(
                                 let device_rate = audio_rate.max(1);
                                 let samples = frame_to_s16_device(&f, device_rate, device_ch)
                                     .unwrap_or_default();
+                                let sample_count = samples.len();
                                 if !samples.is_empty() {
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
@@ -546,20 +551,22 @@ fn run_native_inner(
                                         ));
                                     }
                                 }
-                                // Drive position from audio when no video
+                                // Drive position from audio when no video.
                                 if video_si.is_none() {
-                                    if let Some(ts) = f.pts.or(packet.pts).or(packet.dts) {
-                                        let tb = &ctx.streams[si].time_base;
-                                        let sec = ts as f64 * tb.num as f64 / tb.den.max(1) as f64;
-                                        position = Duration::from_secs_f64(sec.max(0.0));
-                                        emit(
-                                            event_tx,
-                                            PlayerEvent::PositionChanged {
-                                                position,
-                                                generation,
-                                            },
-                                        );
+                                    if audio_master.audio_sample_rate() == 0 {
+                                        audio_master.set_audio_sample_rate(device_rate);
                                     }
+                                    // samples is interleaved i16; frames = len / channels.
+                                    appended_samples += sample_count as u64 / device_ch as u64;
+                                    audio_master.set_audio_samples_played(appended_samples);
+                                    position = audio_master.now();
+                                    emit(
+                                        event_tx,
+                                        PlayerEvent::PositionChanged {
+                                            position,
+                                            generation,
+                                        },
+                                    );
                                 }
                             }
                             Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {

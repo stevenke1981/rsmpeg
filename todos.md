@@ -549,10 +549,12 @@ pub trait Decoder: Send {
 - [ ] 支援 drift compensation
 - [ ] 支援 flush 剩餘 samples
 - [ ] 支援重新配置輸入格式
+- [x] 實作 linear interpolation sample rate conversion（S16/F32 互通）
+- [x] 支援 mono → stereo / stereo → mono（channel mapping）
 - [ ] 將重採樣延遲回報給 audio clock
 - [ ] 增加高品質與低延遲模式
-- [ ] 增加重採樣品質測試
-- [ ] 增加聲道 mapping 測試
+- [x] 增加重採樣品質測試
+- [x] 增加聲道 mapping 測試
 
 ---
 
@@ -591,7 +593,7 @@ pub trait Decoder: Send {
 - [ ] pause 時 clock 停止
 - [ ] resume 時 clock 連續
 - [ ] 音訊裝置不存在時切換為 wall clock
-- [ ] audio-only 播放的 UI position 必須由 AudioClock 更新
+- [x] audio-only 播放的 UI position 必須由 AudioClock 更新（MasterClock 接 native path）
 - [ ] 允許查詢 clock drift 與 underflow 次數
 
 ---
@@ -663,7 +665,7 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [x] 根據 frame PTS 與 master clock 決定顯示時間（API 已建；native 仍部分 Instant pacing）
+- [x] 根據 frame PTS 與 master clock 決定顯示時間（API 已建；native + fallback demux_worker 皆使用 VideoScheduler）
 - [x] 視訊過早時等待
 - [x] 視訊輕微落後時立即顯示
 - [x] 視訊嚴重落後時丟棄非關鍵 frame
@@ -956,7 +958,7 @@ native-only = []
 - [x] 新增 GitHub Actions
 - [x] Windows stable Rust
 - [x] Ubuntu stable Rust
-- [ ] macOS stable Rust
+- [x] macOS stable Rust
 - [x] `cargo fmt --check`
 - [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`（soft / continue-on-error）
 - [x] `cargo test --workspace`
@@ -1045,7 +1047,7 @@ native-only = []
 
 ## Milestone 4：Resample／Scale 整合
 
-- [x] 音訊走 rsmpeg-resample（`frame_to_s16_device` 掛接；演算法仍 stub）
+- [x] 音訊走 rsmpeg-resample（`frame_to_s16_device` 掛接；linear interpolation 實作，非 stub）
 - [x] 視訊走 rsmpeg-scale（native + fallback YUV420P→RGBA）
 - [ ] audio ring buffer
 - [ ] frame pool

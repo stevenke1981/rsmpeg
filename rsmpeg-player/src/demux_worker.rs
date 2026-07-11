@@ -6,14 +6,15 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::audio_convert::frame_to_s16_device;
 use crate::codec_detect::{
     classify_track, find_audio_track, find_h264_video_track, find_unsupported_video, TrackKind,
 };
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
 use crate::h264_bitstream::extract_avcc_streaming;
+use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
-const LATE_DROP_SEC: f64 = 0.050;
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
 
@@ -55,19 +56,6 @@ fn snap(
         generation,
         status: status.into(),
     })
-}
-
-/// Convert interleaved S16 LE plane bytes to `i16` samples for rodio.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
-fn s16_plane_to_i16(plane: &[u8]) -> Vec<i16> {
-    plane
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
 }
 
 /// Map a Symphonia track + optional avcC blob into rsmpeg H.264 codec parameters.
@@ -329,6 +317,7 @@ fn run_worker(
         .filter(|s| s.is_finite() && *s > 0.0);
     let assumed_frame_dur = 1.0 / 30.0;
     let mut playback_start: Option<Instant> = None;
+    let mut video_scheduler = VideoScheduler::new();
     let mut base_video_pts: Option<i64> = None;
     let mut video_frame_index = 0u64;
 
@@ -532,6 +521,7 @@ fn run_worker(
                                 }
                             }
                             playback_start = Some(Instant::now() - Duration::from_secs_f64(capped));
+                            video_scheduler.reset_stats();
                             video_frame_index = 0;
                             base_video_pts = None;
                             force_one_frame = true;
@@ -634,29 +624,39 @@ fn run_worker(
                                             playback_start = Some(Instant::now());
                                         }
                                         if let Some(t0) = playback_start {
-                                            let delta = abs_pos - t0.elapsed().as_secs_f64();
-                                            if delta < -LATE_DROP_SEC {
-                                                present = false;
-                                            } else if delta > 0.001 {
-                                                let mut rem =
-                                                    Duration::from_secs_f64(delta.min(0.5));
-                                                while rem > Duration::ZERO {
-                                                    thread::sleep(rem.min(MAX_PACE_SLEEP));
-                                                    rem = rem.saturating_sub(MAX_PACE_SLEEP);
-                                                    if matches!(
-                                                        cmd_rx.try_recv(),
-                                                        Ok(PlayerCommand::Stop { .. })
-                                                            | Ok(PlayerCommand::Shutdown { .. })
-                                                            | Err(TryRecvError::Disconnected)
-                                                    ) {
-                                                        stop = true;
-                                                        present = false;
-                                                        break;
+                                            let now_d = t0.elapsed();
+                                            let frame_pts =
+                                                Duration::from_secs_f64(abs_pos.max(0.0));
+                                            match video_scheduler.schedule(frame_pts, now_d) {
+                                                ScheduleAction::Wait { duration } => {
+                                                    let mut rem =
+                                                        duration.min(Duration::from_secs_f64(0.5));
+                                                    while rem > Duration::ZERO {
+                                                        thread::sleep(rem.min(MAX_PACE_SLEEP));
+                                                        rem = rem.saturating_sub(MAX_PACE_SLEEP);
+                                                        if matches!(
+                                                            cmd_rx.try_recv(),
+                                                            Ok(PlayerCommand::Stop { .. })
+                                                                | Ok(
+                                                                    PlayerCommand::Shutdown { .. }
+                                                                )
+                                                                | Err(TryRecvError::Disconnected)
+                                                        ) {
+                                                            stop = true;
+                                                            present = false;
+                                                            break;
+                                                        }
+                                                        if !playing && !force_one_frame {
+                                                            present = false;
+                                                            break;
+                                                        }
                                                     }
-                                                    if !playing && !force_one_frame {
-                                                        present = false;
-                                                        break;
-                                                    }
+                                                }
+                                                ScheduleAction::Display => {
+                                                    present = true;
+                                                }
+                                                ScheduleAction::DropLate => {
+                                                    present = false;
                                                 }
                                             }
                                         }
@@ -718,9 +718,12 @@ fn run_worker(
                                 if f.sample_rate > 0 {
                                     audio_rate = f.sample_rate;
                                 }
-                                let samples = s16_plane_to_i16(
-                                    f.data.first().map(|d| d.as_slice()).unwrap_or(&[]),
-                                );
+                                let samples = frame_to_s16_device(
+                                    &f,
+                                    audio_rate.max(1),
+                                    audio_channels.max(1),
+                                )
+                                .unwrap_or_default();
                                 if !samples.is_empty() {
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
@@ -817,7 +820,8 @@ fn run_worker(
                 match dec.receive_frame() {
                     Ok(DecodeStatus::Frame(f)) => {
                         let samples =
-                            s16_plane_to_i16(f.data.first().map(|d| d.as_slice()).unwrap_or(&[]));
+                            frame_to_s16_device(&f, audio_rate.max(1), audio_channels.max(1))
+                                .unwrap_or_default();
                         if !samples.is_empty() {
                             if let Some(ref s) = sink {
                                 s.append(rodio::buffer::SamplesBuffer::new(

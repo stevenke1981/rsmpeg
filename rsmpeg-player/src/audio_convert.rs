@@ -9,9 +9,9 @@
 //!   at the target rate and channel count, bytes are re-read as little-endian `i16`
 //!   with no resampling.
 //! - **Resample path**: otherwise a [`rsmpeg_resample::Resampler`] is constructed and
-//!   invoked. The current resampler is **stub-quality** (allocates a correctly sized
-//!   destination frame but does not yet copy/filter sample data). The API is wired
-//!   so callers and tests can depend on layout/length once real conversion lands.
+//!   invoked. The resampler performs real linear-interpolation sample-rate conversion
+//!   with format conversion (`S16`/`F32`) and basic channel remapping, producing
+//!   correctly sized, non-silent output.
 
 use rsmpeg_codec::Frame;
 use rsmpeg_resample::{Resampler, ResamplerConfig};
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn rate_change_uses_resampler_length() {
-        // Resampler is stub-quality (zeros) but must size output via estimate.
+        // Real resampler must size output via estimate and be non-silent.
         // 441 input samples @ 44100 → 480 @ 48000.
         let nb = 441;
         let mut interleaved = Vec::with_capacity(nb * 2);
@@ -191,9 +191,12 @@ mod tests {
         }
         let frame = s16_stereo_frame(44_100, &interleaved);
         let out = frame_to_s16_device(&frame, 48_000, 2).unwrap();
-        // Stub resampler: correctly sized, currently zero-filled.
+        // Real resampler: correctly sized and non-silent.
         assert_eq!(out.len(), 480 * 2);
-        assert!(out.iter().all(|&s| s == 0));
+        assert!(
+            out.iter().any(|&s| s != 0),
+            "resampler must produce non-silent output"
+        );
     }
 
     #[test]
