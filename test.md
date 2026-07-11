@@ -1,5 +1,18 @@
 # rsmpeg 測試紀錄
 
+## 2026-07-12 — GUI timeline seek preview
+
+| 指令 | 結果 |
+|---|---|
+| `cargo test -p rsmpeg-cli --bin rsmpeg` | PASS（timeline preview throttle） |
+| `cargo test -p rsmpeg-player --lib` | PASS（92 tests，含 stale generation 過濾） |
+| `cargo test --workspace` | PASS（5 個本機外部 H.264 fixture 測試為 ignored） |
+| `cargo check --workspace --no-default-features` | PASS |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
+
+GUI 拖曳時間軸現在每 75 ms 送出 preview seek，放開時提交最終位置；舊 seek 事件不會覆寫
+當前 scrub target，native/fallback seek preview 保留全域 PTS，不再回到 0:00。
+
 ## 2026-07-12 — P0 playback control and release gate
 
 | 指令 | 結果 |

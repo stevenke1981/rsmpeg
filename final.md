@@ -1,5 +1,13 @@
 # rsmpeg 重構驗收摘要（第八刀 — multi-agent round 4）
 
+## 2026-07-12 — GUI timeline preview seek
+
+- 根因：拖曳期間只更新 GUI 本地時間，放開時才 seek；seek 後重設視訊 PTS 基準，首張
+  preview frame 被標記為 0:00，且舊 generation 事件可覆寫最新畫面。
+- 修正：GUI 每 75 ms 發出節流 preview seek、放開時送出最終 seek；保留拖曳 target；
+  player 丟棄舊 generation 的媒體事件；native/fallback 保留全域 PTS 並允許 forced preview。
+- CI clippy gate 現以 `--all-features` 執行，和本機 release 驗收一致。
+
 ## 2026-07-12 — P0 playback hardening follow-up
 
 - Audio-only position 改由 `AudioPlaybackClock` 的單調時間軸估算，不再使用已排入 rodio

@@ -1,7 +1,6 @@
 //! egui UI layout for the rsmpeg media player.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use super::MediaApp;
 use eframe::egui::{self, vec2, Color32, Frame, Margin, Rounding, Stroke};
@@ -88,7 +87,7 @@ fn render_welcome(app: &mut MediaApp, ctx: &egui::Context) {
 
 fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
     let playing = app.playing;
-    let pos = app.position_sec;
+    let pos = app.scrub_position_sec.unwrap_or(app.position_sec);
     let dur = app.duration_sec;
     let status = app.status.clone();
     let hovering = hovering_files(ctx);
@@ -167,21 +166,23 @@ fn render_player(app: &mut MediaApp, ctx: &egui::Context) {
                                 .clamp_to_range(true)
                                 .trailing_fill(true),
                         );
+                        let dragging = slider.dragged();
                         if slider.changed() && dur > 0.0 {
                             let target = (fraction as f64) * dur;
                             app.position_sec = target;
-                            if slider.drag_stopped() || !slider.dragged() {
-                                if let Some(p) = app.player.as_mut() {
-                                    let _ = p.seek(Duration::from_secs_f64(target));
-                                }
-                            }
-                        }
-                        if slider.drag_stopped() && dur > 0.0 {
-                            let target = (fraction as f64) * dur;
+                            app.scrub_position_sec = Some(target);
+                            // Request frames during the drag, not only after it
+                            // ends. The player generations discard any older
+                            // preview result that races this one.
+                            app.timeline_drag_active = dragging;
+                            app.seek_timeline_preview(target, !dragging);
+                        } else if slider.drag_stopped() && dur > 0.0 {
+                            // A final pointer-up can leave the value unchanged;
+                            // still commit the exact local drag target once.
+                            let target = app.scrub_position_sec.unwrap_or(pos);
                             app.position_sec = target;
-                            if let Some(p) = app.player.as_mut() {
-                                let _ = p.seek(Duration::from_secs_f64(target));
-                            }
+                            app.timeline_drag_active = false;
+                            app.seek_timeline_preview(target, true);
                         }
                         ui.label(format_time(dur));
                     });

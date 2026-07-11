@@ -4,8 +4,14 @@
 
 pub mod ui;
 
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 use rsmpeg_player::{Player, PlayerEvent, PlayerState};
+
+/// Keep thumbnail scrubbing responsive without queueing a seek for every
+/// pointer-motion event. A final seek is always sent when the drag ends.
+const TIMELINE_PREVIEW_INTERVAL: Duration = Duration::from_millis(75);
 
 /// Main egui application state.
 pub struct MediaApp {
@@ -18,6 +24,11 @@ pub struct MediaApp {
     position_sec: f64,
     duration_sec: f64,
     playing: bool,
+    /// Slider value held locally while a seek is in flight, so older playback
+    /// events cannot pull the thumb away from the user's drag target.
+    scrub_position_sec: Option<f64>,
+    timeline_drag_active: bool,
+    last_timeline_preview: Option<Instant>,
 }
 
 impl MediaApp {
@@ -31,6 +42,9 @@ impl MediaApp {
             position_sec: 0.0,
             duration_sec: 0.0,
             playing: false,
+            scrub_position_sec: None,
+            timeline_drag_active: false,
+            last_timeline_preview: None,
         };
         if let Some(p) = path {
             app.load_file(&p);
@@ -46,6 +60,9 @@ impl MediaApp {
         self.position_sec = 0.0;
         self.duration_sec = 0.0;
         self.playing = false;
+        self.scrub_position_sec = None;
+        self.timeline_drag_active = false;
+        self.last_timeline_preview = None;
 
         match Player::builder()
             .input(path)
@@ -77,7 +94,38 @@ impl MediaApp {
         self.position_sec = 0.0;
         self.duration_sec = 0.0;
         self.status = "Stopped. Open a media file to start playback.".into();
+        self.scrub_position_sec = None;
+        self.timeline_drag_active = false;
+        self.last_timeline_preview = None;
     }
+
+    /// Request a decoded preview while timeline-scrubbing. Pointer motion is
+    /// deliberately rate-limited; releasing the slider passes `force = true`
+    /// to commit the exact final target.
+    fn seek_timeline_preview(&mut self, target: f64, force: bool) {
+        if !target.is_finite() {
+            return;
+        }
+        let now = Instant::now();
+        if !should_dispatch_timeline_seek(self.last_timeline_preview, now, force) {
+            return;
+        }
+        if let Some(player) = self.player.as_mut() {
+            if player
+                .seek(Duration::from_secs_f64(target.max(0.0)))
+                .is_ok()
+            {
+                self.last_timeline_preview = Some(now);
+            }
+        }
+    }
+}
+
+fn should_dispatch_timeline_seek(last: Option<Instant>, now: Instant, force: bool) -> bool {
+    force
+        || last
+            .map(|previous| now.saturating_duration_since(previous) >= TIMELINE_PREVIEW_INTERVAL)
+            .unwrap_or(true)
 }
 
 impl eframe::App for MediaApp {
@@ -103,6 +151,9 @@ impl eframe::App for MediaApp {
                     }
                     PlayerEvent::SeekCompleted { position, .. } => {
                         self.position_sec = position.as_secs_f64();
+                        if !self.timeline_drag_active {
+                            self.scrub_position_sec = None;
+                        }
                     }
                     PlayerEvent::Ended { .. } => {
                         self.status = "Playback complete".into();
@@ -131,6 +182,9 @@ impl eframe::App for MediaApp {
             {
                 got_frame = true;
                 self.position_sec = pts.as_secs_f64();
+                if !self.timeline_drag_active {
+                    self.scrub_position_sec = None;
+                }
                 let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                 match self.texture.as_mut() {
                     Some(tex) if tex.size() == [width, height] => {
@@ -193,4 +247,30 @@ pub fn run_gui(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         Box::new(|_cc| Ok(Box::new(MediaApp::new(path_owned)))),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeline_preview_is_throttled_but_commit_is_immediate() {
+        let start = Instant::now();
+        assert!(should_dispatch_timeline_seek(None, start, false));
+        assert!(!should_dispatch_timeline_seek(
+            Some(start),
+            start + Duration::from_millis(74),
+            false
+        ));
+        assert!(should_dispatch_timeline_seek(
+            Some(start),
+            start + TIMELINE_PREVIEW_INTERVAL,
+            false
+        ));
+        assert!(should_dispatch_timeline_seek(
+            Some(start),
+            start + Duration::from_millis(1),
+            true
+        ));
+    }
 }

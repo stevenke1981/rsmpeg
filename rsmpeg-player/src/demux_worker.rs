@@ -382,6 +382,10 @@ fn run_worker(
     let mut audio_target_samples: usize = 0;
     let mut audio_ring = PcmRingBuffer::new(0);
     let mut audio_play_start: Option<Instant> = None;
+    // Media position represented by the first audio source submitted after
+    // opening or seeking. `Instant` alone is relative and therefore cannot
+    // synchronize video after a non-zero seek.
+    let mut audio_play_position = Duration::ZERO;
     let mut audio_played_base: u64 = 0;
     let mut drop_until: Option<Duration> = None;
 
@@ -575,6 +579,7 @@ fn run_worker(
                             // while paused can never leave the ring permanently full.
                             audio_ring.clear();
                             audio_play_start = None;
+                            audio_play_position = position;
                             audio_played_base = 0;
                             let _ = format.seek(
                                 SeekMode::Coarse,
@@ -604,7 +609,10 @@ fn run_worker(
                             );
                             video_scheduler.reset_stats();
                             video_frame_index = 0;
-                            base_video_pts = None;
+                            // Keep the stream PTS origin. Re-basing at the
+                            // seek keyframe makes the first preview look like
+                            // it belongs at 0:00 instead of the target time.
+                            last_video_event = None;
                             force_one_frame = true;
                             emit(
                                 &event_tx,
@@ -774,30 +782,37 @@ fn run_worker(
                                     // first audio sample was appended to the output sink. With
                                     // no audio master, align audio position to the frame's own
                                     // timestamp so we always render (no drift to correct).
-                                    let audio_pos_secs = if has_audio {
-                                        match audio_play_start {
-                                            Some(t0) => t0.elapsed().as_secs_f64(),
-                                            None => 0.0,
-                                        }
-                                    } else {
-                                        frame_pts_secs
-                                    };
-                                    let sync_action =
-                                        sync_state.sync_decision(frame_pts_secs, audio_pos_secs);
+                                    // A seek preview must be emitted even when the audio sink is
+                                    // still empty. Otherwise the old relative audio clock marks
+                                    // every non-zero target frame as ahead and drops it.
+                                    if !force_one_frame {
+                                        let audio_pos_secs = if has_audio {
+                                            match audio_play_start {
+                                                Some(t0) => audio_play_position
+                                                    .saturating_add(t0.elapsed())
+                                                    .as_secs_f64(),
+                                                None => audio_play_position.as_secs_f64(),
+                                            }
+                                        } else {
+                                            frame_pts_secs
+                                        };
+                                        let sync_action = sync_state
+                                            .sync_decision(frame_pts_secs, audio_pos_secs);
 
-                                    if sync_action == SyncAction::Drop {
-                                        // Video is ahead of audio beyond tolerance: skip this
-                                        // frame and keep waiting for audio to catch up.
-                                        continue;
-                                    }
-                                    if sync_action == SyncAction::Duplicate {
-                                        if let Some(ref ev) = last_video_event {
-                                            // Video is behind audio: repeat the last displayed
-                                            // frame to fill the gap and hold the picture steady.
-                                            emit(&event_tx, ev.clone());
+                                        if sync_action == SyncAction::Drop {
+                                            // Video is ahead of audio beyond tolerance: skip this
+                                            // frame and keep waiting for audio to catch up.
                                             continue;
                                         }
-                                        // Nothing rendered yet to duplicate: render current frame.
+                                        if sync_action == SyncAction::Duplicate {
+                                            if let Some(ref ev) = last_video_event {
+                                                // Video is behind audio: repeat the last displayed
+                                                // frame to fill the gap and hold the picture steady.
+                                                emit(&event_tx, ev.clone());
+                                                continue;
+                                            }
+                                            // Nothing rendered yet to duplicate: render current frame.
+                                        }
                                     }
 
                                     let mut emit_frame = true;
@@ -889,6 +904,7 @@ fn run_worker(
                                     }
                                     if audio_play_start.is_none() && playing {
                                         audio_play_start = Some(Instant::now());
+                                        audio_play_position = position;
                                     }
                                 }
                                 // Drive position from audio when no video.

@@ -185,10 +185,6 @@ impl Player {
         self.generation.load(Ordering::Relaxed)
     }
 
-    fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
     /// Enqueue a command (non-blocking).
     pub fn send_command(&self, cmd: PlayerCommand) -> Result<(), PlayerError> {
         if self.shut_down {
@@ -225,12 +221,16 @@ impl Player {
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<(), PlayerError> {
-        let g = self.next_generation();
+        // Do not advance the accepted-event generation until the command was
+        // actually queued. Otherwise a full command queue would make this
+        // handle discard every valid event from the still-running seek.
+        let g = self.generation().wrapping_add(1);
         self.send_command(PlayerCommand::Seek {
             position,
             mode: SeekMode::Coarse,
             generation: g,
         })?;
+        self.generation.store(g, Ordering::Relaxed);
         self.position = position;
         self.state = PlayerState::Seeking;
         Ok(())
@@ -282,12 +282,34 @@ impl Player {
 
     /// Poll one outbound event (non-blocking) and update local cache.
     pub fn poll_event(&mut self) -> Option<PlayerEvent> {
-        match self.event_rx.try_recv() {
-            Ok(ev) => {
-                self.apply_event(&ev);
-                Some(ev)
+        loop {
+            match self.event_rx.try_recv() {
+                Ok(ev) if self.is_stale_event(&ev) => {
+                    // A seek may be issued while display events from an older
+                    // generation are already queued. Drain them here so a GUI
+                    // can never replace the requested preview with stale pixels.
+                }
+                Ok(ev) => {
+                    self.apply_event(&ev);
+                    return Some(ev);
+                }
+                Err(_) => return None,
             }
-            Err(_) => None,
+        }
+    }
+
+    /// Events that carry media state must never cross a later seek boundary.
+    /// Errors and warnings remain visible even when their worker generation is
+    /// zero, because they can describe failures opening the current source.
+    fn is_stale_event(&self, ev: &PlayerEvent) -> bool {
+        let current = self.generation();
+        match ev {
+            PlayerEvent::Snapshot(snapshot) => snapshot.generation < current,
+            PlayerEvent::PositionChanged { generation, .. }
+            | PlayerEvent::VideoFrame { generation, .. }
+            | PlayerEvent::SeekCompleted { generation, .. }
+            | PlayerEvent::Ended { generation } => *generation < current,
+            PlayerEvent::Error { .. } | PlayerEvent::Warning { .. } => false,
         }
     }
 
@@ -374,6 +396,27 @@ impl Drop for Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+
+    fn test_player(generation: u64, event_rx: mpsc::Receiver<PlayerEvent>) -> Player {
+        let (cmd_tx, _cmd_rx) = mpsc::sync_channel(1);
+        Player {
+            path: PathBuf::from("test.mp4"),
+            prefer_native: true,
+            state: PlayerState::Ready,
+            generation: AtomicU64::new(generation),
+            volume: 0.8,
+            playback_rate: 1.0,
+            position: Duration::ZERO,
+            duration: Duration::ZERO,
+            playing: false,
+            cmd_tx,
+            event_rx,
+            handle: None,
+            shut_down: false,
+            last_error: None,
+        }
+    }
 
     #[test]
     fn builder_requires_input() {
@@ -415,6 +458,67 @@ mod tests {
         let g0 = p.generation();
         let _ = p.seek(Duration::from_secs(10));
         assert!(p.generation() > g0);
+    }
+
+    #[test]
+    fn poll_event_discards_frames_from_an_older_seek_generation() {
+        let (event_tx, event_rx) = mpsc::sync_channel(2);
+        event_tx
+            .send(PlayerEvent::VideoFrame {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+                pts: Duration::from_secs(1),
+                generation: 6,
+            })
+            .unwrap();
+        event_tx
+            .send(PlayerEvent::SeekCompleted {
+                position: Duration::from_secs(9),
+                generation: 7,
+            })
+            .unwrap();
+        let mut p = test_player(7, event_rx);
+
+        assert!(matches!(
+            p.poll_event(),
+            Some(PlayerEvent::SeekCompleted {
+                position,
+                generation: 7
+            }) if position == Duration::from_secs(9)
+        ));
+        assert_eq!(p.position(), Duration::from_secs(9));
+        assert!(p.poll_event().is_none());
+    }
+
+    #[test]
+    fn failed_seek_does_not_advance_event_generation() {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(1);
+        cmd_tx.send(PlayerCommand::Pause { generation: 7 }).unwrap();
+        let (_event_tx, event_rx) = mpsc::sync_channel(1);
+        let mut p = Player {
+            path: PathBuf::from("test.mp4"),
+            prefer_native: true,
+            state: PlayerState::Ready,
+            generation: AtomicU64::new(7),
+            volume: 0.8,
+            playback_rate: 1.0,
+            position: Duration::ZERO,
+            duration: Duration::ZERO,
+            playing: false,
+            cmd_tx,
+            event_rx,
+            handle: None,
+            shut_down: false,
+            last_error: None,
+        };
+
+        assert!(matches!(
+            p.seek(Duration::from_secs(10)),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert_eq!(p.generation(), 7);
+        assert!(matches!(cmd_rx.try_recv(), Ok(PlayerCommand::Pause { .. })));
     }
 
     #[test]

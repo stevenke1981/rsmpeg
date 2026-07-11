@@ -360,7 +360,9 @@ fn run_native_inner(
                                 Instant::now() - Duration::from_secs_f64(capped / playback_rate),
                             );
                             video_frame_index = 0;
-                            base_video_pts = None;
+                            // Keep the stream PTS origin. Re-basing it at the
+                            // seek keyframe would report the preview as 0:00
+                            // and let the host overwrite the scrub position.
                             // A paused seek may request one video preview, but
                             // audio-only playback must stay paused at the
                             // target instead of consuming its newly sought

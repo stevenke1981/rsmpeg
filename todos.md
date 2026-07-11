@@ -12,6 +12,26 @@
 > 範圍：基於 `65552b0` 的靜態檢視。下列項目優先於後方的歷史階段清單；
 > 完成時須補上相應的回歸測試，並將實測結果更新至 `test.md`。
 
+### P0 — 時間軸拖曳必須呈現正確的 seek preview
+
+- [x] GUI 拖曳時應保存獨立的 scrub target，不能讓尚未處理的舊 `PositionChanged` 或
+  `VideoFrame` 覆寫滑桿位置；放開滑桿後只送出一次最終 seek。
+- [x] 拖曳期間以有上限的頻率送出 preview seek，讓畫面跟隨時間軸，而非只更新本地數字；
+  暫停狀態 seek 必須顯示目標附近的一張畫面且保持暫停。
+- [x] seek 後不得重設視訊 PTS 的全域時間原點。native 與 fallback 的第一張 preview
+  frame/position 必須接近 seek target，不能在 `SeekCompleted(target)` 後回傳 0 秒。
+- [x] `Player` 與 GUI 必須依 generation 丟棄舊 seek 的事件/畫面，避免快速拖曳時舊 frame
+  覆寫最新預覽。
+- [ ] 新增回歸測試：拖至 75% 時 UI playhead 不被舊事件回寫；連續 seek 只呈現最新
+  generation；seek preview 的 PTS 位於目標附近。
+
+### P1 — 播放預覽的記憶體與 CI 一致性
+
+- [ ] 減少 native pipeline 每張 RGBA frame 的 clone/copy，評估 latest-frame handoff 或
+  `Arc<[u8]>`，並為 1080p 播放記錄配置量與 event queue 延遲上限。
+- [x] CI 的 clippy gate 與本機驗收一致，使用 `--all-features`；GUI controller/seek
+  regression tests 必須成為 required test job 的一部分。
+
 ### P0 — 修正音訊主時鐘的資料來源
 
 - [x] 不得以「已 `Sink::append` 的樣本數」當作已播放樣本數；目前 native path 在
