@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第十五刀 Clippy 全清 + 主迴圈接入 + round 11）
+日期：2026-07-11（第十六刀 multi-agent round 12）
 
 ## 指令
 
@@ -18,11 +18,11 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 | workspace tests | **PASS** |
 | rsmpeg-player | **85**（+5：sync 接入 4 / pool 接入 1） |
 | rsmpeg-codec | 29 |
-| rsmpeg-scale | 16（+2：yuv422p→rgba） |
+| rsmpeg-scale | 18（+2：rgb24→rgba） |
 | rsmpeg-util | 16（+4：pixel_format helpers） |
 | rsmpeg-resample | 24（+4：gain helpers） |
-| rsmpeg-format | 14（+4：time_util） |
-| rsmpeg-filter | 17（+4：rotate） |
+| rsmpeg-format | 18（+4：round 12 duration；time_util +4 已含） |
+| rsmpeg-filter | 20（+3：blur） |
 | release build | **PASS** |
 | fmt --check | **PASS** |
 
@@ -69,6 +69,11 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - rsmpeg-filter：新增 `RotateFilter`（RGBA 90° 順時針旋轉）+ 4 單測
 - rsmpeg-scale：新增 `yuv422p_frame_to_rgba`（4:2:2→RGBA，BT.601）+ 2 單測
 - rsmpeg-resample：新增 `apply_gain_f32`/`apply_gain_i16`（音量增益 + clamp）+ 4 單測
+
+## round 12 重點
+- rsmpeg-filter：新增 `BoxBlurFilter`（RGBA 3×3 盒狀模糊，alpha 不模糊）+ 3 單測
+- rsmpeg-scale：新增 `rgb24_frame_to_rgba`（packed RGB24→RGBA，A=255）+ 2 單測
+- rsmpeg-format：新增 `duration.rs`（`samples_to_duration`/`duration_to_samples`，timescale 零安全）+ 4 單測
 
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod demuxers;
+pub mod duration;
 pub mod format;
 pub mod format_context;
 pub mod format_registry;

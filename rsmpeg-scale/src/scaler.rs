@@ -680,6 +680,47 @@ pub fn yuv422p_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
     Ok(out)
 }
 
+/// Convert a packed RGB24 [`Frame`] into RGBA (`Vec<u8>`, 4 bytes/pixel, alpha 255).
+///
+/// RGB24 is a packed 3-bytes/pixel format written in **R,G,B** order (no alpha). This expands the
+/// scale toolbox — the inverse of the `Rgb24` packing used by FFmpeg's `rgb24` layout — by copying
+/// each pixel's three bytes forward and appending an opaque alpha byte (`255`). It reuses the same
+/// `.into()`-on-`RsError::InvalidData` validation style as the `yuv420p_frame_to_rgb24` /
+/// `nv12_frame_to_rgba` paths, but with no color conversion (RGB24 is already in RGB order).
+pub fn rgb24_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
+    if frame.pixel_format != PixelFormat::Rgb24 {
+        return Err(RsError::InvalidData(
+            format!(
+                "rgb24_frame_to_rgba expects Rgb24, got {:?}",
+                frame.pixel_format
+            )
+            .into(),
+        ));
+    }
+    let w = frame.width;
+    let h = frame.height;
+    if w == 0 || h == 0 {
+        return Err(RsError::InvalidData(
+            "rgb24_frame_to_rgba requires non-zero size".into(),
+        ));
+    }
+    if frame.data.is_empty() {
+        return Err(RsError::InvalidData("RGB24 frame has no plane data".into()));
+    }
+
+    let src = &frame.data[0];
+    let mut out = vec![0u8; w * h * 4];
+    for i in 0..w * h {
+        let s = i * 3;
+        let d = i * 4;
+        out[d] = src[s];
+        out[d + 1] = src[s + 1];
+        out[d + 2] = src[s + 2];
+        out[d + 3] = 255;
+    }
+    Ok(out)
+}
+
 /// Build a correctly sized synthetic YUV420P frame (not using broken `Frame::new_video` plane sizes).
 #[cfg(test)]
 pub(crate) fn make_yuv420p_frame(width: usize, height: usize, y: u8, u: u8, v: u8) -> Frame {
@@ -748,6 +789,36 @@ pub(crate) fn make_yuv422p_frame(width: usize, height: usize, y: u8, u: u8, v: u
         width,
         height,
         pixel_format: PixelFormat::Yuv422P,
+        sample_format: rsmpeg_util::SampleFormat::None,
+        sample_rate: 0,
+        channels: 0,
+        samples: 0,
+        pts: Some(0),
+        duration: 1,
+        time_base: Rational::new(1, 25),
+        key_frame: true,
+        pict_type: rsmpeg_codec::PictureType::I,
+    }
+}
+
+/// Build a correctly sized synthetic RGB24 frame with uniform (r, g, b) pixels
+/// (mirrors `make_yuv420p_frame` / `make_nv12_frame` for the packed Rgb24 format).
+#[cfg(test)]
+pub(crate) fn make_rgb24_frame(width: usize, height: usize, r: u8, g: u8, b: u8) -> Frame {
+    let size = width * height * 3;
+    let mut data = vec![0u8; size];
+    for i in 0..width * height {
+        let o = i * 3;
+        data[o] = r;
+        data[o + 1] = g;
+        data[o + 2] = b;
+    }
+    Frame {
+        data: vec![data],
+        linesize: vec![width * 3],
+        width,
+        height,
+        pixel_format: PixelFormat::Rgb24,
         sample_format: rsmpeg_util::SampleFormat::None,
         sample_rate: 0,
         channels: 0,
@@ -1031,6 +1102,44 @@ mod tests {
         // Not a Yuv422P frame — must be rejected.
         frame.pixel_format = PixelFormat::Rgb24;
         let res = yuv422p_frame_to_rgba(&frame);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_rgb24_to_rgba_roundtrip() {
+        // 2x2 RGB24 frame with known bytes, packed R,G,B order (3 bytes/pixel).
+        let rgb = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let frame = Frame {
+            data: vec![rgb],
+            linesize: vec![6],
+            width: 2,
+            height: 2,
+            pixel_format: PixelFormat::Rgb24,
+            sample_format: rsmpeg_util::SampleFormat::None,
+            sample_rate: 0,
+            channels: 0,
+            samples: 0,
+            pts: Some(0),
+            duration: 1,
+            time_base: Rational::new(1, 25),
+            key_frame: true,
+            pict_type: rsmpeg_codec::PictureType::I,
+        };
+        let out = rgb24_frame_to_rgba(&frame).unwrap();
+        // 4 bytes/pixel, alpha 255.
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&out[4..8], &[40, 50, 60, 255]);
+        assert_eq!(&out[8..12], &[70, 80, 90, 255]);
+        assert_eq!(&out[12..16], &[100, 110, 120, 255]);
+    }
+
+    #[test]
+    fn test_rgb24_to_rgba_rejects_wrong_format() {
+        let mut frame = make_rgb24_frame(2, 2, 16, 128, 128);
+        // Not an Rgb24 frame — must be rejected.
+        frame.pixel_format = PixelFormat::Yuv420P;
+        let res = rgb24_frame_to_rgba(&frame);
         assert!(res.is_err());
     }
 }
