@@ -528,7 +528,7 @@ mod tests {
 
         assert!(dec.pending.is_empty(), "reset() must clear pending frames");
         assert!(dec.pts_queue.is_empty(), "reset() must clear the PTS FIFO");
-        assert_eq!(dec.eof, false, "reset() must clear the EOF flag");
+        assert!(!dec.eof, "reset() must clear the EOF flag");
 
         // After a clean reset, a fresh receive must need more input rather
         // than replaying a stale frame.
@@ -550,7 +550,7 @@ mod tests {
         // reset() must undo the EOF set during the flush so playback can
         // resume after a seek.
         dec.reset().unwrap();
-        assert_eq!(dec.eof, false);
+        assert!(!dec.eof);
         assert!(matches!(
             dec.receive_frame().unwrap(),
             DecodeStatus::NeedMoreInput

@@ -1,2 +1,7 @@
 /target/
 .superpowers/
+
+# OpenCode runtime state
+.opencode/
+# Codebase-memory index
+.codebase-memory/

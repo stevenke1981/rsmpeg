@@ -93,7 +93,7 @@ impl ResamplerConfig {
         // ceiling of integer division: (nb_input * dst_rate + src_rate - 1) / src_rate
         let num = nb_input as u64 * self.dst_sample_rate as u64;
         let den = self.src_sample_rate as u64;
-        ((num + den - 1) / den) as usize
+        num.div_ceil(den) as usize
     }
 }
 
@@ -197,7 +197,9 @@ impl Resampler {
         // channel, normalized to [-1, 1).
         let mut decoded: Vec<Vec<f32>> = vec![vec![0.0_f32; nb_in]; src_ch];
         match frame.sample_format {
-            SampleFormat::S16 => {
+            SampleFormat::S16 =>
+            {
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..nb_in {
                     for c in 0..src_ch {
                         let off = (i * src_ch + c) * 2;
@@ -206,7 +208,9 @@ impl Resampler {
                     }
                 }
             }
-            SampleFormat::F32 => {
+            SampleFormat::F32 =>
+            {
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..nb_in {
                     for c in 0..src_ch {
                         let off = (i * src_ch + c) * 4;
@@ -233,6 +237,7 @@ impl Resampler {
         let mut resampled: Vec<Vec<f32>> = vec![vec![0.0_f32; dst_samples]; dst_ch];
         let last = nb_in - 1;
 
+        #[allow(clippy::needless_range_loop)]
         for o in 0..dst_ch {
             let src_idx = self
                 .src_channel_for_dst(o)
@@ -253,6 +258,7 @@ impl Resampler {
         // Encode the interleaved output in the destination sample format.
         let dst_bytes = dst_format.bytes();
         let mut encoded: Vec<u8> = Vec::with_capacity(dst_samples * dst_ch * dst_bytes);
+        #[allow(clippy::needless_range_loop)]
         for j in 0..dst_samples {
             for o in 0..dst_ch {
                 let s = resampled[o][j];

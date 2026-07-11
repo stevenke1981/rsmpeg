@@ -78,19 +78,11 @@ impl Default for TrackTables {
 }
 
 /// MP4/ISOBMFF demuxer with real sample-table packet output.
+#[derive(Default)]
 pub struct MP4Demuxer {
     tracks: Vec<TrackState>,
     /// True when moov lacked sample tables (e.g. fragmented MP4).
     fragmented_or_empty: bool,
-}
-
-impl Default for MP4Demuxer {
-    fn default() -> Self {
-        Self {
-            tracks: Vec::new(),
-            fragmented_or_empty: false,
-        }
-    }
 }
 
 impl InputFormat for MP4Demuxer {
@@ -402,8 +394,8 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
                 .map(|e| e.0.max(1) as usize - 1)
                 .unwrap_or(chunk_count);
             let end = next_first.min(chunk_count);
-            for c in first..end {
-                samples_per_chunk[c] = entry.1;
+            for slot in &mut samples_per_chunk[first..end] {
+                *slot = entry.1;
             }
         }
     }
@@ -500,15 +492,10 @@ fn parse_moov(
         }
         let payload_start = cursor + header_len;
         let payload_end = (cursor + box_size).min(end);
-        match &box_type {
-            b"trak" => {
-                let mut tables = TrackTables::default();
-                tables.media_type = MediaType::Data;
-                tables.codec_id = CodecId::Unknown;
-                parse_trak(io, payload_start, payload_end, &mut tables)?;
-                tracks.push(tables);
-            }
-            _ => {}
+        if &box_type == b"trak" {
+            let mut tables = TrackTables::default();
+            parse_trak(io, payload_start, payload_end, &mut tables)?;
+            tracks.push(tables);
         }
         if box_size == 0 {
             break;
@@ -533,9 +520,8 @@ fn parse_trak(
         }
         let payload_start = cursor + header_len;
         let payload_end = (cursor + box_size).min(end);
-        match &box_type {
-            b"mdia" => parse_mdia(io, payload_start, payload_end, tables)?,
-            _ => {}
+        if &box_type == b"mdia" {
+            parse_mdia(io, payload_start, payload_end, tables)?
         }
         if box_size == 0 {
             break;
@@ -963,7 +949,7 @@ fn parse_visual_sample_entry(
             if len > 0 && len < 1024 * 1024 {
                 io.seek(SeekFrom::Start(payload_start))?;
                 let data = io.read_bytes(len)?;
-                let nls = data.get(4).map(|b| ((*b & 0x03) + 1) as u8).unwrap_or(4);
+                let nls = data.get(4).map(|b| (*b & 0x03) + 1).unwrap_or(4);
                 let nls = if nls == 3 { 4 } else { nls };
                 tables.extradata = Some(data);
                 tables.h264_format = H264BitstreamFormat::Avcc {

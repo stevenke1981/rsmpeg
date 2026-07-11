@@ -44,9 +44,7 @@ impl CropFilter {
         for row in 0..h {
             let s_row = (y + row) * sw * stride + x * stride;
             let d_row = row * w * stride;
-            for col in 0..w * stride {
-                out[d_row + col] = src[s_row + col];
-            }
+            out[d_row..(w * stride + d_row)].copy_from_slice(&src[s_row..(w * stride + s_row)]);
         }
         frame.data = vec![out];
         frame.linesize = vec![w * stride];

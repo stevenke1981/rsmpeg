@@ -63,6 +63,27 @@ pub fn mono_to_stereo_i16(mono: &[i16]) -> Vec<i16> {
     out
 }
 
+/// Apply a linear gain to interleaved `f32` samples in place, clamped to [-1.0, 1.0].
+///
+/// Each sample is multiplied by `gain` and clamped so it stays within the
+/// valid `f32` normalized audio range.
+pub fn apply_gain_f32(samples: &mut [f32], gain: f32) {
+    for s in samples.iter_mut() {
+        *s = (*s * gain).clamp(-1.0, 1.0);
+    }
+}
+
+/// Apply a linear gain to interleaved `i16` samples in place, clamped to i16 range.
+///
+/// Each sample is multiplied by `gain` (in `f32`) and clamped so it stays within
+/// the valid `i16` range before being cast back.
+pub fn apply_gain_i16(samples: &mut [i16], gain: f32) {
+    for s in samples.iter_mut() {
+        let v = (*s as f32) * gain;
+        *s = v.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +138,33 @@ mod tests {
         let stereo = mono_to_stereo_f32(&mono);
         let back = stereo_to_mono_f32(&stereo);
         assert_eq!(mono.to_vec(), back);
+    }
+
+    #[test]
+    fn apply_gain_f32_doubles() {
+        let mut samples = [0.5, -0.25];
+        apply_gain_f32(&mut samples, 2.0);
+        assert_eq!(samples, [1.0, -0.5]);
+    }
+
+    #[test]
+    fn apply_gain_f32_clamps() {
+        let mut samples = [1.0];
+        apply_gain_f32(&mut samples, 2.0);
+        assert_eq!(samples, [1.0]);
+    }
+
+    #[test]
+    fn apply_gain_i16_doubles() {
+        let mut samples = [1000, -500];
+        apply_gain_i16(&mut samples, 2.0);
+        assert_eq!(samples, [2000, -1000]);
+    }
+
+    #[test]
+    fn apply_gain_i16_clamps() {
+        let mut samples = [20000];
+        apply_gain_i16(&mut samples, 10.0);
+        assert_eq!(samples, [i16::MAX]);
     }
 }

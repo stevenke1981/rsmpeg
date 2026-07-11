@@ -79,16 +79,19 @@ impl Rational {
     }
 
     /// Multiply by another rational.
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Rational) -> Self {
         Rational::new(self.num * other.num, self.den * other.den).reduced()
     }
 
     /// Divide by another rational.
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, other: Rational) -> Self {
         Rational::new(self.num * other.den, self.den * other.num).reduced()
     }
 
     /// Add another rational.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: Rational) -> Self {
         Rational::new(
             self.num * other.den + other.num * self.den,

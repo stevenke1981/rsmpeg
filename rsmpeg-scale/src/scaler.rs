@@ -207,8 +207,8 @@ impl Scaler {
         let v_stride = frame.linesize[2];
 
         // Chroma dimensions for 4:2:0.
-        let chroma_w = (use_w + 1) / 2;
-        let chroma_h = (use_h + 1) / 2;
+        let chroma_w = use_w.div_ceil(2);
+        let chroma_h = use_h.div_ceil(2);
 
         // Validate plane capacity (allow extra padding in linesize).
         let y_need = y_stride
@@ -366,8 +366,8 @@ pub fn yuv420p_frame_to_bgr24(frame: &Frame) -> RsResult<Vec<u8>> {
         ));
     }
 
-    let w = frame.width as usize;
-    let h = frame.height as usize;
+    let w = frame.width;
+    let h = frame.height;
     if w == 0 || h == 0 {
         return Err(RsError::InvalidData(
             "yuv420p_frame_to_bgr24 requires non-zero width/height".into(),
@@ -382,8 +382,8 @@ pub fn yuv420p_frame_to_bgr24(frame: &Frame) -> RsResult<Vec<u8>> {
     let v_stride = frame.linesize[2];
 
     // Chroma dimensions for 4:2:0 (matches the Yuv420P → Rgba path).
-    let chroma_w = (w + 1) / 2;
-    let chroma_h = (h + 1) / 2;
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
 
     // Validate plane capacity (allow extra padding in linesize), same as scale_yuv420p_to_packed.
     let y_need = y_stride
@@ -450,8 +450,8 @@ pub fn yuv420p_frame_to_rgb24(frame: &Frame) -> RsResult<Vec<u8>> {
         ));
     }
 
-    let w = frame.width as usize;
-    let h = frame.height as usize;
+    let w = frame.width;
+    let h = frame.height;
     if w == 0 || h == 0 {
         return Err(RsError::InvalidData(
             "yuv420p_frame_to_rgb24 requires non-zero width/height".into(),
@@ -466,8 +466,8 @@ pub fn yuv420p_frame_to_rgb24(frame: &Frame) -> RsResult<Vec<u8>> {
     let v_stride = frame.linesize[2];
 
     // Chroma dimensions for 4:2:0 (matches the Yuv420P → Rgba path).
-    let chroma_w = (w + 1) / 2;
-    let chroma_h = (h + 1) / 2;
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
 
     // Validate plane capacity (allow extra padding in linesize), same as scale_yuv420p_to_packed.
     let y_need = y_stride
@@ -535,8 +535,8 @@ pub fn nv12_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
         ));
     }
 
-    let w = frame.width as usize;
-    let h = frame.height as usize;
+    let w = frame.width;
+    let h = frame.height;
     if w == 0 || h == 0 {
         return Err(RsError::InvalidData(
             "nv12_frame_to_rgba requires non-zero width/height".into(),
@@ -549,8 +549,8 @@ pub fn nv12_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
     let uv_stride = frame.linesize[1];
 
     // Chroma dimensions for 4:2:0 (matches the Yuv420P paths).
-    let chroma_w = (w + 1) / 2;
-    let chroma_h = (h + 1) / 2;
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h.div_ceil(2);
 
     // Validate plane capacity (allow extra padding in linesize), same as yuv420p_frame_to_rgb24.
     let y_need = y_stride
@@ -592,12 +592,100 @@ pub fn nv12_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
     Ok(out)
 }
 
+/// Convert a YUV422P [`Frame`] into packed RGBA (`Vec<u8>`, 4 bytes/pixel, R,G,B,A order).
+///
+/// YUV422P is a planar 4:2:2 format: plane 0 is the full-resolution Y (luma) plane, plane 1 is the
+/// full-height U (chroma) plane, and plane 2 is the full-height V (chroma) plane. Only the
+/// horizontal chroma is halved: for each pixel `x` the chroma sample is at `cx = x / 2`, while the
+/// vertical chroma index equals the row (`cy = y`). This reuses the same `yuv_to_rgb_bt601`
+/// BT.601 (limited range by default) conversion, chroma-offset logic, and plane-capacity validation
+/// style as the `yuv420p_frame_to_rgb24` / `nv12_frame_to_rgba` paths.
+pub fn yuv422p_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
+    if frame.pixel_format != PixelFormat::Yuv422P {
+        return Err(RsError::InvalidData(
+            format!(
+                "yuv422p_frame_to_rgba expects Yuv422P, got {:?}",
+                frame.pixel_format
+            )
+            .into(),
+        ));
+    }
+    if frame.data.len() < 3 || frame.linesize.len() < 3 {
+        return Err(RsError::InvalidData(
+            "YUV422P frame requires 3 planes (Y, U, V)".into(),
+        ));
+    }
+
+    let w = frame.width;
+    let h = frame.height;
+    if w == 0 || h == 0 {
+        return Err(RsError::InvalidData(
+            "yuv422p_frame_to_rgba requires non-zero width/height".into(),
+        ));
+    }
+
+    let y_plane = &frame.data[0];
+    let u_plane = &frame.data[1];
+    let v_plane = &frame.data[2];
+    let y_stride = frame.linesize[0];
+    let u_stride = frame.linesize[1];
+    let v_stride = frame.linesize[2];
+
+    // Chroma dimensions for 4:2:2 (half horizontal only, full vertical — matches FFmpeg).
+    let chroma_w = w.div_ceil(2);
+    let chroma_h = h;
+
+    // Validate plane capacity (allow extra padding in linesize), same as yuv420p_frame_to_rgb24.
+    let y_need = y_stride
+        .checked_mul(h.saturating_sub(1))
+        .and_then(|o| o.checked_add(w));
+    let u_need = u_stride
+        .checked_mul(chroma_h.saturating_sub(1))
+        .and_then(|o| o.checked_add(chroma_w));
+    let v_need = v_stride
+        .checked_mul(chroma_h.saturating_sub(1))
+        .and_then(|o| o.checked_add(chroma_w));
+    match (y_need, u_need, v_need) {
+        (Some(yn), Some(un), Some(vn))
+            if y_plane.len() >= yn && u_plane.len() >= un && v_plane.len() >= vn => {}
+        _ => {
+            return Err(RsError::InvalidData(
+                "YUV422P plane buffers are too small for declared size/linesize".into(),
+            ));
+        }
+    }
+
+    // BT.601 limited range, matching the default Scaler Yuv420P → Rgba conversion.
+    let limited = true;
+    let mut out = vec![0u8; w * h * 4];
+
+    for y in 0..h {
+        // 4:2:2 keeps full vertical chroma resolution.
+        let cy = y;
+        for x in 0..w {
+            let cx = x / 2;
+            let yv = y_plane[y * y_stride + x];
+            let u = u_plane[cy * u_stride + cx];
+            let v = v_plane[cy * v_stride + cx];
+
+            let (r, g, b) = yuv_to_rgb_bt601(yv, u, v, limited);
+            let off = (y * w + x) * 4;
+            out[off] = r;
+            out[off + 1] = g;
+            out[off + 2] = b;
+            out[off + 3] = 255;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Build a correctly sized synthetic YUV420P frame (not using broken `Frame::new_video` plane sizes).
 #[cfg(test)]
 pub(crate) fn make_yuv420p_frame(width: usize, height: usize, y: u8, u: u8, v: u8) -> Frame {
     let y_size = width * height;
-    let chroma_w = (width + 1) / 2;
-    let chroma_h = (height + 1) / 2;
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
     let c_size = chroma_w * chroma_h;
     Frame {
         data: vec![vec![y; y_size], vec![u; c_size], vec![v; c_size]],
@@ -635,6 +723,31 @@ pub(crate) fn make_nv12_frame(width: usize, height: usize, y: u8, u: u8, v: u8) 
         width,
         height,
         pixel_format: PixelFormat::Nv12,
+        sample_format: rsmpeg_util::SampleFormat::None,
+        sample_rate: 0,
+        channels: 0,
+        samples: 0,
+        pts: Some(0),
+        duration: 1,
+        time_base: Rational::new(1, 25),
+        key_frame: true,
+        pict_type: rsmpeg_codec::PictureType::I,
+    }
+}
+
+/// Build a correctly sized synthetic YUV422P frame (not using broken `Frame::new_video` plane sizes).
+/// 4:2:2 keeps full vertical chroma, so each chroma plane is `chroma_w * height` bytes.
+#[cfg(test)]
+pub(crate) fn make_yuv422p_frame(width: usize, height: usize, y: u8, u: u8, v: u8) -> Frame {
+    let y_size = width * height;
+    let chroma_w = width.div_ceil(2);
+    let c_size = chroma_w * height;
+    Frame {
+        data: vec![vec![y; y_size], vec![u; c_size], vec![v; c_size]],
+        linesize: vec![width, chroma_w, chroma_w],
+        width,
+        height,
+        pixel_format: PixelFormat::Yuv422P,
         sample_format: rsmpeg_util::SampleFormat::None,
         sample_rate: 0,
         channels: 0,
@@ -743,8 +856,8 @@ mod tests {
     fn test_yuv420p_gradient_rgba_len() {
         let w = 16usize;
         let h = 8usize;
-        let chroma_w = (w + 1) / 2;
-        let chroma_h = (h + 1) / 2;
+        let chroma_w = w.div_ceil(2);
+        let chroma_h = h.div_ceil(2);
         let mut y = vec![0u8; w * h];
         for row in 0..h {
             for col in 0..w {
@@ -894,6 +1007,30 @@ mod tests {
         // Not an NV12 frame — must be rejected.
         frame.pixel_format = PixelFormat::Rgb24;
         let res = nv12_frame_to_rgba(&frame);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_yuv422p_to_rgba_buffer_len_and_black() {
+        let w = 2usize;
+        let h = 2usize;
+        // Y=0 (limited-range black), neutral chroma U=V=128 → near-black.
+        let frame = make_yuv422p_frame(w, h, 0, 128, 128);
+        let out = yuv422p_frame_to_rgba(&frame).unwrap();
+        assert_eq!(out.len(), w * h * 4);
+        // First pixel ≈ black. Order is R,G,B,A; all color channels small, alpha 255.
+        assert!(out[0] < 16, "R={}", out[0]);
+        assert!(out[1] < 16, "G={}", out[1]);
+        assert!(out[2] < 16, "B={}", out[2]);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn test_yuv422p_to_rgba_rejects_wrong_format() {
+        let mut frame = make_yuv422p_frame(2, 2, 16, 128, 128);
+        // Not a Yuv422P frame — must be rejected.
+        frame.pixel_format = PixelFormat::Rgb24;
+        let res = yuv422p_frame_to_rgba(&frame);
         assert!(res.is_err());
     }
 }

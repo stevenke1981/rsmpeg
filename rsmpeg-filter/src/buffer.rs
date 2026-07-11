@@ -5,6 +5,12 @@ pub struct BufferSrc {
     pub name: &'static str,
 }
 
+impl Default for BufferSrc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BufferSrc {
     pub fn new() -> Self {
         BufferSrc { name: "buffer" }
@@ -39,6 +45,12 @@ impl Filter for BufferSrc {
 pub struct BufferSink {
     pub name: &'static str,
     pub frames: Vec<rsmpeg_codec::Frame>,
+}
+
+impl Default for BufferSink {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BufferSink {

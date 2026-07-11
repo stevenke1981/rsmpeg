@@ -48,12 +48,13 @@ pub fn yuv420p_frame_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame_pool::FramePool;
     use rsmpeg_codec::PictureType;
     use rsmpeg_util::{Rational, SampleFormat};
 
     fn solid_yuv420p(w: usize, h: usize, y: u8, u: u8, v: u8) -> Frame {
-        let cw = (w + 1) / 2;
-        let ch = (h + 1) / 2;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
         Frame {
             data: vec![vec![y; w * h], vec![u; cw * ch], vec![v; cw * ch]],
             linesize: vec![w, cw, cw],
@@ -94,5 +95,24 @@ mod tests {
         let frame = solid_yuv420p(16, 10, 16, 128, 128);
         let rgba = yuv420p_frame_to_rgba_cached(&frame).unwrap();
         assert_eq!(rgba.len(), 16 * 10 * 4);
+    }
+
+    #[test]
+    fn pool_backed_convert_preserves_pixels() {
+        let frame = solid_yuv420p(16, 10, 16, 128, 128);
+        let converted = yuv420p_frame_to_rgba_cached(&frame).unwrap();
+        // Mirror the native pipeline's pool-backed path: copy the verified
+        // conversion into a recycled scratch buffer and confirm pixel content.
+        let pool = FramePool::new(64 * 1024 * 1024);
+        let needed_len = converted.len();
+        let mut scratch = pool.get(needed_len);
+        scratch.extend_from_slice(&converted);
+        assert_eq!(scratch.len(), 16 * 10 * 4);
+        // limited black
+        assert!(scratch[0] <= 2);
+        assert_eq!(scratch[3], 255);
+        // Byte-identical to the non-pooled conversion.
+        assert_eq!(scratch, converted);
+        pool.recycle(scratch);
     }
 }

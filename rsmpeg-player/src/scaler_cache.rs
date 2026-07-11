@@ -37,7 +37,7 @@ pub fn yuv420p_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
     // borrow — `scale` returns an owned `Frame`, so no borrow conflict arises.
     let out = CACHE.with(|c| -> RsResult<Frame> {
         let mut guard = c.borrow_mut();
-        if !guard.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Vacant(e) = guard.entry(key) {
             let config = ScalerConfig::new(
                 frame.width as u32,
                 frame.height as u32,
@@ -47,7 +47,7 @@ pub fn yuv420p_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
                 PixelFormat::Rgba,
             );
             let scaler = Scaler::new(config)?;
-            guard.insert(key, scaler);
+            e.insert(scaler);
         }
         let scaler = guard.get(&key).expect("scaler just inserted for key");
         scaler.scale(frame)
@@ -66,8 +66,8 @@ mod tests {
     use rsmpeg_util::Rational;
 
     fn solid_yuv420p(w: usize, h: usize, y: u8, u: u8, v: u8) -> Frame {
-        let cw = (w + 1) / 2;
-        let ch = (h + 1) / 2;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
         Frame {
             data: vec![vec![y; w * h], vec![u; cw * ch], vec![v; cw * ch]],
             linesize: vec![w, cw, cw],

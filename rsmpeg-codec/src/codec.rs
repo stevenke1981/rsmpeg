@@ -93,11 +93,8 @@ pub trait Decoder: Send {
     fn decode(&mut self, packet: &Packet) -> RsResult<Vec<Frame>> {
         self.send_packet(Some(packet))?;
         let mut frames = Vec::new();
-        loop {
-            match self.receive_frame()? {
-                DecodeStatus::Frame(f) => frames.push(f),
-                DecodeStatus::NeedMoreInput | DecodeStatus::EndOfStream => break,
-            }
+        while let DecodeStatus::Frame(f) = self.receive_frame()? {
+            frames.push(f);
         }
         Ok(frames)
     }
@@ -108,11 +105,8 @@ pub trait Decoder: Send {
     fn flush(&mut self) -> RsResult<Vec<Frame>> {
         self.send_packet(None)?;
         let mut frames = Vec::new();
-        loop {
-            match self.receive_frame()? {
-                DecodeStatus::Frame(f) => frames.push(f),
-                DecodeStatus::NeedMoreInput | DecodeStatus::EndOfStream => break,
-            }
+        while let DecodeStatus::Frame(f) = self.receive_frame()? {
+            frames.push(f);
         }
         Ok(frames)
     }

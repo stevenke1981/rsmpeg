@@ -64,7 +64,7 @@ impl SyncController {
 fn duration_to_ms(d: Duration) -> u64 {
     d.as_secs()
         .saturating_mul(1_000)
-        .saturating_add((d.subsec_nanos() / 1_000_000) as u64)
+        .saturating_add(d.subsec_millis() as u64)
 }
 
 #[cfg(test)]

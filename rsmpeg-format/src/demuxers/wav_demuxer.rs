@@ -225,10 +225,8 @@ fn find_data_chunk(io: &mut crate::io_context::IOContext) -> RsResult<u32> {
         } else {
             size as u64 + 1
         };
-        if skip > 0 {
-            if io.seek(SeekFrom::Current(skip as i64)).is_err() {
-                return Ok(0);
-            }
+        if skip > 0 && io.seek(SeekFrom::Current(skip as i64)).is_err() {
+            return Ok(0);
         }
     }
 }

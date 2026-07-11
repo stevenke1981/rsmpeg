@@ -4,6 +4,7 @@
 //! sample index (currently non-fragmented MP4, and WAV PCM).
 
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,10 +15,26 @@ use rsmpeg_util::MediaType;
 use crate::clock::MasterClock;
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
+use crate::frame_pool::FramePool;
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
+
+/// Process-wide reusable scratch buffer for YUV→RGBA conversion.
+///
+/// A single large pool is shared across every native-pipeline frame emission
+/// so we allocate a fresh `Vec<u8>` only on the first frame (and if the
+/// resolution changes). The verified conversion from
+/// [`crate::video_convert::yuv420p_frame_to_rgba_cached`] is copied into the
+/// pooled scratch buffer; the event keeps a clone and the scratch is recycled
+/// for the next frame. Pixel content is therefore byte-identical to the
+/// non-pooled path.
+static RGBA_POOL: OnceLock<FramePool> = OnceLock::new();
+
+fn rgba_pool() -> &'static FramePool {
+    RGBA_POOL.get_or_init(|| FramePool::new(64 * 1024 * 1024))
+}
 
 fn emit(tx: &SyncSender<PlayerEvent>, ev: PlayerEvent) {
     let _ = tx.try_send(ev);
@@ -485,17 +502,23 @@ fn run_native_inner(
                                     video_frame_index += 1;
                                     position = frame_pts;
                                     if present || force_one_frame {
-                                        if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
+                                        if let Ok(converted) = yuv420p_frame_to_rgba_cached(&f) {
+                                            // Reuse a pooled scratch buffer instead of allocating
+                                            // a fresh Vec per frame; pixels remain byte-identical.
+                                            let needed_len = converted.len();
+                                            let mut scratch = rgba_pool().get(needed_len);
+                                            scratch.extend_from_slice(&converted);
                                             emit(
                                                 event_tx,
                                                 PlayerEvent::VideoFrame {
                                                     width: w,
                                                     height: h,
-                                                    rgba,
+                                                    rgba: scratch.clone(),
                                                     pts: position,
                                                     generation,
                                                 },
                                             );
+                                            rgba_pool().recycle(scratch);
                                             force_one_frame = false;
                                             emit(
                                                 event_tx,
@@ -591,20 +614,24 @@ fn run_native_inner(
                 loop {
                     match dec.receive_frame() {
                         Ok(DecodeStatus::Frame(f)) => {
-                            if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
+                            if let Ok(converted) = yuv420p_frame_to_rgba_cached(&f) {
                                 let w = f.width;
                                 let h = f.height;
                                 if w > 0 && h > 0 {
+                                    let needed_len = converted.len();
+                                    let mut scratch = rgba_pool().get(needed_len);
+                                    scratch.extend_from_slice(&converted);
                                     emit(
                                         event_tx,
                                         PlayerEvent::VideoFrame {
                                             width: w,
                                             height: h,
-                                            rgba,
+                                            rgba: scratch.clone(),
                                             pts: position,
                                             generation,
                                         },
                                     );
+                                    rgba_pool().recycle(scratch);
                                 }
                             }
                         }

@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第十四刀 multi-agent round 10）
+日期：2026-07-11（第十五刀 Clippy 全清 + 主迴圈接入 + round 11）
 
 ## 指令
 
@@ -16,13 +16,13 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 | 項目 | 結果 |
 |------|------|
 | workspace tests | **PASS** |
-| rsmpeg-player | **80**（+4：sync controller 4） |
-| rsmpeg-codec | 29（+1：codec_parameters builders） |
-| rsmpeg-scale | 14（+2：nv12→rgba） |
+| rsmpeg-player | **85**（+5：sync 接入 4 / pool 接入 1） |
+| rsmpeg-codec | 29 |
+| rsmpeg-scale | 16（+2：yuv422p→rgba） |
 | rsmpeg-util | 16（+4：pixel_format helpers） |
-| rsmpeg-resample | 20（+9：channel mix helpers） |
+| rsmpeg-resample | 24（+4：gain helpers） |
 | rsmpeg-format | 14（+4：time_util） |
-| rsmpeg-filter | 13（+3：crop） |
+| rsmpeg-filter | 17（+4：rotate） |
 | release build | **PASS** |
 | fmt --check | **PASS** |
 
@@ -62,9 +62,17 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - rsmpeg-scale：新增 `nv12_frame_to_rgba`（semi-planar NV12→RGBA，BT.601）+ 2 單測
 - rsmpeg-codec：新增 `CodecParameters::for_video`/`for_audio` 建構子（原僅有 `new`）+ 1 單測
 
+## Clippy 全清 + 主迴圈接入 + round 11
+- **Clippy 全清**：`cargo clippy --workspace --all-targets --all-features -- -D warnings` 通過（0 warning，~30 項修正，含 rational should_implement_trait 用 allow、resampler needless_range_loop 用 allow、crop/mp4_demuxer 等 idiomatic 修正；未改 public API）
+- **SyncController 接入**（`demux_worker.rs`）：`WorkerSync` + `sync_decision()` 輔助；依 A/V drift 執行 Drop（丟幀）/ Duplicate（重送上一幀）/ Render，預設啟用 + 4 單測
+- **FramePool 接入**（`native_pipeline.rs`）：`OnceLock` 64MiB pool 作為 YUV→RGBA 暫存緩衝，事件內容 byte-identical，暫存 recycle 重用 + 1 單測
+- rsmpeg-filter：新增 `RotateFilter`（RGBA 90° 順時針旋轉）+ 4 單測
+- rsmpeg-scale：新增 `yuv422p_frame_to_rgba`（4:2:2→RGBA，BT.601）+ 2 單測
+- rsmpeg-resample：新增 `apply_gain_f32`/`apply_gain_i16`（音量增益 + clamp）+ 4 單測
+
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做
 - VFR 仍依賴解碼幀 PTS，若上游未帶 PTS 始終退回固定幀率
-- FramePool / SyncController 尚未接入播放主迴圈（demux_worker / native_pipeline）
+- demux_worker 的 audio position 用 `audio_play_start.elapsed()` 近似（非 MasterClock），僅作 >40ms 漂移二級校正
 - `map_sample_format` 為未來多格式輸出的 building block，尚未接入解碼路徑
-- Clippy 仍有預存 style warning（soft）
+- Clippy 已全清（`-D warnings` 通過）

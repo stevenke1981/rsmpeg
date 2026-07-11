@@ -20,8 +20,8 @@ impl MirrorFilter {
     /// swap but is preserved in value because the whole pixel is exchanged. For RGBA,
     /// `frame.data[0]` is a single tightly-packed plane with a 4-byte stride.
     pub fn apply(&self, frame: &mut Frame) {
-        let w = frame.width as usize;
-        let h = frame.height as usize;
+        let w = frame.width;
+        let h = frame.height;
         if w == 0 || h == 0 {
             return;
         }

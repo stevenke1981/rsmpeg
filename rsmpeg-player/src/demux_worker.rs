@@ -16,8 +16,59 @@ use crate::event::{PlayerEvent, PlayerSnapshot};
 use crate::h264_bitstream::extract_avcc_streaming;
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+use crate::sync::{SyncAction, SyncController};
+
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
+
+/// A/V sync helper wrapper for the demux worker.
+///
+/// Holds a [`SyncController`] plus an enable flag so the A/V drift correction
+/// can be disabled (force `Render`) without touching the rest of the emit path.
+/// This is the bridge between the pure [`SyncController`] logic and the worker's
+/// video emit loop: it decides whether each decoded frame should be rendered,
+/// dropped (video ahead of audio), or have the previous frame duplicated
+/// (video behind audio).
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+struct WorkerSync {
+    sync: SyncController,
+    sync_enabled: bool,
+}
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+impl WorkerSync {
+    /// Create a sync wrapper with the default 40 ms tolerance, enabled.
+    fn new() -> Self {
+        Self {
+            sync: SyncController::default(),
+            sync_enabled: true,
+        }
+    }
+
+    /// Decide whether to render / drop / duplicate a video frame given A/V drift.
+    fn sync_decision(&self, frame_pts_secs: f64, audio_pos_secs: f64) -> SyncAction {
+        if !self.sync_enabled {
+            return SyncAction::Render;
+        }
+        self.sync.advise(
+            Duration::from_secs_f64(frame_pts_secs),
+            Duration::from_secs_f64(audio_pos_secs),
+        )
+    }
+}
 
 /// Spawn the playback worker thread.
 pub fn spawn_worker(
@@ -321,6 +372,9 @@ fn run_worker(
     let mut video_scheduler = VideoScheduler::new();
     let mut base_video_pts: Option<i64> = None;
     let mut video_frame_index = 0u64;
+    let sync_state = WorkerSync::new();
+    // Last rendered VideoFrame event, reused on `Duplicate` to repeat a frame.
+    let mut last_video_event: Option<PlayerEvent> = None;
 
     // ── Sample-based audio throttle ──
     const AUDIO_TARGET_MS: u64 = 200;
@@ -712,6 +766,37 @@ fn run_worker(
                                     }
                                     video_frame_index += 1;
                                     position = Duration::from_secs_f64(abs_pos.max(0.0));
+                                    let frame_pts_secs = abs_pos.max(0.0);
+                                    // Approximate audio playback position: elapsed since the
+                                    // first audio sample was appended to the output sink. With
+                                    // no audio master, align audio position to the frame's own
+                                    // timestamp so we always render (no drift to correct).
+                                    let audio_pos_secs = if has_audio {
+                                        match audio_play_start {
+                                            Some(t0) => t0.elapsed().as_secs_f64(),
+                                            None => 0.0,
+                                        }
+                                    } else {
+                                        frame_pts_secs
+                                    };
+                                    let sync_action =
+                                        sync_state.sync_decision(frame_pts_secs, audio_pos_secs);
+
+                                    if sync_action == SyncAction::Drop {
+                                        // Video is ahead of audio beyond tolerance: skip this
+                                        // frame and keep waiting for audio to catch up.
+                                        continue;
+                                    }
+                                    if sync_action == SyncAction::Duplicate {
+                                        if let Some(ref ev) = last_video_event {
+                                            // Video is behind audio: repeat the last displayed
+                                            // frame to fill the gap and hold the picture steady.
+                                            emit(&event_tx, ev.clone());
+                                            continue;
+                                        }
+                                        // Nothing rendered yet to duplicate: render current frame.
+                                    }
+
                                     let mut emit_frame = true;
                                     if let Some(t) = drop_until {
                                         if video_scheduler.drop_before_seek(position, t) {
@@ -723,28 +808,25 @@ fn run_worker(
                                     if force_one_frame {
                                         emit_frame = true;
                                     }
-                                    if present || force_one_frame {
-                                        if emit_frame {
-                                            if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
-                                                emit(
-                                                    &event_tx,
-                                                    PlayerEvent::VideoFrame {
-                                                        width: w,
-                                                        height: h,
-                                                        rgba,
-                                                        pts: position,
-                                                        generation,
-                                                    },
-                                                );
-                                                force_one_frame = false;
-                                                emit(
-                                                    &event_tx,
-                                                    PlayerEvent::PositionChanged {
-                                                        position,
-                                                        generation,
-                                                    },
-                                                );
-                                            }
+                                    if (present || force_one_frame) && emit_frame {
+                                        if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                                            let ev = PlayerEvent::VideoFrame {
+                                                width: w,
+                                                height: h,
+                                                rgba,
+                                                pts: position,
+                                                generation,
+                                            };
+                                            emit(&event_tx, ev.clone());
+                                            last_video_event = Some(ev);
+                                            force_one_frame = false;
+                                            emit(
+                                                &event_tx,
+                                                PlayerEvent::PositionChanged {
+                                                    position,
+                                                    generation,
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -943,4 +1025,48 @@ fn run_worker(
         },
     );
     Err("backends disabled".into())
+}
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+#[cfg(test)]
+mod tests {
+    use super::WorkerSync;
+    use crate::sync::SyncAction;
+
+    #[test]
+    fn sync_drop_when_video_ahead() {
+        let s = WorkerSync::new();
+        // Video 0.5 s ahead of audio at 0.0 s (tolerance 40 ms) => Drop.
+        assert_eq!(s.sync_decision(0.5, 0.0), SyncAction::Drop);
+    }
+
+    #[test]
+    fn sync_duplicate_when_audio_ahead() {
+        let s = WorkerSync::new();
+        // Audio 0.5 s ahead of video at 0.0 s => Duplicate.
+        assert_eq!(s.sync_decision(0.0, 0.5), SyncAction::Duplicate);
+    }
+
+    #[test]
+    fn sync_render_within_tolerance() {
+        let s = WorkerSync::new();
+        // 20 ms drift is within the default 40 ms tolerance => Render.
+        assert_eq!(s.sync_decision(0.02, 0.0), SyncAction::Render);
+        assert_eq!(s.sync_decision(0.0, 0.02), SyncAction::Render);
+        // Exactly aligned => Render.
+        assert_eq!(s.sync_decision(0.1, 0.1), SyncAction::Render);
+    }
+
+    #[test]
+    fn sync_render_forced_when_disabled() {
+        let mut s = WorkerSync::new();
+        s.sync_enabled = false;
+        // Even a large drift must render when sync is disabled.
+        assert_eq!(s.sync_decision(5.0, 0.0), SyncAction::Render);
+        assert_eq!(s.sync_decision(0.0, 5.0), SyncAction::Render);
+    }
 }

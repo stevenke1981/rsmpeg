@@ -8,6 +8,7 @@ pub mod filter_graph;
 pub mod grayscale;
 pub mod mirror;
 pub mod pad;
+pub mod rotate;
 
 pub use buffer::BufferSink;
 pub use filter::{Filter, FilterContext};
