@@ -200,7 +200,7 @@ impl Decoder for OpenH264Decoder {
     }
 
     fn receive_frame(&mut self) -> RsResult<DecodeStatus> {
-        if let Some(frame) = self.pending.pop_front() {
+        if let Some(frame) = take_display_order(&mut self.pending) {
             return Ok(DecodeStatus::Frame(frame));
         }
         if self.eof {
@@ -217,6 +217,26 @@ impl Decoder for OpenH264Decoder {
     fn get_parameters(&self) -> CodecParameters {
         self.params.clone()
     }
+}
+
+/// Take the next frame in display (PTS) order from `pending`.
+///
+/// If every queued frame has a PTS, the smallest-PTS frame is returned
+/// (correct B-frame display order). Otherwise falls back to FIFO.
+fn take_display_order(pending: &mut VecDeque<Frame>) -> Option<Frame> {
+    if pending.is_empty() {
+        return None;
+    }
+    if pending.iter().all(|f| f.pts.is_some()) {
+        let mut best = 0usize;
+        for i in 1..pending.len() {
+            if pending[i].pts < pending[best].pts {
+                best = i;
+            }
+        }
+        return pending.remove(best);
+    }
+    pending.pop_front()
 }
 
 fn create_decoder() -> RsResult<openh264::decoder::Decoder> {
@@ -442,5 +462,49 @@ mod tests {
         assert_eq!(frame.data[1].len(), (w / 2) * (h / 2));
         assert_eq!(frame.data[2].len(), (w / 2) * (h / 2));
         assert_eq!(frame.linesize, vec![w, w / 2, w / 2]);
+    }
+
+    #[test]
+    fn take_display_order_returns_smallest_pts_first() {
+        use rsmpeg_codec::Frame;
+
+        let mut pending: VecDeque<Frame> = VecDeque::new();
+        let mut f3 = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        f3.pts = Some(3);
+        let mut f1 = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        f1.pts = Some(1);
+        let mut f2 = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        f2.pts = Some(2);
+        // Inserted in PTS order [3, 1, 2].
+        pending.push_back(f3);
+        pending.push_back(f1);
+        pending.push_back(f2);
+
+        assert_eq!(take_display_order(&mut pending).unwrap().pts, Some(1));
+        assert_eq!(take_display_order(&mut pending).unwrap().pts, Some(2));
+        assert_eq!(take_display_order(&mut pending).unwrap().pts, Some(3));
+        assert!(take_display_order(&mut pending).is_none());
+    }
+
+    #[test]
+    fn take_display_order_falls_back_to_fifo_when_pts_missing() {
+        use rsmpeg_codec::Frame;
+
+        let mut pending: VecDeque<Frame> = VecDeque::new();
+        let mut a = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        a.pts = Some(10);
+        let mut b = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        b.pts = None;
+        let mut c = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        c.pts = Some(1);
+        // Mixed timestamps → FIFO insertion order [10, None, 1] must be preserved.
+        pending.push_back(a);
+        pending.push_back(b);
+        pending.push_back(c);
+
+        assert_eq!(take_display_order(&mut pending).unwrap().pts, Some(10));
+        assert_eq!(take_display_order(&mut pending).unwrap().pts, None);
+        assert_eq!(take_display_order(&mut pending).unwrap().pts, Some(1));
+        assert!(take_display_order(&mut pending).is_none());
     }
 }

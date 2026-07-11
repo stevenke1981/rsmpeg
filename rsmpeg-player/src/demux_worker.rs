@@ -493,6 +493,7 @@ fn run_worker(
                         }
                         PlayerCommand::Seek {
                             position: target,
+                            mode,
                             generation: g,
                             ..
                         } => {
@@ -506,7 +507,13 @@ fn run_worker(
                                 }
                             };
                             position = Duration::from_secs_f64(capped);
-                            drop_until = Some(position);
+                            // Only Precise seeks drop frames arriving before the target;
+                            // Coarse seeks keep all decoded frames (keyframe-aligned).
+                            drop_until = if mode == crate::command::SeekMode::Precise {
+                                Some(position)
+                            } else {
+                                None
+                            };
                             // Reset the approximate sample throttle so a seek
                             // while paused can never leave the ring permanently full.
                             audio_ring.clear();
@@ -635,16 +642,30 @@ fn run_worker(
                                 let w = f.width;
                                 let h = f.height;
                                 if w > 0 && h > 0 {
-                                    let pts = f.pts.unwrap_or(rsmpeg_pkt.pts.unwrap_or(0));
-                                    let abs_pos = match sec_per_tick {
-                                        Some(spt) => {
+                                    let raw_pts = f.pts.or(rsmpeg_pkt.pts).or(rsmpeg_pkt.dts);
+                                    let tb = if f.time_base.num != 0 && f.time_base.den != 0 {
+                                        f.time_base
+                                    } else {
+                                        default_video_tb
+                                    };
+                                    let abs_pos = match raw_pts {
+                                        Some(p) => {
                                             if base_video_pts.is_none() {
-                                                base_video_pts = Some(pts);
+                                                base_video_pts = Some(p);
                                             }
-                                            let base = base_video_pts.unwrap_or(pts);
-                                            (pts - base) as f64 * spt
+                                            let base = base_video_pts.unwrap_or(p);
+                                            let den = tb.den.max(1) as f64;
+                                            (p - base) as f64 * (tb.num as f64 / den)
                                         }
-                                        None => video_frame_index as f64 * assumed_frame_dur,
+                                        None => match sec_per_tick {
+                                            Some(spt) => {
+                                                if base_video_pts.is_none() {
+                                                    base_video_pts = Some(0);
+                                                }
+                                                video_frame_index as f64 * spt
+                                            }
+                                            None => video_frame_index as f64 * assumed_frame_dur,
+                                        },
                                     };
                                     let mut present = true;
                                     if !force_one_frame {
