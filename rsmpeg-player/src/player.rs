@@ -1,17 +1,20 @@
 //! High-level [`Player`] handle — CLI and GUI entry point.
+//!
+//! Hosts only send commands and poll events.  Demux/decode never run on the
+//! calling thread.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
-use crate::clock::MasterClock;
 use crate::command::{PlayerCommand, SeekMode};
+use crate::demux_worker;
 use crate::event::{PlayerEvent, PlayerSnapshot};
-use crate::queue::BoundedQueue;
 
 const CMD_CAPACITY: usize = 64;
-const EVT_CAPACITY: usize = 64;
+const EVT_CAPACITY: usize = 128;
 
 /// Player lifecycle / readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct PlayerBuilder {
     input: Option<PathBuf>,
     prefer_native_pipeline: bool,
     volume: f32,
+    /// Start playback immediately when the worker opens the file.
+    autoplay: bool,
 }
 
 impl PlayerBuilder {
@@ -53,6 +58,7 @@ impl PlayerBuilder {
             input: None,
             prefer_native_pipeline: true,
             volume: 0.8,
+            autoplay: true,
         }
     }
 
@@ -71,19 +77,26 @@ impl PlayerBuilder {
         self
     }
 
+    pub fn autoplay(mut self, yes: bool) -> Self {
+        self.autoplay = yes;
+        self
+    }
+
     pub fn build(self) -> Result<Player, PlayerError> {
         let path = self.input.ok_or(PlayerError::NoInput)?;
-        Ok(Player::new(path, self.prefer_native_pipeline, self.volume))
+        Ok(Player::open(
+            path,
+            self.prefer_native_pipeline,
+            self.volume,
+            self.autoplay,
+        ))
     }
 }
 
 /// Unified player handle.
-///
-/// Phase 2 scaffold: command/event channels and generation tracking work now.
-/// Demux/decode workers will drain these queues in later phases; until then
-/// the control plane updates a local snapshot so hosts can integrate safely.
 pub struct Player {
     path: PathBuf,
+    #[allow(dead_code)]
     prefer_native: bool,
     state: PlayerState,
     generation: AtomicU64,
@@ -91,34 +104,39 @@ pub struct Player {
     position: Duration,
     duration: Duration,
     playing: bool,
-    clock: MasterClock,
     cmd_tx: mpsc::SyncSender<PlayerCommand>,
-    cmd_rx: mpsc::Receiver<PlayerCommand>,
-    /// Outbound events for the host (bounded).
-    events: BoundedQueue<PlayerEvent>,
+    event_rx: mpsc::Receiver<PlayerEvent>,
+    handle: Option<thread::JoinHandle<()>>,
     shut_down: bool,
+    last_error: Option<String>,
 }
 
 impl Player {
-    fn new(path: PathBuf, prefer_native: bool, volume: f32) -> Self {
+    fn open(path: PathBuf, prefer_native: bool, volume: f32, autoplay: bool) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
-        let mut player = Self {
+        let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
+        let handle = demux_worker::spawn_worker(path.clone(), volume, cmd_rx, event_tx);
+
+        let player = Self {
             path,
             prefer_native,
-            state: PlayerState::Ready,
+            state: PlayerState::Opening,
             generation: AtomicU64::new(1),
             volume,
             position: Duration::ZERO,
             duration: Duration::ZERO,
-            playing: false,
-            clock: MasterClock::new(),
+            playing: autoplay,
             cmd_tx,
-            cmd_rx,
-            events: BoundedQueue::new(EVT_CAPACITY),
+            event_rx,
+            handle: Some(handle),
             shut_down: false,
+            last_error: None,
         };
-        player.push_snapshot();
-        let _ = player.prefer_native; // reserved for backend selection
+
+        if !autoplay {
+            let g = player.generation();
+            let _ = player.send_command(PlayerCommand::Pause { generation: g });
+        }
         player
     }
 
@@ -134,6 +152,26 @@ impl Player {
         self.state
     }
 
+    pub fn position(&self) -> Duration {
+        self.position
+    }
+
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
@@ -142,7 +180,7 @@ impl Player {
         self.generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Enqueue a command (non-blocking).  Fails if the bounded queue is full.
+    /// Enqueue a command (non-blocking).
     pub fn send_command(&self, cmd: PlayerCommand) -> Result<(), PlayerError> {
         if self.shut_down {
             return Err(PlayerError::ShutDown);
@@ -155,21 +193,25 @@ impl Player {
     pub fn play(&mut self) -> Result<(), PlayerError> {
         let g = self.generation();
         self.send_command(PlayerCommand::Play { generation: g })?;
-        self.drain_commands();
+        self.playing = true;
+        self.state = PlayerState::Playing;
         Ok(())
     }
 
     pub fn pause(&mut self) -> Result<(), PlayerError> {
         let g = self.generation();
         self.send_command(PlayerCommand::Pause { generation: g })?;
-        self.drain_commands();
+        self.playing = false;
+        self.state = PlayerState::Paused;
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), PlayerError> {
         let g = self.generation();
         self.send_command(PlayerCommand::Stop { generation: g })?;
-        self.drain_commands();
+        self.playing = false;
+        self.state = PlayerState::Ready;
+        self.position = Duration::ZERO;
         Ok(())
     }
 
@@ -180,127 +222,127 @@ impl Player {
             mode: SeekMode::Coarse,
             generation: g,
         })?;
-        self.drain_commands();
+        self.position = position;
+        self.state = PlayerState::Seeking;
         Ok(())
     }
 
     pub fn set_volume(&mut self, volume: f32) -> Result<(), PlayerError> {
         let g = self.generation();
+        let volume = volume.clamp(0.0, 1.0);
         self.send_command(PlayerCommand::SetVolume {
-            volume: volume.clamp(0.0, 1.0),
+            volume,
             generation: g,
         })?;
-        self.drain_commands();
+        self.volume = volume;
         Ok(())
     }
 
     pub fn shutdown(&mut self) -> Result<(), PlayerError> {
+        if self.shut_down {
+            return Ok(());
+        }
         let g = self.generation();
         let _ = self.send_command(PlayerCommand::Shutdown { generation: g });
-        self.drain_commands();
         self.shut_down = true;
+        self.playing = false;
+        self.state = PlayerState::Idle;
+        // Non-blocking: do not join on the UI thread (todos.md).
+        if let Some(h) = self.handle.take() {
+            // Detach — worker exits on Shutdown.
+            drop(h);
+        }
         Ok(())
     }
 
-    /// Poll one outbound event (non-blocking).
+    /// Poll one outbound event (non-blocking) and update local cache.
     pub fn poll_event(&mut self) -> Option<PlayerEvent> {
-        self.drain_commands();
-        self.events.pop()
-    }
-
-    /// Process pending control commands on the calling thread.
-    ///
-    /// Later phases move this into a dedicated control worker.
-    pub fn drain_commands(&mut self) {
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
-            // Discard commands from a superseded generation when applicable.
-            match cmd {
-                PlayerCommand::Play { generation } => {
-                    self.playing = true;
-                    self.state = PlayerState::Playing;
-                    // resume() if previously paused, else start()
-                    if self.clock.clock().is_paused() {
-                        self.clock.clock_mut().resume();
-                    }
-                    self.clock.clock_mut().start();
-                    self.push_event(PlayerEvent::Snapshot(self.snapshot(generation)));
-                }
-                PlayerCommand::Pause { generation } => {
-                    self.playing = false;
-                    self.state = PlayerState::Paused;
-                    self.clock.clock_mut().pause();
-                    self.push_event(PlayerEvent::Snapshot(self.snapshot(generation)));
-                }
-                PlayerCommand::Stop { generation } => {
-                    self.playing = false;
-                    self.state = PlayerState::Ready;
-                    self.position = Duration::ZERO;
-                    self.clock.clock_mut().seek(Duration::ZERO);
-                    self.clock.clock_mut().pause();
-                    self.push_event(PlayerEvent::Snapshot(self.snapshot(generation)));
-                }
-                PlayerCommand::Seek {
-                    position,
-                    generation,
-                    ..
-                } => {
-                    self.state = PlayerState::Seeking;
-                    self.position = position;
-                    self.clock.clock_mut().seek(position);
-                    self.push_event(PlayerEvent::SeekCompleted {
-                        position,
-                        generation,
-                    });
-                    self.state = if self.playing {
-                        PlayerState::Playing
-                    } else {
-                        PlayerState::Paused
-                    };
-                    self.push_event(PlayerEvent::Snapshot(self.snapshot(generation)));
-                }
-                PlayerCommand::SetVolume { volume, generation } => {
-                    self.volume = volume.clamp(0.0, 1.0);
-                    self.push_event(PlayerEvent::Snapshot(self.snapshot(generation)));
-                }
-                PlayerCommand::SelectAudioTrack { generation, .. }
-                | PlayerCommand::SelectVideoTrack { generation, .. } => {
-                    self.push_event(PlayerEvent::Warning {
-                        message: "track selection not yet wired to demux".into(),
-                        generation,
-                    });
-                }
-                PlayerCommand::SetPlaybackRate { rate, generation } => {
-                    self.clock.clock_mut().set_rate(rate);
-                    self.push_event(PlayerEvent::Snapshot(self.snapshot(generation)));
-                }
-                PlayerCommand::Shutdown { .. } => {
-                    self.playing = false;
-                    self.state = PlayerState::Idle;
-                    self.shut_down = true;
-                    self.events.clear();
-                }
+        match self.event_rx.try_recv() {
+            Ok(ev) => {
+                self.apply_event(&ev);
+                Some(ev)
             }
+            Err(_) => None,
         }
     }
 
-    fn snapshot(&self, generation: u64) -> PlayerSnapshot {
+    /// Drain all pending events; returns the latest video frame if any.
+    pub fn poll_all(&mut self) -> (Vec<PlayerEvent>, Option<PlayerEvent>) {
+        let mut events = Vec::new();
+        let mut latest_frame = None;
+        while let Some(ev) = self.poll_event() {
+            if matches!(ev, PlayerEvent::VideoFrame { .. }) {
+                latest_frame = Some(ev);
+            } else {
+                events.push(ev);
+            }
+        }
+        (events, latest_frame)
+    }
+
+    fn apply_event(&mut self, ev: &PlayerEvent) {
+        match ev {
+            PlayerEvent::Snapshot(s) => {
+                self.playing = s.playing;
+                self.position = s.position;
+                self.duration = s.duration;
+                self.volume = s.volume;
+                self.state = if s.playing {
+                    PlayerState::Playing
+                } else if s.status == "paused" {
+                    PlayerState::Paused
+                } else if s.status == "opening" {
+                    PlayerState::Opening
+                } else {
+                    PlayerState::Ready
+                };
+            }
+            PlayerEvent::PositionChanged { position, .. } => {
+                self.position = *position;
+            }
+            PlayerEvent::SeekCompleted { position, .. } => {
+                self.position = *position;
+                self.state = if self.playing {
+                    PlayerState::Playing
+                } else {
+                    PlayerState::Paused
+                };
+            }
+            PlayerEvent::Ended { .. } => {
+                self.playing = false;
+                self.state = PlayerState::Ended;
+            }
+            PlayerEvent::Error { message, .. } => {
+                self.playing = false;
+                self.state = PlayerState::Error;
+                self.last_error = Some(message.clone());
+            }
+            PlayerEvent::VideoFrame { pts, .. } => {
+                self.position = *pts;
+                if self.state == PlayerState::Opening {
+                    self.state = PlayerState::Playing;
+                }
+            }
+            PlayerEvent::Warning { .. } => {}
+        }
+    }
+
+    /// Convenience snapshot for UI binding.
+    pub fn snapshot(&self) -> PlayerSnapshot {
         PlayerSnapshot {
             playing: self.playing,
             position: self.position,
             duration: self.duration,
             volume: self.volume,
-            generation,
+            generation: self.generation(),
             status: format!("{:?}", self.state),
         }
     }
+}
 
-    fn push_snapshot(&mut self) {
-        let g = self.generation();
-        self.push_event(PlayerEvent::Snapshot(self.snapshot(g)));
-    }
-
-    fn push_event(&mut self, ev: PlayerEvent) {
-        let _ = self.events.push(ev);
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -317,47 +359,50 @@ mod tests {
     }
 
     #[test]
-    fn play_pause_updates_state() {
-        let mut p = Player::builder().input("dummy.mp4").build().unwrap();
-        p.play().unwrap();
-        assert_eq!(p.state(), PlayerState::Playing);
-        p.pause().unwrap();
-        assert_eq!(p.state(), PlayerState::Paused);
-        // Drain events
-        let mut saw_pause = false;
-        while let Some(ev) = p.poll_event() {
-            if let PlayerEvent::Snapshot(s) = ev {
-                if !s.playing {
-                    saw_pause = true;
+    fn open_missing_file_reports_error_event() {
+        let mut p = Player::builder()
+            .input("definitely-missing-file-xyz.mp4")
+            .build()
+            .unwrap();
+        // Worker should fail open and emit Error.
+        let mut saw_error = false;
+        for _ in 0..50 {
+            thread::sleep(Duration::from_millis(20));
+            while let Some(ev) = p.poll_event() {
+                if matches!(ev, PlayerEvent::Error { .. }) {
+                    saw_error = true;
                 }
             }
+            if saw_error {
+                break;
+            }
         }
-        assert!(saw_pause);
+        assert!(saw_error, "expected Error event for missing file");
     }
 
     #[test]
     fn seek_bumps_generation() {
-        let mut p = Player::builder().input("x.mp4").build().unwrap();
+        let mut p = Player::builder()
+            .input("definitely-missing-file-xyz.mp4")
+            .autoplay(false)
+            .build()
+            .unwrap();
         let g0 = p.generation();
-        p.seek(Duration::from_secs(10)).unwrap();
+        let _ = p.seek(Duration::from_secs(10));
         assert!(p.generation() > g0);
-        let mut completed = false;
-        while let Some(ev) = p.poll_event() {
-            if matches!(ev, PlayerEvent::SeekCompleted { .. }) {
-                completed = true;
-            }
-        }
-        assert!(completed);
     }
 
     #[test]
-    fn twenty_pause_resume_cycles() {
-        let mut p = Player::builder().input("x.mp4").build().unwrap();
+    fn twenty_pause_resume_commands() {
+        let mut p = Player::builder()
+            .input("definitely-missing-file-xyz.mp4")
+            .autoplay(false)
+            .build()
+            .unwrap();
         for _ in 0..20 {
-            p.play().unwrap();
-            assert_eq!(p.state(), PlayerState::Playing);
-            p.pause().unwrap();
-            assert_eq!(p.state(), PlayerState::Paused);
+            let _ = p.play();
+            let _ = p.pause();
         }
+        assert_eq!(p.state(), PlayerState::Paused);
     }
 }

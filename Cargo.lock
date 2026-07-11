@@ -3307,6 +3307,7 @@ dependencies = [
  "rfd",
  "rodio",
  "rsmpeg",
+ "rsmpeg-player",
  "serde_json",
  "symphonia",
  "tracing",
@@ -3350,9 +3351,12 @@ dependencies = [
 name = "rsmpeg-player"
 version = "0.1.0"
 dependencies = [
+ "openh264",
+ "rodio",
  "rsmpeg-codec",
  "rsmpeg-format",
  "rsmpeg-util",
+ "symphonia",
  "thiserror 2.0.18",
  "tracing",
 ]

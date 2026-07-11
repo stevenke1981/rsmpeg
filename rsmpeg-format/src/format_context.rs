@@ -116,7 +116,7 @@ impl FormatContext {
                 demuxer = Some(Box::new(crate::demuxers::FLACDemuxer));
             }
             "wav" => {
-                demuxer = Some(Box::new(crate::demuxers::WAVDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::WAVDemuxer::default()));
             }
             "rawvideo" | "raw" | "yuv" => {
                 demuxer = Some(Box::new(crate::demuxers::RawVideoDemuxer));
@@ -148,6 +148,19 @@ impl FormatContext {
         } else {
             tracing::warn!("read_frame called but no input format loaded");
             Ok(None)
+        }
+    }
+
+    /// Seek to a timestamp (container-dependent units).
+    pub fn seek(&mut self, timestamp: i64) -> RsResult<()> {
+        if let Some(mut input) = self.input.take() {
+            let result = input.seek(self, timestamp);
+            self.input = Some(input);
+            result
+        } else {
+            Err(RsError::InvalidData(
+                "seek called but no input format loaded".into(),
+            ))
         }
     }
 

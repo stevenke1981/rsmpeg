@@ -1,25 +1,23 @@
 #![forbid(unsafe_code)]
 
-//! Shared helpers for the rsmpeg CLI binary (AVCC conversion, codec detection).
+//! Shared helpers for the rsmpeg CLI — re-exports playback utilities from
+//! [`rsmpeg_player`] so tests and legacy call sites keep working.
 
-pub mod codec_detect;
-pub mod h264_bitstream;
-
-// Re-export primary H.264 helpers for callers and tests.
-pub use h264_bitstream::{
+pub use rsmpeg_player::h264_bitstream::{
     avcc_extradata_to_annex_b, avcc_nal_length_size, avcc_packet_to_annex_b,
     extract_avcc_streaming, is_annex_b, packet_for_decoder, H264BitstreamError,
     H264BitstreamFormat,
 };
+pub use rsmpeg_player::{
+    classify_track, codec_from_fourcc, find_audio_track, find_h264_video_track,
+    find_unsupported_video, DetectedVideoCodec, TrackKind,
+};
 
 /// Backward-compatible name for streaming avcC extraction.
-///
-/// **Never** reads the whole file into memory.
 pub fn extract_avcc_from_mp4(path: &str) -> Option<Vec<u8>> {
     extract_avcc_streaming(path)
 }
 
-/// Fallible → Vec wrappers used by older call sites that discard errors.
 pub fn avcc_extradata_to_annex_b_lossy(extra_data: &[u8]) -> Vec<u8> {
     avcc_extradata_to_annex_b(extra_data).unwrap_or_default()
 }

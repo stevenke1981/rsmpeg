@@ -14,9 +14,9 @@
 - [ ] 每個階段完成後執行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [x] 每個階段完成後執行 `cargo test --workspace`
 - [x] 所有播放器 queue 必須有容量上限，禁止無限增長
-- [ ] 禁止 UI 執行緒直接執行 demux、decode、resample、scale 或等待播放執行緒
+- [x] 禁止 UI 執行緒直接執行 demux、decode、resample、scale 或等待播放執行緒
 - [x] 不支援的 codec 必須回報明確錯誤，不得誤送到錯誤 decoder
-- [ ] Seek、Pause、Stop、換檔均不得造成 GUI 卡死
+- [x] Seek、Pause、Stop、換檔均不得造成 GUI 卡死
 - [x] 優先確保播放正確性，再進行效能優化
 - [ ] 所有時間戳統一使用明確的 `pts + time_base`
 - [x] 所有 decoder 在 seek 後都必須 reset 或重建
@@ -160,12 +160,12 @@ rsmpeg-player/
 - [x] 建立 `PlayerEvent`
 - [x] 建立 `PlayerState`
 - [x] 建立 `PlayerError`
-- [ ] GUI 與 CLI 只透過 `rsmpeg-player` 播放
-- [ ] 移除 CLI 與 GUI 重複的播放實作
+- [x] GUI 與 CLI 只透過 `rsmpeg-player` 播放
+- [x] 移除 CLI 與 GUI 重複的播放實作
 - [ ] 外部後端全部透過 adapter 接入
 - [ ] native pipeline 設為主要實作
-- [ ] 外部後端只作為可選 fallback
-- [ ] 播放器不得直接依賴容器特定解析函式
+- [x] 外部後端只作為可選 fallback
+- [x] 播放器不得直接依賴容器特定解析函式
 
 建議 API：
 
@@ -199,7 +199,7 @@ while let Some(event) = player.poll_event() {
 
 - [x] 使用 bounded command channel
 - [x] 使用 bounded event channel
-- [ ] 使用 bounded video frame channel
+- [x] 使用 bounded video frame channel
 - [ ] 使用 bounded audio frame channel
 - [x] 建立 `Play`
 - [x] 建立 `Pause`
@@ -211,8 +211,8 @@ while let Some(event) = player.poll_event() {
 - [x] 建立 `SetPlaybackRate`
 - [x] 建立 `Shutdown`
 - [x] 命令必須包含 generation 或 sequence id
-- [ ] 舊 generation 的 frame 與事件必須可丟棄
-- [ ] UI 不再直接修改大型 `Arc<Mutex<PlaybackState>>`
+- [x] 舊 generation 的 frame 與事件必須可丟棄
+- [x] UI 不再直接修改大型 `Arc<Mutex<PlaybackState>>`
 - [ ] 只保留適合原子操作的狀態為 atomic
 - [x] 複合狀態透過 snapshot event 傳遞
 
@@ -364,7 +364,7 @@ pub trait Demuxer: Send {
 
 待辦：
 
-- [ ] 確認 WAV `read_frame` 可連續產生 PCM packet
+- [x] 確認 WAV `read_frame` 可連續產生 PCM packet
 - [ ] 確認 FLAC `read_frame` 可產生 frame packet
 - [ ] 完成 AVI idx1／OpenDML index
 - [ ] 解析 AVI stream header
@@ -768,12 +768,12 @@ Seek 時必須：
 
 待辦：
 
-- [ ] `MediaApp` 改為持有 `rsmpeg_player::Player`
-- [ ] UI 只發送 `PlayerCommand`
-- [ ] UI 只接收 `PlayerEvent`
-- [ ] 不再直接持有 decoder thread handle
-- [ ] Stop 不得在 UI thread 執行 blocking join
-- [ ] 換檔採用非阻塞 shutdown
+- [x] `MediaApp` 改為持有 `rsmpeg_player::Player`
+- [x] UI 只發送 `PlayerCommand`
+- [x] UI 只接收 `PlayerEvent`
+- [x] 不再直接持有 decoder thread handle
+- [x] Stop 不得在 UI thread 執行 blocking join
+- [x] 換檔採用非阻塞 shutdown
 - [ ] 顯示目前 codec
 - [ ] 顯示解析度與 FPS
 - [ ] 顯示音訊格式
@@ -795,8 +795,8 @@ Seek 時必須：
 
 待辦：
 
-- [ ] `rsmpeg play` 使用 `rsmpeg-player`
-- [ ] CLI 與 GUI 使用相同 demux／decode／sync
+- [x] `rsmpeg play` 使用 `rsmpeg-player`
+- [x] CLI 與 GUI 使用相同 demux／decode／sync
 - [ ] 新增 `--audio-track`
 - [ ] 新增 `--video-track`
 - [ ] 新增 `--no-audio`
