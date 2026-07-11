@@ -82,7 +82,57 @@ impl PixelFormat {
             | PixelFormat::Yuv420P10
             | PixelFormat::Yuv420P12 => 3,
             PixelFormat::Nv12 | PixelFormat::Nv21 => 2,
+            PixelFormat::None => 0,
             _ => 1,
+        }
+    }
+
+    /// Per-plane `(byte_size, linesize)` for a frame of `width` × `height`.
+    ///
+    /// Uses floor division for chroma dimensions (FFmpeg-compatible).
+    /// 10/12-bit planar formats are stored as 16-bit samples (2 bytes/component).
+    pub fn plane_sizes(self, width: usize, height: usize) -> Vec<(usize, usize)> {
+        match self {
+            PixelFormat::Yuv420P => {
+                let cw = width / 2;
+                let ch = height / 2;
+                vec![(width * height, width), (cw * ch, cw), (cw * ch, cw)]
+            }
+            PixelFormat::Yuv422P => {
+                let cw = width / 2;
+                vec![
+                    (width * height, width),
+                    (cw * height, cw),
+                    (cw * height, cw),
+                ]
+            }
+            PixelFormat::Yuv444P => {
+                let plane = width * height;
+                vec![(plane, width), (plane, width), (plane, width)]
+            }
+            PixelFormat::Nv12 | PixelFormat::Nv21 => {
+                // Y plane + interleaved UV (height/2 rows × width bytes)
+                vec![(width * height, width), (width * (height / 2), width)]
+            }
+            PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
+                vec![(width * height * 3, width * 3)]
+            }
+            PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => {
+                vec![(width * height * 4, width * 4)]
+            }
+            PixelFormat::Gray8 => vec![(width * height, width)],
+            PixelFormat::Gray16 => vec![(width * height * 2, width * 2)],
+            // 10/12-bit stored in 16-bit little-endian samples
+            PixelFormat::Yuv420P10 | PixelFormat::Yuv420P12 => {
+                let cw = width / 2;
+                let ch = height / 2;
+                vec![
+                    (width * height * 2, width * 2),
+                    (cw * ch * 2, cw * 2),
+                    (cw * ch * 2, cw * 2),
+                ]
+            }
+            PixelFormat::None => Vec::new(),
         }
     }
 
@@ -102,5 +152,44 @@ impl PixelFormat {
             "gray16" => Some(PixelFormat::Gray16),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plane_sizes_yuv420p() {
+        let sizes = PixelFormat::Yuv420P.plane_sizes(64, 48);
+        assert_eq!(sizes, vec![(64 * 48, 64), (32 * 24, 32), (32 * 24, 32)]);
+    }
+
+    #[test]
+    fn test_plane_sizes_yuv422p() {
+        let sizes = PixelFormat::Yuv422P.plane_sizes(64, 48);
+        assert_eq!(sizes, vec![(64 * 48, 64), (32 * 48, 32), (32 * 48, 32)]);
+    }
+
+    #[test]
+    fn test_plane_sizes_yuv444p() {
+        let sizes = PixelFormat::Yuv444P.plane_sizes(16, 8);
+        assert_eq!(sizes, vec![(128, 16), (128, 16), (128, 16)]);
+    }
+
+    #[test]
+    fn test_plane_sizes_nv12() {
+        let sizes = PixelFormat::Nv12.plane_sizes(64, 48);
+        assert_eq!(sizes, vec![(64 * 48, 64), (64 * 24, 64)]);
+    }
+
+    #[test]
+    fn test_plane_sizes_packed() {
+        assert_eq!(
+            PixelFormat::Rgb24.plane_sizes(10, 8),
+            vec![(10 * 8 * 3, 30)]
+        );
+        assert_eq!(PixelFormat::Rgba.plane_sizes(10, 8), vec![(10 * 8 * 4, 40)]);
+        assert_eq!(PixelFormat::Gray8.plane_sizes(10, 8), vec![(80, 10)]);
     }
 }

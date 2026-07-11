@@ -1,0 +1,32 @@
+# Minimal CI for the rsmpeg workspace.
+#
+# openh264 (via openh264 / openh264-sys2 in rsmpeg-player and rsmpeg-cli) may
+# compile Cisco OpenH264 from source. That needs a C++ toolchain on the runner
+# (preinstalled on ubuntu-latest). If builds become too heavy or flaky, consider
+# skipping default features for those crates, e.g.:
+#   cargo test --workspace --exclude rsmpeg-player --exclude rsmpeg-cli
+# or testing with --no-default-features / without backend-openh264.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (ubuntu, stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --workspace

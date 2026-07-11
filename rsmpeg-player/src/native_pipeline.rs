@@ -1,4 +1,4 @@
-//! Native demux path: `rsmpeg-format` packets → OpenH264 / Symphonia decode.
+//! Native demux path: `rsmpeg-format` packets → backend OpenH264 / Symphonia decode.
 //!
 //! Used when `prefer_native_pipeline` is true and the container yields a real
 //! sample index (currently non-fragmented MP4, and WAV PCM).
@@ -13,9 +13,6 @@ use rsmpeg_util::MediaType;
 
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
-use crate::h264_bitstream::{
-    avcc_extradata_to_annex_b, avcc_nal_length_size, packet_for_decoder, H264BitstreamFormat,
-};
 
 const LATE_DROP_SEC: f64 = 0.050;
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
@@ -71,6 +68,19 @@ pub fn try_run_native(
     }
 }
 
+/// Convert interleaved S16 LE plane bytes to `i16` samples for rodio.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn s16_plane_to_i16(plane: &[u8]) -> Vec<i16> {
+    plane
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
 #[cfg(all(
     feature = "backend-symphonia",
     feature = "backend-openh264",
@@ -82,12 +92,12 @@ fn run_native_inner(
     cmd_rx: &Receiver<PlayerCommand>,
     event_tx: &SyncSender<PlayerEvent>,
 ) -> Result<(), String> {
-    use openh264::formats::YUVSource;
     use rodio::{OutputStream, Sink};
-    use symphonia::core::audio::{Channels, SampleBuffer};
-    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_PCM_S16LE};
-    use symphonia::core::formats::Packet as SymPacket;
-    use symphonia::core::units::TimeBase;
+    use rsmpeg_codec::{DecodeStatus, Decoder};
+
+    use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
+    use crate::backend::OpenH264Decoder;
+    use crate::video_convert::yuv420p_frame_to_rgba;
 
     emit(
         event_tx,
@@ -166,51 +176,31 @@ fn run_native_inner(
     let mut video_frame_index = 0u64;
     let assumed_frame_dur = 1.0 / 30.0;
 
-    // ── Video decoder ──
-    let mut h264 = if video_si.is_some() {
-        openh264::decoder::Decoder::with_api_config(
-            openh264::OpenH264API::from_source(),
-            openh264::decoder::DecoderConfig::new()
-                .flush_after_decode(openh264::decoder::Flush::NoFlush),
-        )
-        .ok()
+    // ── Video decoder (OpenH264 backend) ──
+    let mut video_dec: Option<OpenH264Decoder> = if let Some(si) = video_si {
+        match OpenH264Decoder::from_params(&ctx.streams[si].codec_params) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: format!("native path: failed to open OpenH264 decoder: {e}"),
+                        generation: 1,
+                    },
+                );
+                None
+            }
+        }
     } else {
         None
     };
 
-    let (sps_pps_prefix, bitstream_format) = if let Some(si) = video_si {
-        let stream = &ctx.streams[si];
-        if let Some(ref avcc) = stream.codec_params.extradata {
-            match (avcc_nal_length_size(avcc), avcc_extradata_to_annex_b(avcc)) {
-                (Ok(n), Ok(a)) => (Some(a), H264BitstreamFormat::Avcc { nal_length_size: n }),
-                _ => (None, H264BitstreamFormat::Avcc { nal_length_size: 4 }),
-            }
-        } else {
-            match stream.codec_params.h264_bitstream_format {
-                rsmpeg_codec::H264BitstreamFormat::Avcc { nal_length_size } => (
-                    None,
-                    H264BitstreamFormat::Avcc {
-                        nal_length_size: nal_length_size as usize,
-                    },
-                ),
-                rsmpeg_codec::H264BitstreamFormat::AnnexB => (None, H264BitstreamFormat::AnnexB),
-                rsmpeg_codec::H264BitstreamFormat::Unknown => {
-                    (None, H264BitstreamFormat::Avcc { nal_length_size: 4 })
-                }
-            }
-        }
-    } else {
-        (None, H264BitstreamFormat::AnnexB)
-    };
-    let mut sps_pps_sent = false;
-
-    // ── Audio decoder (Symphonia decode-only, no demux) ──
-    let (mut audio_decoder, audio_channels, audio_rate) = if let Some(si) = audio_si {
+    // ── Audio decoder (Symphonia packet-in backend) ──
+    let (mut audio_dec, mut audio_channels, mut audio_rate) = if let Some(si) = audio_si {
         let stream = &ctx.streams[si];
         let rate = stream.codec_params.sample_rate.unwrap_or(48_000);
         let ch = stream.codec_params.channels.unwrap_or(2);
-        let codec_ok = matches!(stream.codec_id, CodecId::Aac | CodecId::Pcm);
-        if !codec_ok {
+        if !SymphoniaAudioDecoder::supported(stream.codec_id) {
             emit(
                 event_tx,
                 PlayerEvent::Warning {
@@ -223,42 +213,21 @@ fn run_native_inner(
             );
             (None, ch, rate)
         } else {
-            let mut params = symphonia::core::codecs::CodecParameters::new();
-            match stream.codec_id {
-                CodecId::Aac => {
-                    params.for_codec(CODEC_TYPE_AAC);
-                    if let Some(ref extra) = stream.codec_params.extradata {
-                        let asc = extract_aac_asc(extra).unwrap_or_else(|| extra.clone());
-                        params.with_extra_data(asc.into_boxed_slice());
-                    }
+            match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
+                Ok(d) => (Some(d), ch, rate),
+                Err(e) => {
+                    emit(
+                        event_tx,
+                        PlayerEvent::Warning {
+                            message: format!(
+                                "native path: failed to open Symphonia audio decoder: {e}"
+                            ),
+                            generation: 1,
+                        },
+                    );
+                    (None, ch, rate)
                 }
-                CodecId::Pcm => {
-                    params.for_codec(CODEC_TYPE_PCM_S16LE);
-                }
-                _ => {}
             }
-            params.with_sample_rate(rate);
-            let channels = match ch {
-                1 => Channels::FRONT_LEFT,
-                _ => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
-            };
-            params.with_channels(channels);
-            let den = stream.time_base.den.max(1) as u32;
-            let num = stream.time_base.num.max(1) as u32;
-            params.with_time_base(TimeBase::new(num, den));
-            let dec = symphonia::default::get_codecs()
-                .make(&params, &DecoderOptions::default())
-                .ok();
-            if dec.is_none() {
-                emit(
-                    event_tx,
-                    PlayerEvent::Warning {
-                        message: "native path: failed to open Symphonia audio decoder".into(),
-                        generation: 1,
-                    },
-                );
-            }
-            (dec, ch, rate)
         }
     } else {
         (None, 2u16, 44_100u32)
@@ -358,17 +327,11 @@ fn run_native_inner(
                             let ts_ms = (capped * 1000.0) as i64;
                             let _ = ctx.seek(ts_ms);
                             pending = ctx.read_frame().ok().flatten();
-                            if let Some(ref mut d) = audio_decoder {
-                                d.reset();
+                            if let Some(ref mut d) = audio_dec {
+                                let _ = d.reset();
                             }
-                            if video_si.is_some() {
-                                h264 = openh264::decoder::Decoder::with_api_config(
-                                    openh264::OpenH264API::from_source(),
-                                    openh264::decoder::DecoderConfig::new()
-                                        .flush_after_decode(openh264::decoder::Flush::NoFlush),
-                                )
-                                .ok();
-                                sps_pps_sent = false;
+                            if let Some(ref mut d) = video_dec {
+                                let _ = d.reset();
                             }
                             if let Some(ref s) = sink {
                                 s.clear();
@@ -443,7 +406,7 @@ fn run_native_inner(
             s.set_volume(volume);
         }
 
-        let packet = match pending.take() {
+        let mut packet = match pending.take() {
             Some(p) => p,
             None => match ctx.read_frame() {
                 Ok(Some(p)) => p,
@@ -453,90 +416,98 @@ fn run_native_inner(
         };
         let si = packet.stream_index;
 
+        // Ensure PTS is populated before send_packet (backend uses pts.or(dts)).
+        if packet.pts.is_none() {
+            packet.pts = packet.dts;
+        }
+
         // ── Video ──
-        if Some(si) == video_si && h264.is_some() {
-            let pts = packet.pts.or(packet.dts).unwrap_or(0);
-            let annex_b = match packet_for_decoder(
-                &packet.data,
-                bitstream_format,
-                sps_pps_prefix.as_deref(),
-                sps_pps_sent,
-            ) {
-                Ok(b) => {
-                    sps_pps_sent = true;
-                    b
-                }
-                Err(_) => Vec::new(),
-            };
-            if !annex_b.is_empty() {
-                if let Ok(Some(yuv)) = h264.as_mut().unwrap().decode(&annex_b) {
-                    let (w, h) = yuv.dimensions();
-                    if w > 0 && h > 0 {
-                        let abs_pos = match video_time_base {
-                            Some(spt) if spt > 0.0 && spt.is_finite() => {
-                                if base_video_pts.is_none() {
-                                    base_video_pts = Some(pts);
-                                }
-                                let base = base_video_pts.unwrap_or(pts);
-                                (pts - base) as f64 * spt
-                            }
-                            _ => video_frame_index as f64 * assumed_frame_dur,
-                        };
-                        let mut present = true;
-                        if !force_one_frame {
-                            if playback_start.is_none() {
-                                playback_start = Some(Instant::now());
-                            }
-                            if let Some(t0) = playback_start {
-                                let delta = abs_pos - t0.elapsed().as_secs_f64();
-                                if delta < -LATE_DROP_SEC {
-                                    present = false;
-                                } else if delta > 0.001 {
-                                    let mut rem = Duration::from_secs_f64(delta.min(0.5));
-                                    while rem > Duration::ZERO {
-                                        thread::sleep(rem.min(MAX_PACE_SLEEP));
-                                        rem = rem.saturating_sub(MAX_PACE_SLEEP);
-                                        if matches!(
-                                            cmd_rx.try_recv(),
-                                            Ok(PlayerCommand::Stop { .. })
-                                                | Ok(PlayerCommand::Shutdown { .. })
-                                                | Err(TryRecvError::Disconnected)
-                                        ) {
-                                            stop = true;
-                                            present = false;
-                                            break;
+        if Some(si) == video_si {
+            if let Some(ref mut dec) = video_dec {
+                if dec.send_packet(Some(&packet)).is_ok() {
+                    loop {
+                        match dec.receive_frame() {
+                            Ok(DecodeStatus::Frame(f)) => {
+                                let w = f.width;
+                                let h = f.height;
+                                if w > 0 && h > 0 {
+                                    let pts = f.pts.unwrap_or(0);
+                                    let abs_pos = match video_time_base {
+                                        Some(spt) if spt > 0.0 && spt.is_finite() => {
+                                            if base_video_pts.is_none() {
+                                                base_video_pts = Some(pts);
+                                            }
+                                            let base = base_video_pts.unwrap_or(pts);
+                                            (pts - base) as f64 * spt
                                         }
-                                        if !playing && !force_one_frame {
-                                            present = false;
-                                            break;
+                                        _ => video_frame_index as f64 * assumed_frame_dur,
+                                    };
+                                    let mut present = true;
+                                    if !force_one_frame {
+                                        if playback_start.is_none() {
+                                            playback_start = Some(Instant::now());
+                                        }
+                                        if let Some(t0) = playback_start {
+                                            let delta = abs_pos - t0.elapsed().as_secs_f64();
+                                            if delta < -LATE_DROP_SEC {
+                                                present = false;
+                                            } else if delta > 0.001 {
+                                                let mut rem =
+                                                    Duration::from_secs_f64(delta.min(0.5));
+                                                while rem > Duration::ZERO {
+                                                    thread::sleep(rem.min(MAX_PACE_SLEEP));
+                                                    rem = rem.saturating_sub(MAX_PACE_SLEEP);
+                                                    if matches!(
+                                                        cmd_rx.try_recv(),
+                                                        Ok(PlayerCommand::Stop { .. })
+                                                            | Ok(PlayerCommand::Shutdown { .. })
+                                                            | Err(TryRecvError::Disconnected)
+                                                    ) {
+                                                        stop = true;
+                                                        present = false;
+                                                        break;
+                                                    }
+                                                    if !playing && !force_one_frame {
+                                                        present = false;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    video_frame_index += 1;
+                                    position = Duration::from_secs_f64(abs_pos.max(0.0));
+                                    if present || force_one_frame {
+                                        if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                                            emit(
+                                                event_tx,
+                                                PlayerEvent::VideoFrame {
+                                                    width: w,
+                                                    height: h,
+                                                    rgba,
+                                                    pts: position,
+                                                    generation,
+                                                },
+                                            );
+                                            force_one_frame = false;
+                                            emit(
+                                                event_tx,
+                                                PlayerEvent::PositionChanged {
+                                                    position,
+                                                    generation,
+                                                },
+                                            );
                                         }
                                     }
                                 }
+                                if stop {
+                                    break;
+                                }
                             }
-                        }
-                        video_frame_index += 1;
-                        position = Duration::from_secs_f64(abs_pos.max(0.0));
-                        if present || force_one_frame {
-                            let mut rgba = vec![0u8; w * h * 4];
-                            yuv.write_rgba8(&mut rgba);
-                            emit(
-                                event_tx,
-                                PlayerEvent::VideoFrame {
-                                    width: w,
-                                    height: h,
-                                    rgba,
-                                    pts: position,
-                                    generation,
-                                },
-                            );
-                            force_one_frame = false;
-                            emit(
-                                event_tx,
-                                PlayerEvent::PositionChanged {
-                                    position,
-                                    generation,
-                                },
-                            );
+                            Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {
+                                break;
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -544,45 +515,56 @@ fn run_native_inner(
         }
 
         // ── Audio ──
-        if Some(si) == audio_si && audio_decoder.is_some() {
+        if Some(si) == audio_si {
             if force_one_frame && !playing {
                 continue;
             }
-            let ts = packet.pts.or(packet.dts).unwrap_or(0).max(0) as u64;
-            let dur = packet.duration.max(0) as u64;
-            let sym = SymPacket::new_from_slice(si as u32, ts, dur, &packet.data);
-            match audio_decoder.as_mut().unwrap().decode(&sym) {
-                Ok(buf) => {
-                    let spec = *buf.spec();
-                    let mut sb = SampleBuffer::<i16>::new(buf.capacity() as u64, spec);
-                    sb.copy_interleaved_ref(buf);
-                    let samples = sb.samples().to_vec();
-                    if !samples.is_empty() {
-                        if let Some(ref s) = sink {
-                            s.append(rodio::buffer::SamplesBuffer::new(
-                                audio_channels,
-                                audio_rate,
-                                samples,
-                            ));
+            if let Some(ref mut dec) = audio_dec {
+                if dec.send_packet(Some(&packet)).is_ok() {
+                    loop {
+                        match dec.receive_frame() {
+                            Ok(DecodeStatus::Frame(f)) => {
+                                if f.channels > 0 {
+                                    audio_channels = f.channels;
+                                }
+                                if f.sample_rate > 0 {
+                                    audio_rate = f.sample_rate;
+                                }
+                                let samples = s16_plane_to_i16(
+                                    f.data.first().map(|d| d.as_slice()).unwrap_or(&[]),
+                                );
+                                if !samples.is_empty() {
+                                    if let Some(ref s) = sink {
+                                        s.append(rodio::buffer::SamplesBuffer::new(
+                                            audio_channels,
+                                            audio_rate,
+                                            samples,
+                                        ));
+                                    }
+                                }
+                                // Drive position from audio when no video
+                                if video_si.is_none() {
+                                    if let Some(ts) = f.pts.or(packet.pts).or(packet.dts) {
+                                        let tb = &ctx.streams[si].time_base;
+                                        let sec = ts as f64 * tb.num as f64 / tb.den.max(1) as f64;
+                                        position = Duration::from_secs_f64(sec.max(0.0));
+                                        emit(
+                                            event_tx,
+                                            PlayerEvent::PositionChanged {
+                                                position,
+                                                generation,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {
+                                break;
+                            }
+                            Err(_) => break,
                         }
                     }
-                    // Drive position from audio when no video
-                    if video_si.is_none() {
-                        let tb = &ctx.streams[si].time_base;
-                        let sec = ts as f64 * tb.num as f64 / tb.den.max(1) as f64;
-                        position = Duration::from_secs_f64(sec.max(0.0));
-                        emit(
-                            event_tx,
-                            PlayerEvent::PositionChanged {
-                                position,
-                                generation,
-                            },
-                        );
-                    }
                 }
-                Err(symphonia::core::errors::Error::DecodeError(_))
-                | Err(symphonia::core::errors::Error::IoError(_)) => {}
-                Err(_) => {}
             }
         }
 
@@ -592,24 +574,55 @@ fn run_native_inner(
     }
 
     if !stop {
-        if let Some(ref mut d) = h264 {
-            if let Ok(frames) = d.flush_remaining() {
-                for yuv in &frames {
-                    let (w, h) = yuv.dimensions();
-                    if w > 0 && h > 0 {
-                        let mut rgba = vec![0u8; w * h * 4];
-                        yuv.write_rgba8(&mut rgba);
-                        emit(
-                            event_tx,
-                            PlayerEvent::VideoFrame {
-                                width: w,
-                                height: h,
-                                rgba,
-                                pts: position,
-                                generation,
-                            },
-                        );
+        // Flush video decoder: send_packet(None) + drain remaining frames.
+        if let Some(ref mut dec) = video_dec {
+            if dec.send_packet(None).is_ok() {
+                loop {
+                    match dec.receive_frame() {
+                        Ok(DecodeStatus::Frame(f)) => {
+                            if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                                let w = f.width;
+                                let h = f.height;
+                                if w > 0 && h > 0 {
+                                    emit(
+                                        event_tx,
+                                        PlayerEvent::VideoFrame {
+                                            width: w,
+                                            height: h,
+                                            rgba,
+                                            pts: position,
+                                            generation,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => break,
+                        Err(_) => break,
                     }
+                }
+            }
+        }
+        // Soft-flush audio decoder (no presentation frames beyond sink queue).
+        if let Some(ref mut dec) = audio_dec {
+            let _ = dec.send_packet(None);
+            loop {
+                match dec.receive_frame() {
+                    Ok(DecodeStatus::Frame(f)) => {
+                        let samples =
+                            s16_plane_to_i16(f.data.first().map(|d| d.as_slice()).unwrap_or(&[]));
+                        if !samples.is_empty() {
+                            if let Some(ref s) = sink {
+                                s.append(rodio::buffer::SamplesBuffer::new(
+                                    f.channels.max(1),
+                                    f.sample_rate.max(1),
+                                    samples,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -624,55 +637,4 @@ fn run_native_inner(
         );
     }
     Ok(())
-}
-
-/// Pull AudioSpecificConfig from an MPEG-4 `esds` box payload (or return raw).
-fn extract_aac_asc(esds: &[u8]) -> Option<Vec<u8>> {
-    let mut i = 0usize;
-    while i < esds.len() {
-        let tag = esds[i];
-        i += 1;
-        if i >= esds.len() {
-            return None;
-        }
-        // Expandable MPEG-4 length
-        let mut len = 0usize;
-        for _ in 0..4 {
-            if i >= esds.len() {
-                return None;
-            }
-            let b = esds[i];
-            i += 1;
-            len = (len << 7) | (b & 0x7f) as usize;
-            if b & 0x80 == 0 {
-                break;
-            }
-        }
-        if tag == 0x05 {
-            if i + len <= esds.len() && len > 0 {
-                return Some(esds[i..i + len].to_vec());
-            }
-            return None;
-        }
-        // Skip this descriptor body (may contain nested descriptors — linear scan still works)
-        if tag == 0x03 || tag == 0x04 {
-            // Do not skip fully; nested tags follow inside — just continue from i
-            continue;
-        }
-        i = i.saturating_add(len);
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_asc_from_minimal_esds_like() {
-        // Fake: tag 0x05, len 2, ASC bytes
-        let data = [0x05u8, 0x02, 0x11, 0x90];
-        let asc = extract_aac_asc(&data).expect("asc");
-        assert_eq!(asc, vec![0x11, 0x90]);
-    }
 }

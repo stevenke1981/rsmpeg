@@ -382,19 +382,19 @@ pub trait Demuxer: Send {
 
 待辦：
 
-- [ ] 將一次性 `decode(packet) -> Vec<Frame>` 改成 send/receive 模型
-- [ ] 新增 `send_packet`
-- [ ] 新增 `receive_frame`
-- [ ] 新增 `drain`
-- [ ] 新增 `reset`
-- [ ] 新增 `flush`
+- [x] 將一次性 `decode(packet) -> Vec<Frame>` 改成 send/receive 模型
+- [x] 新增 `send_packet`
+- [x] 新增 `receive_frame`
+- [x] 新增 `drain`（via receive loop / default decode）
+- [x] 新增 `reset`
+- [x] 新增 `flush`
 - [ ] 新增 `FormatChanged`
-- [ ] 新增 `NeedMoreInput`
-- [ ] 新增 `EndOfStream`
-- [ ] 支援一 packet 多 frame
-- [ ] 支援多 packet 一 frame
+- [x] 新增 `NeedMoreInput`
+- [x] 新增 `EndOfStream`
+- [x] 支援一 packet 多 frame
+- [x] 支援多 packet 一 frame
 - [ ] 支援 decoder reorder
-- [ ] seek 後可清除 reorder queue
+- [x] seek 後可清除 reorder queue（reset）
 - [ ] 解碼錯誤帶入 packet PTS、DTS、stream index
 - [ ] 不得將正常 B-frame reorder 視為 decode error
 
@@ -423,23 +423,23 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 移除所有 plane 都配置 `width * height` 的錯誤邏輯
-- [ ] 建立 `PixelFormatDescriptor`
-- [ ] 描述 plane count
-- [ ] 描述 chroma subsampling
-- [ ] 描述 packed／planar
-- [ ] 描述 bytes per component
-- [ ] 描述 bit depth
+- [x] 移除所有 plane 都配置 `width * height` 的錯誤邏輯
+- [x] 建立 `PixelFormatDescriptor`（via `plane_sizes` helper）
+- [x] 描述 plane count
+- [x] 描述 chroma subsampling
+- [x] 描述 packed／planar
+- [x] 描述 bytes per component
+- [x] 描述 bit depth
 - [ ] 描述 alignment
-- [ ] 正確配置 YUV420P
-- [ ] 正確配置 YUV422P
-- [ ] 正確配置 YUV444P
-- [ ] 正確配置 NV12/NV21
-- [ ] 正確配置 RGB24/BGR24
-- [ ] 正確配置 RGBA/BGRA/ARGB
-- [ ] 正確配置 Gray8/Gray16
-- [ ] 正確配置 10-bit／12-bit
-- [ ] 支援獨立 stride
+- [x] 正確配置 YUV420P
+- [x] 正確配置 YUV422P
+- [x] 正確配置 YUV444P
+- [x] 正確配置 NV12/NV21
+- [x] 正確配置 RGB24/BGR24
+- [x] 正確配置 RGBA/BGRA/ARGB
+- [x] 正確配置 Gray8/Gray16
+- [x] 正確配置 10-bit／12-bit
+- [x] 支援獨立 stride（linesize）
 - [ ] 支援 coded size 與 display size
 - [ ] 支援 crop rectangle
 - [ ] 支援 sample aspect ratio
@@ -447,10 +447,10 @@ pub trait Decoder: Send {
 - [ ] 支援 color primaries
 - [ ] 支援 transfer characteristic
 - [ ] 支援 matrix coefficients
-- [ ] Frame 增加 PTS
+- [x] Frame 增加 PTS
 - [ ] Frame 增加 DTS 或 best-effort timestamp
-- [ ] Frame 增加 duration
-- [ ] Frame 增加 time base
+- [x] Frame 增加 duration
+- [x] Frame 增加 time base
 - [ ] Frame 增加 seek generation
 - [ ] 使用 `Arc<[u8]>` 或 frame pool 減少複製
 
@@ -460,20 +460,20 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 在 `rsmpeg-codec` 或獨立 backend crate 建立 `H264Decoder`
-- [ ] 實作 rsmpeg `Decoder` trait
-- [ ] 從 `CodecParameters.extradata` 取得 SPS/PPS
-- [ ] 支援 AVCC input
-- [ ] 支援 Annex B input
-- [ ] 建立 packet timestamp reorder queue
-- [ ] decoder 輸出 frame 時附上正確 timestamp
-- [ ] 處理一 packet 無 frame
-- [ ] 處理 decoder flush
+- [x] 在 `rsmpeg-codec` 或獨立 backend crate 建立 `H264Decoder`（player `backend/openh264_dec`）
+- [x] 實作 rsmpeg `Decoder` trait
+- [x] 從 `CodecParameters.extradata` 取得 SPS/PPS
+- [x] 支援 AVCC input
+- [x] 支援 Annex B input
+- [x] 建立 packet timestamp reorder queue（FIFO best-effort）
+- [x] decoder 輸出 frame 時附上正確 timestamp
+- [x] 處理一 packet 無 frame
+- [x] 處理 decoder flush
 - [ ] 處理 resolution change
 - [ ] 處理 SPS/PPS 更新
-- [ ] seek 後 reset decoder
-- [ ] 不得在 player 層直接呼叫 OpenH264 API
-- [ ] feature 名稱建議為 `codec-openh264`
+- [x] seek 後 reset decoder
+- [x] 不得在 player 層直接呼叫 OpenH264 API（native_pipeline 已隔離；fallback demux_worker 仍有）
+- [x] feature 名稱建議為 `codec-openh264`（現為 `backend-openh264`）
 
 ---
 
@@ -481,23 +481,23 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 建立 `SymphoniaAudioDecoder`
-- [ ] 實作 rsmpeg `Decoder` trait
-- [ ] 支援 MP3
-- [ ] 支援 AAC
+- [x] 建立 `SymphoniaAudioDecoder`
+- [x] 實作 rsmpeg `Decoder` trait
+- [x] 支援 MP3
+- [x] 支援 AAC
 - [ ] 支援 FLAC
 - [ ] 支援 Vorbis
 - [ ] 支援 Opus（若後端可用）
 - [ ] 支援 ALAC
-- [ ] 支援 PCM
-- [ ] 將 Symphonia audio buffer 轉成 rsmpeg `Frame`
-- [ ] 保留 sample format
-- [ ] 保留 channel layout
-- [ ] 保留 sample rate
-- [ ] 保留 frame PTS 與 duration
-- [ ] decoder 不得依賴 Symphonia 自己重新 demux 同一檔案
-- [ ] 音訊 decoder 只接收 rsmpeg-format 產生的 packet
-- [ ] feature 名稱建議為 `codec-symphonia`
+- [x] 支援 PCM
+- [x] 將 Symphonia audio buffer 轉成 rsmpeg `Frame`
+- [x] 保留 sample format
+- [x] 保留 channel layout
+- [x] 保留 sample rate
+- [x] 保留 frame PTS 與 duration
+- [x] decoder 不得依賴 Symphonia 自己重新 demux 同一檔案
+- [x] 音訊 decoder 只接收 rsmpeg-format 產生的 packet（native path）
+- [x] feature 名稱建議為 `codec-symphonia`（現為 `backend-symphonia`）
 
 ---
 
@@ -602,25 +602,25 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 播放器不得直接呼叫 OpenH264 的 `write_rgba8`
-- [ ] OpenH264 backend 輸出原始 YUV frame
-- [ ] 使用 `rsmpeg-scale` 進行 YUV → RGBA
-- [ ] 支援 YUV420P
+- [x] 播放器不得直接呼叫 OpenH264 的 `write_rgba8`（native path）
+- [x] OpenH264 backend 輸出原始 YUV frame
+- [x] 使用 `rsmpeg-scale` 進行 YUV → RGBA
+- [x] 支援 YUV420P
 - [ ] 支援 YUV422P
 - [ ] 支援 YUV444P
 - [ ] 支援 NV12
 - [ ] 支援 10-bit 輸入
-- [ ] 支援 BT.601
+- [x] 支援 BT.601
 - [ ] 支援 BT.709
 - [ ] 支援 BT.2020
-- [ ] 支援 limited range
-- [ ] 支援 full range
+- [x] 支援 limited range
+- [x] 支援 full range
 - [ ] 支援 gamma／transfer metadata
-- [ ] 對未知色彩資訊使用合理預設並記錄警告
-- [ ] Scaler 可重用 context
-- [ ] 解析度不變時不得每 frame 重建 scaler
+- [x] 對未知色彩資訊使用合理預設並記錄警告
+- [x] Scaler 可重用 context
+- [ ] 解析度不變時不得每 frame 重建 scaler（video_convert 目前每 frame new）
 - [ ] resolution change 時可重新配置
-- [ ] 新增色彩準確度測試
+- [x] 新增色彩準確度測試
 - [ ] 新增 stride 非等於 width 的測試
 
 ---
@@ -663,19 +663,19 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 根據 frame PTS 與 master clock 決定顯示時間
-- [ ] 視訊過早時等待
-- [ ] 視訊輕微落後時立即顯示
-- [ ] 視訊嚴重落後時丟棄非關鍵 frame
+- [x] 根據 frame PTS 與 master clock 決定顯示時間（API 已建；native 仍部分 Instant pacing）
+- [x] 視訊過早時等待
+- [x] 視訊輕微落後時立即顯示
+- [x] 視訊嚴重落後時丟棄非關鍵 frame
 - [ ] 不得在 demux 執行緒 sleep
 - [ ] 不得在 audio decode 執行緒 sleep
-- [ ] frame drop threshold 可設定
+- [x] frame drop threshold 可設定
 - [ ] 支援 variable frame rate
 - [ ] 不得固定假設 30 FPS
 - [ ] missing PTS 時使用 duration／frame rate 推導
 - [ ] 連續 missing PTS 時記錄警告
 - [ ] 更新 UI position 時使用 master clock，而非最近 video frame
-- [ ] 統計 displayed、dropped、late、early frame
+- [x] 統計 displayed、dropped、late、early frame
 
 ---
 
@@ -953,13 +953,13 @@ native-only = []
 
 待辦：
 
-- [ ] 新增 GitHub Actions
+- [x] 新增 GitHub Actions
 - [ ] Windows stable Rust
-- [ ] Ubuntu stable Rust
+- [x] Ubuntu stable Rust
 - [ ] macOS stable Rust
-- [ ] `cargo fmt --check`
+- [x] `cargo fmt --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --workspace`
+- [x] `cargo test --workspace`
 - [ ] `cargo test --workspace --no-default-features`
 - [ ] 常用 feature 組合測試
 - [ ] `cargo deny check`
@@ -1031,22 +1031,22 @@ native-only = []
 
 ## Milestone 3：統一 decoder pipeline
 
-- [ ] H.264 backend 實作 rsmpeg Decoder
-- [ ] 音訊 backend 實作 rsmpeg Decoder
-- [ ] Frame 模型修正
-- [ ] decoder timestamp reorder 正確
+- [x] H.264 backend 實作 rsmpeg Decoder
+- [x] 音訊 backend 實作 rsmpeg Decoder
+- [x] Frame 模型修正
+- [ ] decoder timestamp reorder 正確（FIFO best-effort only）
 
 完成標準：
 
-- [ ] Player 只接觸 rsmpeg Decoder trait
-- [ ] Player 不直接呼叫 OpenH264 或 Symphonia decoder API
+- [x] Player 只接觸 rsmpeg Decoder trait（native path）
+- [x] Player 不直接呼叫 OpenH264 或 Symphonia decoder API（native path；fallback worker 仍待）
 
 ---
 
 ## Milestone 4：Resample／Scale 整合
 
 - [ ] 音訊走 rsmpeg-resample
-- [ ] 視訊走 rsmpeg-scale
+- [x] 視訊走 rsmpeg-scale（native path YUV420P→RGBA）
 - [ ] audio ring buffer
 - [ ] frame pool
 

@@ -19,6 +19,7 @@ audio-rodio = ["dep:rodio"]
 rsmpeg-util = { path = "../rsmpeg-util" }
 rsmpeg-codec = { path = "../rsmpeg-codec" }
 rsmpeg-format = { path = "../rsmpeg-format" }
+rsmpeg-scale = { path = "../rsmpeg-scale" }
 thiserror.workspace = true
 tracing.workspace = true
 

@@ -89,6 +89,29 @@ impl PlaybackClock {
     pub fn is_paused(&self) -> bool {
         self.paused_at.is_some() || self.started.is_none()
     }
+
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// Convert a played sample count into a media timeline duration.
+    ///
+    /// Returns [`Duration::ZERO`] when `sample_rate` is 0.
+    pub fn duration_from_audio_samples(samples_played: u64, sample_rate: u32) -> Duration {
+        if sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs_f64(samples_played as f64 / f64::from(sample_rate))
+    }
+
+    /// Snap the clock position to an audio-sample-derived timeline (e.g. after
+    /// seek or when audio is master). Preserves pause state.
+    pub fn seek_audio_samples(&mut self, samples_played: u64, sample_rate: u32) {
+        self.seek(Self::duration_from_audio_samples(
+            samples_played,
+            sample_rate,
+        ));
+    }
 }
 
 /// Selects audio vs wall master later; currently wraps [`PlaybackClock`].
@@ -96,6 +119,10 @@ impl PlaybackClock {
 pub struct MasterClock {
     inner: PlaybackClock,
     use_audio: bool,
+    /// Optional audio sample-rate used when advancing from sample counts.
+    audio_sample_rate: u32,
+    /// Samples accounted for when `use_audio` is true (device-reported).
+    audio_samples_played: u64,
 }
 
 impl MasterClock {
@@ -111,6 +138,31 @@ impl MasterClock {
         self.use_audio
     }
 
+    /// Configure the audio sample rate used by [`Self::set_audio_samples_played`].
+    pub fn set_audio_sample_rate(&mut self, sample_rate: u32) {
+        self.audio_sample_rate = sample_rate;
+    }
+
+    pub fn audio_sample_rate(&self) -> u32 {
+        self.audio_sample_rate
+    }
+
+    /// Update the audio-derived position from a cumulative played sample count.
+    ///
+    /// When audio is master, this also seeks the underlying wall clock so
+    /// [`Self::now`] reflects the audio timeline.
+    pub fn set_audio_samples_played(&mut self, samples: u64) {
+        self.audio_samples_played = samples;
+        if self.use_audio && self.audio_sample_rate > 0 {
+            let pos = PlaybackClock::duration_from_audio_samples(samples, self.audio_sample_rate);
+            self.inner.seek(pos);
+        }
+    }
+
+    pub fn audio_samples_played(&self) -> u64 {
+        self.audio_samples_played
+    }
+
     pub fn clock_mut(&mut self) -> &mut PlaybackClock {
         &mut self.inner
     }
@@ -120,7 +172,14 @@ impl MasterClock {
     }
 
     pub fn now(&self) -> Duration {
-        self.inner.now()
+        if self.use_audio && self.audio_sample_rate > 0 {
+            PlaybackClock::duration_from_audio_samples(
+                self.audio_samples_played,
+                self.audio_sample_rate,
+            )
+        } else {
+            self.inner.now()
+        }
     }
 }
 
@@ -163,5 +222,26 @@ mod tests {
         let after = c.now();
         // Immediately after resume should be ~same as pause position.
         assert!((after.as_secs_f64() - paused.as_secs_f64()).abs() < 0.02);
+    }
+
+    #[test]
+    fn duration_from_audio_samples() {
+        let d = PlaybackClock::duration_from_audio_samples(48_000, 48_000);
+        assert!((d.as_secs_f64() - 1.0).abs() < 1e-9);
+        assert_eq!(
+            PlaybackClock::duration_from_audio_samples(100, 0),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn master_clock_audio_samples() {
+        let mut m = MasterClock::new();
+        m.set_audio_sample_rate(48_000);
+        m.set_audio_master(true);
+        m.set_audio_samples_played(24_000);
+        let n = m.now().as_secs_f64();
+        assert!((n - 0.5).abs() < 1e-9);
+        assert_eq!(m.audio_samples_played(), 24_000);
     }
 }

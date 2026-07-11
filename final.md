@@ -1,33 +1,47 @@
-# rsmpeg 重構驗收摘要（第四刀）
+# rsmpeg 重構驗收摘要（第五刀 — multi-agent catch-up）
 
 分支：`feat/native-playback-pipeline`
 
-## 本輪完成
+## 本輪完成（並行 subagent）
 
-### Milestone 2 收尾：Player 接上 native MP4 demux
-- 新增 `rsmpeg-player/src/native_pipeline.rs`
-- `prefer_native_pipeline`（預設 true）時優先：
-  1. `FormatContext::open_input` + `read_header` + `read_frame`
-  2. H.264 → OpenH264（avcC extradata / AVCC packet）
-  3. AAC/PCM → Symphonia **decode-only**（不 demux 同一檔）
-  4. Seek 走 `FormatContext::seek`（ms → keyframe）
-- Native 不可用時自動 fallback 既有 Symphonia demux 路徑
-- 發出 `using native demux (mp4)` / fallback 警告事件
+### Stream A — Codec foundation
+- `Decoder` 改為 **send_packet / receive_frame / reset** + `DecodeStatus`
+- `Frame::new_video` 正確 YUV/RGB plane 配置（`PixelFormat::plane_sizes`）
+- Raw/PCM 已遷移
 
-### 與第三刀銜接
-- 依賴已完成的 MP4 sample-table demux
+### Stream B/C — Decoder backends
+- `backend/openh264_dec.rs`：`OpenH264Decoder` 實作 trait，輸出 YUV420P
+- `backend/symphonia_audio.rs`：packet-in AAC/PCM/MP3，無 FormatReader demux
+
+### Stream D — Scale + sync scaffolding
+- `rsmpeg-scale` 真實 **YUV420P → RGBA/RGB24**（BT.601 limited）
+- `VideoScheduler`（Wait / Display / DropLate）
+- `video_convert::yuv420p_frame_to_rgba`
+- Clock 增加 audio-sample helpers
+
+### Stream E — CI
+- `.github/workflows/ci.yml`：Ubuntu stable、fmt check、`cargo test --workspace`
+
+### Integration
+- **native_pipeline** 不再直接呼叫 `openh264::` / `symphonia::`
+- 路徑：`rsmpeg-format demux → Decoder backends → rsmpeg-scale → UI`
 
 ## 驗收
 
 ```text
-cargo fmt --all
-cargo test --workspace          # PASS
-cargo build --release -p rsmpeg-cli -p rsmpeg-player -p rsmpeg-format  # PASS
+cargo test --workspace   # PASS（player 44 tests, codec 27, scale 8, util 12）
+cargo build --release -p rsmpeg-cli -p rsmpeg-player  # PASS
 ```
 
-## 下一刀建議
+## 仍未完成
+- demux_worker Symphonia **fallback** 仍直接呼叫 OpenH264/Symphonia（非 native 路徑）
+- VideoScheduler 尚未完全取代 Instant pacing
+- rsmpeg-resample 尚未接入播放音訊
+- B-frame PTS reorder 仍為 FIFO best-effort
+- Clippy -D warnings / Windows CI job
 
-1. Phase 4：OpenH264 / Symphonia 包成 rsmpeg `Decoder` trait
-2. Phase 6：YUV → RGBA 改走 `rsmpeg-scale`
-3. Phase 7：AudioClock + VideoScheduler
-4. 真實 H.264+AAC 素材整合測試（非合成 box）
+## 下一刀
+1. 將 demux_worker fallback 也改走 backend
+2. VideoScheduler 接入 native pacing
+3. AudioClock master + rodio samples played
+4. 真實 H.264+AAC 手動播放驗證

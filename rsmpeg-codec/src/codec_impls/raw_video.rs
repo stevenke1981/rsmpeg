@@ -1,13 +1,15 @@
 //! Raw video codec — copies frames as-is without compression.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 
-use crate::codec::{Codec, CodecCapabilities, Decoder, Encoder};
+use crate::codec::{Codec, CodecCapabilities, DecodeStatus, Decoder, Encoder};
 use crate::codec_id::CodecId;
 use crate::codec_parameters::CodecParameters;
 use crate::frame::Frame;
 use crate::packet::{Packet, PacketFlags};
-use rsmpeg_util::{MediaType, RsResult};
+use rsmpeg_util::{MediaType, RsError, RsResult};
 
 /// Raw video codec — copies frames as-is without compression.
 pub struct RawVideoCodec;
@@ -44,34 +46,27 @@ impl Codec for RawVideoCodec {
 /// Decoder for raw video — each packet becomes one frame.
 pub struct RawVideoDecoder {
     params: Option<CodecParameters>,
+    pending: VecDeque<Frame>,
+    eof: bool,
 }
 
 impl RawVideoDecoder {
     pub fn new() -> Self {
-        RawVideoDecoder { params: None }
+        RawVideoDecoder {
+            params: None,
+            pending: VecDeque::new(),
+            eof: false,
+        }
     }
 
     #[allow(dead_code)]
     pub fn set_parameters(&mut self, params: CodecParameters) {
         self.params = Some(params);
     }
-}
 
-impl Default for RawVideoDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decoder for RawVideoDecoder {
-    fn codec_id(&self) -> CodecId {
-        CodecId::RawVideo
-    }
-
-    fn decode(&mut self, packet: &Packet) -> RsResult<Vec<Frame>> {
-        let data = packet.data.to_vec();
-        let frame = Frame {
-            data: vec![data],
+    fn packet_to_frame(&self, packet: &Packet) -> Frame {
+        Frame {
+            data: vec![packet.data.to_vec()],
             linesize: vec![packet.data.len()],
             width: self.params.as_ref().and_then(|p| p.width).unwrap_or(0),
             height: self.params.as_ref().and_then(|p| p.height).unwrap_or(0),
@@ -89,12 +84,53 @@ impl Decoder for RawVideoDecoder {
             time_base: packet.time_base,
             key_frame: packet.is_key(),
             pict_type: crate::picture_type::PictureType::None,
-        };
-        Ok(vec![frame])
+        }
+    }
+}
+
+impl Default for RawVideoDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decoder for RawVideoDecoder {
+    fn codec_id(&self) -> CodecId {
+        CodecId::RawVideo
     }
 
-    fn flush(&mut self) -> RsResult<Vec<Frame>> {
-        Ok(vec![])
+    fn send_packet(&mut self, packet: Option<&Packet>) -> RsResult<()> {
+        match packet {
+            Some(pkt) => {
+                if self.eof {
+                    return Err(RsError::Codec(
+                        "cannot send packet after end-of-stream; call reset() first".into(),
+                    ));
+                }
+                self.pending.push_back(self.packet_to_frame(pkt));
+                Ok(())
+            }
+            None => {
+                self.eof = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn receive_frame(&mut self) -> RsResult<DecodeStatus> {
+        if let Some(frame) = self.pending.pop_front() {
+            Ok(DecodeStatus::Frame(frame))
+        } else if self.eof {
+            Ok(DecodeStatus::EndOfStream)
+        } else {
+            Ok(DecodeStatus::NeedMoreInput)
+        }
+    }
+
+    fn reset(&mut self) -> RsResult<()> {
+        self.pending.clear();
+        self.eof = false;
+        Ok(())
     }
 
     fn get_parameters(&self) -> CodecParameters {
@@ -236,6 +272,70 @@ mod tests {
         let frames = decoder.decode(&packet).unwrap();
         assert_eq!(frames[0].width, 10);
         assert_eq!(frames[0].height, 10);
+    }
+
+    #[test]
+    fn test_raw_video_send_receive() {
+        let mut decoder = RawVideoDecoder::new();
+        decoder.set_parameters(make_params());
+
+        let packet = Packet {
+            data: Bytes::from(vec![1u8; 50]),
+            pts: Some(42),
+            dts: Some(42),
+            duration: 1,
+            stream_index: 0,
+            flags: PacketFlags::KEY,
+            pos: 0,
+            time_base: test_time_base(),
+        };
+
+        decoder.send_packet(Some(&packet)).unwrap();
+        match decoder.receive_frame().unwrap() {
+            DecodeStatus::Frame(f) => {
+                assert_eq!(f.pts, Some(42));
+                assert_eq!(f.data[0].len(), 50);
+            }
+            other => panic!("expected Frame, got {:?}", other),
+        }
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeStatus::NeedMoreInput
+        ));
+
+        decoder.send_packet(None).unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn test_raw_video_reset_after_eos() {
+        let mut decoder = RawVideoDecoder::new();
+        decoder.send_packet(None).unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
+        // Sending after EOS must fail until reset
+        let packet = Packet {
+            data: Bytes::from(vec![0u8; 4]),
+            pts: None,
+            dts: None,
+            duration: 0,
+            stream_index: 0,
+            flags: PacketFlags::empty(),
+            pos: -1,
+            time_base: test_time_base(),
+        };
+        assert!(decoder.send_packet(Some(&packet)).is_err());
+        decoder.reset().unwrap();
+        decoder.send_packet(Some(&packet)).unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeStatus::Frame(_)
+        ));
     }
 
     #[test]

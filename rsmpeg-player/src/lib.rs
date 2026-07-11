@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
 pub mod clock;
 pub mod codec_detect;
 pub mod command;
@@ -14,6 +15,8 @@ pub mod h264_bitstream;
 pub mod native_pipeline;
 pub mod player;
 pub mod queue;
+pub mod video_convert;
+pub mod video_scheduler;
 
 pub use clock::{MasterClock, PlaybackClock};
 pub use codec_detect::{
@@ -29,3 +32,5 @@ pub use h264_bitstream::{
 };
 pub use player::{Player, PlayerBuilder, PlayerError, PlayerState};
 pub use queue::BoundedQueue;
+pub use video_convert::yuv420p_frame_to_rgba;
+pub use video_scheduler::{ScheduleAction, VideoScheduler, VideoSchedulerStats};
