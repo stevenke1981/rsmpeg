@@ -13,8 +13,8 @@ use rsmpeg_util::MediaType;
 
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
+use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
-const LATE_DROP_SEC: f64 = 0.050;
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
 
@@ -68,19 +68,6 @@ pub fn try_run_native(
     }
 }
 
-/// Convert interleaved S16 LE plane bytes to `i16` samples for rodio.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
-fn s16_plane_to_i16(plane: &[u8]) -> Vec<i16> {
-    plane
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
 #[cfg(all(
     feature = "backend-symphonia",
     feature = "backend-openh264",
@@ -95,6 +82,7 @@ fn run_native_inner(
     use rodio::{OutputStream, Sink};
     use rsmpeg_codec::{DecodeStatus, Decoder};
 
+    use crate::audio_convert::frame_to_s16_device;
     use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
     use crate::backend::OpenH264Decoder;
     use crate::video_convert::yuv420p_frame_to_rgba;
@@ -175,6 +163,8 @@ fn run_native_inner(
     let mut playback_start: Option<Instant> = None;
     let mut video_frame_index = 0u64;
     let assumed_frame_dur = 1.0 / 30.0;
+    // ~50 ms late-drop threshold (VideoScheduler::new default).
+    let mut video_scheduler = VideoScheduler::new();
 
     // ── Video decoder (OpenH264 backend) ──
     let mut video_dec: Option<OpenH264Decoder> = if let Some(si) = video_si {
@@ -343,6 +333,7 @@ fn run_native_inner(
                             video_frame_index = 0;
                             base_video_pts = None;
                             force_one_frame = true;
+                            video_scheduler.reset_stats();
                             emit(
                                 event_tx,
                                 PlayerEvent::SeekCompleted {
@@ -442,18 +433,24 @@ fn run_native_inner(
                                         }
                                         _ => video_frame_index as f64 * assumed_frame_dur,
                                     };
+                                    let frame_pts = Duration::from_secs_f64(abs_pos.max(0.0));
+                                    // Seek preview: always display without wait/drop.
                                     let mut present = true;
                                     if !force_one_frame {
                                         if playback_start.is_none() {
                                             playback_start = Some(Instant::now());
                                         }
-                                        if let Some(t0) = playback_start {
-                                            let delta = abs_pos - t0.elapsed().as_secs_f64();
-                                            if delta < -LATE_DROP_SEC {
+                                        let now = playback_start
+                                            .map(|t0| t0.elapsed())
+                                            .unwrap_or(Duration::ZERO);
+                                        match video_scheduler.schedule(frame_pts, now) {
+                                            ScheduleAction::DropLate => {
                                                 present = false;
-                                            } else if delta > 0.001 {
+                                            }
+                                            ScheduleAction::Wait { duration } => {
+                                                // Cap wait so a bad PTS cannot freeze the loop.
                                                 let mut rem =
-                                                    Duration::from_secs_f64(delta.min(0.5));
+                                                    duration.min(Duration::from_millis(500));
                                                 while rem > Duration::ZERO {
                                                     thread::sleep(rem.min(MAX_PACE_SLEEP));
                                                     rem = rem.saturating_sub(MAX_PACE_SLEEP);
@@ -472,11 +469,17 @@ fn run_native_inner(
                                                         break;
                                                     }
                                                 }
+                                                if present {
+                                                    video_scheduler.mark_displayed();
+                                                }
+                                            }
+                                            ScheduleAction::Display => {
+                                                present = true;
                                             }
                                         }
                                     }
                                     video_frame_index += 1;
-                                    position = Duration::from_secs_f64(abs_pos.max(0.0));
+                                    position = frame_pts;
                                     if present || force_one_frame {
                                         if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
                                             emit(
@@ -530,14 +533,15 @@ fn run_native_inner(
                                 if f.sample_rate > 0 {
                                     audio_rate = f.sample_rate;
                                 }
-                                let samples = s16_plane_to_i16(
-                                    f.data.first().map(|d| d.as_slice()).unwrap_or(&[]),
-                                );
+                                let device_ch = audio_channels.max(1);
+                                let device_rate = audio_rate.max(1);
+                                let samples = frame_to_s16_device(&f, device_rate, device_ch)
+                                    .unwrap_or_default();
                                 if !samples.is_empty() {
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
-                                            audio_channels,
-                                            audio_rate,
+                                            device_ch,
+                                            device_rate,
                                             samples,
                                         ));
                                     }
@@ -609,15 +613,12 @@ fn run_native_inner(
             loop {
                 match dec.receive_frame() {
                     Ok(DecodeStatus::Frame(f)) => {
-                        let samples =
-                            s16_plane_to_i16(f.data.first().map(|d| d.as_slice()).unwrap_or(&[]));
+                        let ch = f.channels.max(1);
+                        let rate = f.sample_rate.max(1);
+                        let samples = frame_to_s16_device(&f, rate, ch).unwrap_or_default();
                         if !samples.is_empty() {
                             if let Some(ref s) = sink {
-                                s.append(rodio::buffer::SamplesBuffer::new(
-                                    f.channels.max(1),
-                                    f.sample_rate.max(1),
-                                    samples,
-                                ));
+                                s.append(rodio::buffer::SamplesBuffer::new(ch, rate, samples));
                             }
                         }
                     }

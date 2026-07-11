@@ -1,47 +1,44 @@
-# rsmpeg 重構驗收摘要（第五刀 — multi-agent catch-up）
+# rsmpeg 重構驗收摘要（第六刀 — multi-agent round 2）
 
 分支：`feat/native-playback-pipeline`
 
-## 本輪完成（並行 subagent）
+## 本輪完成
 
-### Stream A — Codec foundation
-- `Decoder` 改為 **send_packet / receive_frame / reset** + `DecodeStatus`
-- `Frame::new_video` 正確 YUV/RGB plane 配置（`PixelFormat::plane_sizes`）
-- Raw/PCM 已遷移
+### F — demux_worker fallback backend 化
+- Symphonia 仍負責 **demux**
+- 解碼改走 `OpenH264Decoder` + `SymphoniaAudioDecoder`
+- RGBA 改走 `yuv420p_frame_to_rgba`（`rsmpeg-scale`）
+- `openh264::` / `write_rgba8` 已從 demux_worker 移除
 
-### Stream B/C — Decoder backends
-- `backend/openh264_dec.rs`：`OpenH264Decoder` 實作 trait，輸出 YUV420P
-- `backend/symphonia_audio.rs`：packet-in AAC/PCM/MP3，無 FormatReader demux
+### G — VideoScheduler 接入 native path
+- 取代 `LATE_DROP_SEC` 手寫 pacing
+- Wait / Display / DropLate + seek 時 reset stats
 
-### Stream D — Scale + sync scaffolding
-- `rsmpeg-scale` 真實 **YUV420P → RGBA/RGB24**（BT.601 limited）
-- `VideoScheduler`（Wait / Display / DropLate）
-- `video_convert::yuv420p_frame_to_rgba`
-- Clock 增加 audio-sample helpers
+### H — audio_convert + resample 掛點
+- `frame_to_s16_device`（identity S16 或經 rsmpeg-resample）
+- native_pipeline 音訊輸出改走此 helper
+- 註：Resampler 本體仍為 stub 品質（長度正確、非 identity 可能靜音）
 
-### Stream E — CI
-- `.github/workflows/ci.yml`：Ubuntu stable、fmt check、`cargo test --workspace`
-
-### Integration
-- **native_pipeline** 不再直接呼叫 `openh264::` / `symphonia::`
-- 路徑：`rsmpeg-format demux → Decoder backends → rsmpeg-scale → UI`
+### I — CI 擴充
+- Ubuntu：fmt + test（硬失敗）
+- Windows：test（45m timeout，硬失敗）
+- Clippy soft（continue-on-error）
 
 ## 驗收
 
 ```text
-cargo test --workspace   # PASS（player 44 tests, codec 27, scale 8, util 12）
+cargo test --workspace   # PASS（player 50 tests）
 cargo build --release -p rsmpeg-cli -p rsmpeg-player  # PASS
 ```
 
-## 仍未完成
-- demux_worker Symphonia **fallback** 仍直接呼叫 OpenH264/Symphonia（非 native 路徑）
-- VideoScheduler 尚未完全取代 Instant pacing
-- rsmpeg-resample 尚未接入播放音訊
-- B-frame PTS reorder 仍為 FIFO best-effort
-- Clippy -D warnings / Windows CI job
+## 里程碑狀態（更新）
+- M3 Decoder pipeline：**native + fallback 皆走 Decoder trait**
+- M4 Scale：native + fallback 皆走 rsmpeg-scale
+- M4 Resample：API 掛上，演算法仍待實作
+- M5 Scheduler：native 已用；fallback demux_worker 仍 Instant pacing
 
 ## 下一刀
-1. 將 demux_worker fallback 也改走 backend
-2. VideoScheduler 接入 native pacing
-3. AudioClock master + rodio samples played
-4. 真實 H.264+AAC 手動播放驗證
+1. 實作真正的 Resampler（非 zero-fill）
+2. demux_worker 也接 VideoScheduler
+3. AudioClock master 驅動 position
+4. B-frame PTS reorder

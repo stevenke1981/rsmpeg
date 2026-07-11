@@ -20,6 +20,7 @@ rsmpeg-util = { path = "../rsmpeg-util" }
 rsmpeg-codec = { path = "../rsmpeg-codec" }
 rsmpeg-format = { path = "../rsmpeg-format" }
 rsmpeg-scale = { path = "../rsmpeg-scale" }
+rsmpeg-resample = { path = "../rsmpeg-resample" }
 thiserror.workspace = true
 tracing.workspace = true
 

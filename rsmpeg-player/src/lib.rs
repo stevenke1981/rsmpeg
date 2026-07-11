@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio_convert;
 pub mod backend;
 pub mod clock;
 pub mod codec_detect;
@@ -18,6 +19,7 @@ pub mod queue;
 pub mod video_convert;
 pub mod video_scheduler;
 
+pub use audio_convert::frame_to_s16_device;
 pub use clock::{MasterClock, PlaybackClock};
 pub use codec_detect::{
     classify_track, codec_from_fourcc, find_audio_track, find_h264_video_track,

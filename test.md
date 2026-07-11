@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第五刀 multi-agent）
+日期：2026-07-11（第六刀 multi-agent round 2）
 
 ## 指令
 
@@ -16,21 +16,19 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 | 項目 | 結果 |
 |------|------|
 | workspace tests | **PASS** |
-| rsmpeg-codec | 27 tests |
-| rsmpeg-player | 44 tests |
-| rsmpeg-scale | 8 tests |
-| rsmpeg-util | 12 tests |
+| rsmpeg-player | **50** tests |
+| rsmpeg-codec | 27 |
+| rsmpeg-scale | 8 |
+| rsmpeg-util | 12 |
 | release build | **PASS** |
 
-## 本輪新增測試重點
-- Frame YUV plane sizes
-- Decoder send/receive (Raw/PCM)
-- OpenH264Decoder construct/reset
-- SymphoniaAudioDecoder PCM roundtrip
-- Scaler YUV420P→RGBA colour approx
-- VideoScheduler wait/display/drop
+## 本輪重點
+- demux_worker 無 `openh264::` / `write_rgba8`
+- native VideoScheduler pacing
+- `frame_to_s16_device` identity + rate-change tests
+- CI: ubuntu + windows + soft clippy
 
 ## 已知限制
-- Fallback demux_worker 尚未完全 backend 化
-- Scheduler 統計尚未接到 UI
-- 無真實媒體檔 CI 整合測試
+- Resampler 非 identity 路徑仍可能輸出靜音（stub）
+- fallback demux 未接 VideoScheduler
+- 無真實媒體 CI 素材

@@ -472,7 +472,7 @@ pub trait Decoder: Send {
 - [ ] 處理 resolution change
 - [ ] 處理 SPS/PPS 更新
 - [x] seek 後 reset decoder
-- [x] 不得在 player 層直接呼叫 OpenH264 API（native_pipeline 已隔離；fallback demux_worker 仍有）
+- [x] 不得在 player 層直接呼叫 OpenH264 API（native + fallback demux_worker 皆隔離）
 - [x] feature 名稱建議為 `codec-openh264`（現為 `backend-openh264`）
 
 ---
@@ -954,11 +954,11 @@ native-only = []
 待辦：
 
 - [x] 新增 GitHub Actions
-- [ ] Windows stable Rust
+- [x] Windows stable Rust
 - [x] Ubuntu stable Rust
 - [ ] macOS stable Rust
 - [x] `cargo fmt --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`（soft / continue-on-error）
 - [x] `cargo test --workspace`
 - [ ] `cargo test --workspace --no-default-features`
 - [ ] 常用 feature 組合測試
@@ -1038,15 +1038,15 @@ native-only = []
 
 完成標準：
 
-- [x] Player 只接觸 rsmpeg Decoder trait（native path）
-- [x] Player 不直接呼叫 OpenH264 或 Symphonia decoder API（native path；fallback worker 仍待）
+- [x] Player 只接觸 rsmpeg Decoder trait（native + fallback decode）
+- [x] Player 不直接呼叫 OpenH264 或 Symphonia decoder API（demux fallback 仍用 Symphonia FormatReader）
 
 ---
 
 ## Milestone 4：Resample／Scale 整合
 
-- [ ] 音訊走 rsmpeg-resample
-- [x] 視訊走 rsmpeg-scale（native path YUV420P→RGBA）
+- [x] 音訊走 rsmpeg-resample（`frame_to_s16_device` 掛接；演算法仍 stub）
+- [x] 視訊走 rsmpeg-scale（native + fallback YUV420P→RGBA）
 - [ ] audio ring buffer
 - [ ] frame pool
 
