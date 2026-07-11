@@ -11,6 +11,7 @@ pub mod command;
 pub mod demux_worker;
 pub mod event;
 pub mod h264_bitstream;
+pub mod native_pipeline;
 pub mod player;
 pub mod queue;
 

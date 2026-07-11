@@ -115,7 +115,8 @@ impl Player {
     fn open(path: PathBuf, prefer_native: bool, volume: f32, autoplay: bool) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
-        let handle = demux_worker::spawn_worker(path.clone(), volume, cmd_rx, event_tx);
+        let handle =
+            demux_worker::spawn_worker(path.clone(), volume, prefer_native, cmd_rx, event_tx);
 
         let player = Self {
             path,

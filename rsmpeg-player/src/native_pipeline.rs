@@ -1,42 +1,25 @@
-//! Background demux / decode / output worker (UI-thread free).
+//! Native demux path: `rsmpeg-format` packets → OpenH264 / Symphonia decode.
+//!
+//! Used when `prefer_native_pipeline` is true and the container yields a real
+//! sample index (currently non-fragmented MP4, and WAV PCM).
 
-use std::fs::File;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::codec_detect::{
-    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video, TrackKind,
-};
+use rsmpeg_codec::CodecId;
+use rsmpeg_format::FormatContext;
+use rsmpeg_util::MediaType;
+
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
 use crate::h264_bitstream::{
-    avcc_extradata_to_annex_b, avcc_nal_length_size, extract_avcc_streaming, packet_for_decoder,
-    H264BitstreamFormat,
+    avcc_extradata_to_annex_b, avcc_nal_length_size, packet_for_decoder, H264BitstreamFormat,
 };
 
 const LATE_DROP_SEC: f64 = 0.050;
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
-
-/// Spawn the playback worker thread.
-pub fn spawn_worker(
-    path: PathBuf,
-    volume: f32,
-    prefer_native: bool,
-    cmd_rx: Receiver<PlayerCommand>,
-    event_tx: SyncSender<PlayerEvent>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        if let Err(e) = run_worker(path, volume, prefer_native, cmd_rx, event_tx.clone()) {
-            let _ = event_tx.try_send(PlayerEvent::Error {
-                message: e.to_string(),
-                generation: 0,
-            });
-        }
-    })
-}
 
 fn emit(tx: &SyncSender<PlayerEvent>, ev: PlayerEvent) {
     let _ = tx.try_send(ev);
@@ -60,43 +43,118 @@ fn snap(
     })
 }
 
+/// Try native demux. Returns `Ok(())` if the session finished on this path.
+/// Returns `Err` when native demux is unavailable so the caller can fall back.
+pub fn try_run_native(
+    path: &std::path::Path,
+    volume: f32,
+    cmd_rx: &Receiver<PlayerCommand>,
+    event_tx: &SyncSender<PlayerEvent>,
+) -> Result<(), String> {
+    #[cfg(not(all(
+        feature = "backend-symphonia",
+        feature = "backend-openh264",
+        feature = "audio-rodio"
+    )))]
+    {
+        let _ = (path, volume, cmd_rx, event_tx);
+        return Err("backends disabled".into());
+    }
+
+    #[cfg(all(
+        feature = "backend-symphonia",
+        feature = "backend-openh264",
+        feature = "audio-rodio"
+    ))]
+    {
+        run_native_inner(path, volume, cmd_rx, event_tx)
+    }
+}
+
 #[cfg(all(
     feature = "backend-symphonia",
     feature = "backend-openh264",
     feature = "audio-rodio"
 ))]
-fn run_worker(
-    path: PathBuf,
+fn run_native_inner(
+    path: &std::path::Path,
     mut volume: f32,
-    prefer_native: bool,
-    cmd_rx: Receiver<PlayerCommand>,
-    event_tx: SyncSender<PlayerEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    cmd_rx: &Receiver<PlayerCommand>,
+    event_tx: &SyncSender<PlayerEvent>,
+) -> Result<(), String> {
     use openh264::formats::YUVSource;
     use rodio::{OutputStream, Sink};
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::errors::Error;
-    use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, Track};
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
-    use symphonia::core::units::Time;
+    use symphonia::core::audio::{Channels, SampleBuffer};
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_PCM_S16LE};
+    use symphonia::core::formats::Packet as SymPacket;
+    use symphonia::core::units::TimeBase;
 
-    if prefer_native {
-        match crate::native_pipeline::try_run_native(&path, volume, &cmd_rx, &event_tx) {
-            Ok(()) => return Ok(()),
-            Err(reason) => {
-                emit(
-                    &event_tx,
-                    PlayerEvent::Warning {
-                        message: format!("native pipeline unavailable ({reason}); falling back"),
-                        generation: 0,
-                    },
-                );
-            }
-        }
+    emit(
+        event_tx,
+        snap(
+            true,
+            Duration::ZERO,
+            Duration::ZERO,
+            volume,
+            1,
+            "opening-native",
+        ),
+    );
+
+    let mut ctx = FormatContext::open_input(path).map_err(|e| e.to_string())?;
+    ctx.read_header().map_err(|e| e.to_string())?;
+
+    let format_name = ctx.format_name.clone().unwrap_or_default();
+    let native_ok = matches!(format_name.as_str(), "mp4" | "mov" | "m4a" | "m4v" | "wav");
+    if !native_ok {
+        return Err(format!(
+            "native demux not preferred for format '{format_name}'"
+        ));
     }
+
+    // Peek first packet — proves sample index exists.
+    let first = ctx
+        .read_frame()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "native demux produced no packets (fragmented or empty stbl)".to_string())?;
+    let mut pending: Option<rsmpeg_codec::Packet> = Some(first);
+
+    let video_si = ctx
+        .streams
+        .iter()
+        .position(|s| s.media_type == MediaType::Video && s.codec_id == CodecId::H264);
+    let audio_si = ctx.streams.iter().position(|s| {
+        s.media_type == MediaType::Audio
+            && matches!(
+                s.codec_id,
+                CodecId::Aac | CodecId::Pcm | CodecId::Mp3 | CodecId::Alac
+            )
+    });
+
+    if video_si.is_none() && audio_si.is_none() {
+        return Err("native demux: no H.264 video or supported audio stream".into());
+    }
+
+    if let Some(u) = ctx.streams.iter().find(|s| {
+        s.media_type == MediaType::Video
+            && s.codec_id != CodecId::H264
+            && s.codec_id != CodecId::Unknown
+    }) {
+        emit(
+            event_tx,
+            PlayerEvent::Warning {
+                message: format!(
+                    "Unsupported video codec '{}' — skipping video",
+                    u.codec_id.name()
+                ),
+                generation: 1,
+            },
+        );
+    }
+
+    let duration_ms = ctx.duration.max(0) as u64;
+    let duration = Duration::from_millis(duration_ms);
+    let duration_sec = duration.as_secs_f64();
 
     let mut generation = 1u64;
     let mut playing = true;
@@ -104,100 +162,12 @@ fn run_worker(
     let mut position = Duration::ZERO;
     let mut force_one_frame = false;
     let mut was_playing = true;
-
-    emit(
-        &event_tx,
-        snap(
-            true,
-            position,
-            Duration::ZERO,
-            volume,
-            generation,
-            "opening",
-        ),
-    );
-
-    let file = Box::new(File::open(&path)?);
-    let mss = MediaSourceStream::new(file, Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    let probed = symphonia::default::get_probe().format(
-        &hint,
-        mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
-    )?;
-    let mut format = probed.format;
-    let tracks = format.tracks().to_vec();
-
-    let audio_track: Option<Track> = find_audio_track(&tracks).cloned();
-    let mut video_track: Option<Track> = find_h264_video_track(&tracks).cloned();
-    let mut stream_avcc = None;
-    if video_track.is_none() {
-        if let Some(u) = find_unsupported_video(&tracks) {
-            emit(
-                &event_tx,
-                PlayerEvent::Warning {
-                    message: format!("Unsupported video codec '{}' — audio only", u.name()),
-                    generation,
-                },
-            );
-        } else if let Some(avcc) = extract_avcc_streaming(&path) {
-            video_track = tracks
-                .iter()
-                .find(|t| !matches!(classify_track(t), TrackKind::Audio))
-                .cloned();
-            stream_avcc = Some(avcc);
-        }
-    }
-    let has_video = video_track.is_some();
-    let has_audio = audio_track.is_some();
-    if !has_video && !has_audio {
-        return Err("No playable audio or H.264 video tracks found".into());
-    }
-
-    let track_duration_sec = |t: &Track| -> f64 {
-        let n = t.codec_params.n_frames.unwrap_or(0) as f64;
-        if n <= 0.0 {
-            return 0.0;
-        }
-        if let Some(sr) = t.codec_params.sample_rate {
-            if sr > 0 {
-                return n / f64::from(sr);
-            }
-        }
-        if let Some(tb) = t.codec_params.time_base {
-            let s = tb.numer as f64 / tb.denom.max(1) as f64;
-            if s > 0.0 && s.is_finite() {
-                return n * s;
-            }
-        }
-        0.0
-    };
-    let duration_sec = {
-        let a = audio_track.as_ref().map(track_duration_sec).unwrap_or(0.0);
-        let v = video_track.as_ref().map(track_duration_sec).unwrap_or(0.0);
-        if a > 0.0 {
-            a
-        } else {
-            v
-        }
-    };
-    let duration = Duration::from_secs_f64(duration_sec.max(0.0));
-
-    let sec_per_tick = video_track
-        .as_ref()
-        .and_then(|t| t.codec_params.time_base)
-        .map(|tb| tb.numer as f64 / tb.denom.max(1) as f64)
-        .filter(|s| s.is_finite() && *s > 0.0);
-    let assumed_frame_dur = 1.0 / 30.0;
     let mut playback_start: Option<Instant> = None;
-    let mut base_video_pts: Option<u64> = None;
     let mut video_frame_index = 0u64;
+    let assumed_frame_dur = 1.0 / 30.0;
 
-    let mut h264 = if has_video {
+    // ── Video decoder ──
+    let mut h264 = if video_si.is_some() {
         openh264::decoder::Decoder::with_api_config(
             openh264::OpenH264API::from_source(),
             openh264::decoder::DecoderConfig::new()
@@ -208,21 +178,91 @@ fn run_worker(
         None
     };
 
-    let mut audio_decoder = audio_track.as_ref().and_then(|t| {
-        symphonia::default::get_codecs()
-            .make(&t.codec_params, &DecoderOptions::default())
-            .ok()
-    });
-    let audio_track_id = audio_track.as_ref().map(|t| t.id);
-    let audio_channels = audio_track
-        .as_ref()
-        .and_then(|t| t.codec_params.channels)
-        .map(|c| c.count() as u16)
-        .unwrap_or(2);
-    let audio_rate = audio_track
-        .as_ref()
-        .and_then(|t| t.codec_params.sample_rate)
-        .unwrap_or(44100);
+    let (sps_pps_prefix, bitstream_format) = if let Some(si) = video_si {
+        let stream = &ctx.streams[si];
+        if let Some(ref avcc) = stream.codec_params.extradata {
+            match (avcc_nal_length_size(avcc), avcc_extradata_to_annex_b(avcc)) {
+                (Ok(n), Ok(a)) => (Some(a), H264BitstreamFormat::Avcc { nal_length_size: n }),
+                _ => (None, H264BitstreamFormat::Avcc { nal_length_size: 4 }),
+            }
+        } else {
+            match stream.codec_params.h264_bitstream_format {
+                rsmpeg_codec::H264BitstreamFormat::Avcc { nal_length_size } => (
+                    None,
+                    H264BitstreamFormat::Avcc {
+                        nal_length_size: nal_length_size as usize,
+                    },
+                ),
+                rsmpeg_codec::H264BitstreamFormat::AnnexB => (None, H264BitstreamFormat::AnnexB),
+                rsmpeg_codec::H264BitstreamFormat::Unknown => {
+                    (None, H264BitstreamFormat::Avcc { nal_length_size: 4 })
+                }
+            }
+        }
+    } else {
+        (None, H264BitstreamFormat::AnnexB)
+    };
+    let mut sps_pps_sent = false;
+
+    // ── Audio decoder (Symphonia decode-only, no demux) ──
+    let (mut audio_decoder, audio_channels, audio_rate) = if let Some(si) = audio_si {
+        let stream = &ctx.streams[si];
+        let rate = stream.codec_params.sample_rate.unwrap_or(48_000);
+        let ch = stream.codec_params.channels.unwrap_or(2);
+        let codec_ok = matches!(stream.codec_id, CodecId::Aac | CodecId::Pcm);
+        if !codec_ok {
+            emit(
+                event_tx,
+                PlayerEvent::Warning {
+                    message: format!(
+                        "native audio codec '{}' not wired — audio muted",
+                        stream.codec_id.name()
+                    ),
+                    generation: 1,
+                },
+            );
+            (None, ch, rate)
+        } else {
+            let mut params = symphonia::core::codecs::CodecParameters::new();
+            match stream.codec_id {
+                CodecId::Aac => {
+                    params.for_codec(CODEC_TYPE_AAC);
+                    if let Some(ref extra) = stream.codec_params.extradata {
+                        let asc = extract_aac_asc(extra).unwrap_or_else(|| extra.clone());
+                        params.with_extra_data(asc.into_boxed_slice());
+                    }
+                }
+                CodecId::Pcm => {
+                    params.for_codec(CODEC_TYPE_PCM_S16LE);
+                }
+                _ => {}
+            }
+            params.with_sample_rate(rate);
+            let channels = match ch {
+                1 => Channels::FRONT_LEFT,
+                _ => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
+            };
+            params.with_channels(channels);
+            let den = stream.time_base.den.max(1) as u32;
+            let num = stream.time_base.num.max(1) as u32;
+            params.with_time_base(TimeBase::new(num, den));
+            let dec = symphonia::default::get_codecs()
+                .make(&params, &DecoderOptions::default())
+                .ok();
+            if dec.is_none() {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: "native path: failed to open Symphonia audio decoder".into(),
+                        generation: 1,
+                    },
+                );
+            }
+            (dec, ch, rate)
+        }
+    } else {
+        (None, 2u16, 44_100u32)
+    };
 
     let _rodio = OutputStream::try_default();
     let sink = _rodio
@@ -233,32 +273,33 @@ fn run_worker(
         s.set_volume(volume);
     }
 
-    let avcc_blob = video_track
-        .as_ref()
-        .and_then(|t| t.codec_params.extra_data.as_ref().map(|e| e.to_vec()))
-        .or(stream_avcc);
-    let (sps_pps_prefix, bitstream_format) = if h264.is_some() {
-        if let Some(ref avcc) = avcc_blob {
-            match (avcc_nal_length_size(avcc), avcc_extradata_to_annex_b(avcc)) {
-                (Ok(n), Ok(a)) => (Some(a), H264BitstreamFormat::Avcc { nal_length_size: n }),
-                _ => (None, H264BitstreamFormat::Avcc { nal_length_size: 4 }),
-            }
-        } else {
-            (None, H264BitstreamFormat::AnnexB)
-        }
-    } else {
-        (None, H264BitstreamFormat::AnnexB)
-    };
-    let mut sps_pps_sent = false;
-    let seek_track_id = video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
-
     emit(
-        &event_tx,
-        snap(true, position, duration, volume, generation, "playing"),
+        event_tx,
+        snap(
+            true,
+            position,
+            duration,
+            volume,
+            generation,
+            "playing-native",
+        ),
+    );
+    emit(
+        event_tx,
+        PlayerEvent::Warning {
+            message: format!("using native demux ({format_name})"),
+            generation,
+        },
     );
 
+    let video_time_base = video_si.map(|si| {
+        let tb = &ctx.streams[si].time_base;
+        tb.num as f64 / tb.den.max(1) as f64
+    });
+    let mut base_video_pts: Option<i64> = None;
+
     loop {
-        // ── Drain commands ──
+        // ── Commands ──
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
@@ -277,7 +318,7 @@ fn run_worker(
                             playing = true;
                             was_playing = true;
                             emit(
-                                &event_tx,
+                                event_tx,
                                 snap(true, position, duration, volume, g, "playing"),
                             );
                         }
@@ -288,7 +329,7 @@ fn run_worker(
                                 s.pause();
                             }
                             emit(
-                                &event_tx,
+                                event_tx,
                                 snap(false, position, duration, volume, g, "paused"),
                             );
                         }
@@ -314,17 +355,13 @@ fn run_worker(
                                 }
                             };
                             position = Duration::from_secs_f64(capped);
-                            let _ = format.seek(
-                                SeekMode::Coarse,
-                                SeekTo::Time {
-                                    time: Time::from(capped),
-                                    track_id: seek_track_id,
-                                },
-                            );
+                            let ts_ms = (capped * 1000.0) as i64;
+                            let _ = ctx.seek(ts_ms);
+                            pending = ctx.read_frame().ok().flatten();
                             if let Some(ref mut d) = audio_decoder {
                                 d.reset();
                             }
-                            if has_video {
+                            if video_si.is_some() {
                                 h264 = openh264::decoder::Decoder::with_api_config(
                                     openh264::OpenH264API::from_source(),
                                     openh264::decoder::DecoderConfig::new()
@@ -341,16 +378,17 @@ fn run_worker(
                             }
                             playback_start = Some(Instant::now() - Duration::from_secs_f64(capped));
                             video_frame_index = 0;
+                            base_video_pts = None;
                             force_one_frame = true;
                             emit(
-                                &event_tx,
+                                event_tx,
                                 PlayerEvent::SeekCompleted {
                                     position,
                                     generation: g,
                                 },
                             );
                             emit(
-                                &event_tx,
+                                event_tx,
                                 snap(playing, position, duration, volume, g, "seeked"),
                             );
                         }
@@ -363,16 +401,16 @@ fn run_worker(
                                 s.set_volume(volume);
                             }
                             emit(
-                                &event_tx,
+                                event_tx,
                                 snap(playing, position, duration, volume, g, "volume"),
                             );
                         }
                         other => {
                             emit(
-                                &event_tx,
+                                event_tx,
                                 PlayerEvent::Warning {
                                     message: format!(
-                                        "command not implemented: {:?}",
+                                        "command not implemented: gen={}",
                                         other.generation()
                                     ),
                                     generation: other.generation(),
@@ -405,16 +443,19 @@ fn run_worker(
             s.set_volume(volume);
         }
 
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(Error::ResetRequired) => break,
-            Err(Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(_) => break,
+        let packet = match pending.take() {
+            Some(p) => p,
+            None => match ctx.read_frame() {
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(_) => break,
+            },
         };
-        let tid = packet.track_id();
+        let si = packet.stream_index;
 
-        if has_video && h264.is_some() && video_track.as_ref().is_some_and(|vt| vt.id == tid) {
-            let pts = packet.ts();
+        // ── Video ──
+        if Some(si) == video_si && h264.is_some() {
+            let pts = packet.pts.or(packet.dts).unwrap_or(0);
             let annex_b = match packet_for_decoder(
                 &packet.data,
                 bitstream_format,
@@ -431,14 +472,15 @@ fn run_worker(
                 if let Ok(Some(yuv)) = h264.as_mut().unwrap().decode(&annex_b) {
                     let (w, h) = yuv.dimensions();
                     if w > 0 && h > 0 {
-                        let abs_pos = match sec_per_tick {
-                            Some(spt) => {
+                        let abs_pos = match video_time_base {
+                            Some(spt) if spt > 0.0 && spt.is_finite() => {
                                 if base_video_pts.is_none() {
                                     base_video_pts = Some(pts);
                                 }
-                                pts.saturating_sub(base_video_pts.unwrap_or(pts)) as f64 * spt
+                                let base = base_video_pts.unwrap_or(pts);
+                                (pts - base) as f64 * spt
                             }
-                            None => video_frame_index as f64 * assumed_frame_dur,
+                            _ => video_frame_index as f64 * assumed_frame_dur,
                         };
                         let mut present = true;
                         if !force_one_frame {
@@ -454,7 +496,6 @@ fn run_worker(
                                     while rem > Duration::ZERO {
                                         thread::sleep(rem.min(MAX_PACE_SLEEP));
                                         rem = rem.saturating_sub(MAX_PACE_SLEEP);
-                                        // Check for stop/pause without consuming other cmds fully
                                         if matches!(
                                             cmd_rx.try_recv(),
                                             Ok(PlayerCommand::Stop { .. })
@@ -479,7 +520,7 @@ fn run_worker(
                             let mut rgba = vec![0u8; w * h * 4];
                             yuv.write_rgba8(&mut rgba);
                             emit(
-                                &event_tx,
+                                event_tx,
                                 PlayerEvent::VideoFrame {
                                     width: w,
                                     height: h,
@@ -490,7 +531,7 @@ fn run_worker(
                             );
                             force_one_frame = false;
                             emit(
-                                &event_tx,
+                                event_tx,
                                 PlayerEvent::PositionChanged {
                                     position,
                                     generation,
@@ -502,11 +543,15 @@ fn run_worker(
             }
         }
 
-        if has_audio && audio_decoder.is_some() && audio_track_id == Some(tid) {
+        // ── Audio ──
+        if Some(si) == audio_si && audio_decoder.is_some() {
             if force_one_frame && !playing {
                 continue;
             }
-            match audio_decoder.as_mut().unwrap().decode(&packet) {
+            let ts = packet.pts.or(packet.dts).unwrap_or(0).max(0) as u64;
+            let dur = packet.duration.max(0) as u64;
+            let sym = SymPacket::new_from_slice(si as u32, ts, dur, &packet.data);
+            match audio_decoder.as_mut().unwrap().decode(&sym) {
                 Ok(buf) => {
                     let spec = *buf.spec();
                     let mut sb = SampleBuffer::<i16>::new(buf.capacity() as u64, spec);
@@ -521,11 +566,26 @@ fn run_worker(
                             ));
                         }
                     }
+                    // Drive position from audio when no video
+                    if video_si.is_none() {
+                        let tb = &ctx.streams[si].time_base;
+                        let sec = ts as f64 * tb.num as f64 / tb.den.max(1) as f64;
+                        position = Duration::from_secs_f64(sec.max(0.0));
+                        emit(
+                            event_tx,
+                            PlayerEvent::PositionChanged {
+                                position,
+                                generation,
+                            },
+                        );
+                    }
                 }
-                Err(Error::DecodeError(_)) | Err(Error::IoError(_)) => {}
-                Err(_) => break,
+                Err(symphonia::core::errors::Error::DecodeError(_))
+                | Err(symphonia::core::errors::Error::IoError(_)) => {}
+                Err(_) => {}
             }
         }
+
         if stop {
             break;
         }
@@ -540,7 +600,7 @@ fn run_worker(
                         let mut rgba = vec![0u8; w * h * 4];
                         yuv.write_rgba8(&mut rgba);
                         emit(
-                            &event_tx,
+                            event_tx,
                             PlayerEvent::VideoFrame {
                                 width: w,
                                 height: h,
@@ -556,34 +616,63 @@ fn run_worker(
         if let Some(ref s) = sink {
             s.sleep_until_end();
         }
-        emit(&event_tx, PlayerEvent::Ended { generation });
+        emit(event_tx, PlayerEvent::Ended { generation });
     } else {
         emit(
-            &event_tx,
+            event_tx,
             snap(false, position, duration, volume, generation, "stopped"),
         );
     }
     Ok(())
 }
 
-#[cfg(not(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-)))]
-fn run_worker(
-    _path: PathBuf,
-    _volume: f32,
-    _prefer_native: bool,
-    _cmd_rx: Receiver<PlayerCommand>,
-    event_tx: SyncSender<PlayerEvent>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    emit(
-        &event_tx,
-        PlayerEvent::Error {
-            message: "playback backends disabled".into(),
-            generation: 0,
-        },
-    );
-    Err("backends disabled".into())
+/// Pull AudioSpecificConfig from an MPEG-4 `esds` box payload (or return raw).
+fn extract_aac_asc(esds: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 0usize;
+    while i < esds.len() {
+        let tag = esds[i];
+        i += 1;
+        if i >= esds.len() {
+            return None;
+        }
+        // Expandable MPEG-4 length
+        let mut len = 0usize;
+        for _ in 0..4 {
+            if i >= esds.len() {
+                return None;
+            }
+            let b = esds[i];
+            i += 1;
+            len = (len << 7) | (b & 0x7f) as usize;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        if tag == 0x05 {
+            if i + len <= esds.len() && len > 0 {
+                return Some(esds[i..i + len].to_vec());
+            }
+            return None;
+        }
+        // Skip this descriptor body (may contain nested descriptors — linear scan still works)
+        if tag == 0x03 || tag == 0x04 {
+            // Do not skip fully; nested tags follow inside — just continue from i
+            continue;
+        }
+        i = i.saturating_add(len);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_asc_from_minimal_esds_like() {
+        // Fake: tag 0x05, len 2, ASC bytes
+        let data = [0x05u8, 0x02, 0x11, 0x90];
+        let asc = extract_aac_asc(&data).expect("asc");
+        assert_eq!(asc, vec![0x11, 0x90]);
+    }
 }

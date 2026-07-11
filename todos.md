@@ -101,7 +101,7 @@
 - [x] 不再由播放器自行掃描 MP4 二進位尋找 `avcC`
 - [x] 由 MP4 demuxer 解析 `stsd → avc1/avc3 → avcC`
 - [x] 將 avcC payload 存入 `Stream.codec_params.extradata`
-- [ ] 多視訊軌時每個 stream 必須保存自己的 extradata
+- [x] 多視訊軌時每個 stream 必須保存自己的 extradata
 - [x] 支援 extended-size ISOBMFF box
 - [x] 支援 box size 為 0 的合法情況
 - [x] 遇到 fragmented MP4 時回報目前支援狀態
@@ -163,7 +163,7 @@ rsmpeg-player/
 - [x] GUI 與 CLI 只透過 `rsmpeg-player` 播放
 - [x] 移除 CLI 與 GUI 重複的播放實作
 - [ ] 外部後端全部透過 adapter 接入
-- [ ] native pipeline 設為主要實作
+- [x] native pipeline 設為主要實作
 - [x] 外部後端只作為可選 fallback
 - [x] 播放器不得直接依賴容器特定解析函式
 
@@ -1024,7 +1024,7 @@ native-only = []
 
 完成標準：
 
-- [ ] 播放器不再依賴 Symphonia demux MP4
+- [x] 播放器不再依賴 Symphonia demux MP4（native 優先；失敗才 fallback）
 - [x] rsmpeg-format 可獨立輸出 MP4 packet
 
 ---
@@ -1077,12 +1077,13 @@ native-only = []
 
 只有全部滿足以下條件，才能宣告播放管線完成：
 
-- [ ] 容器資料由 `rsmpeg-format` demux
+- [x] 容器資料由 `rsmpeg-format` demux（MP4/WAV native path；其他 fallback）
 - [ ] 壓縮 packet 由 `rsmpeg-codec` decoder 解碼
 - [ ] 音訊 frame 經過 `rsmpeg-resample`
 - [ ] 視訊 frame 經過 `rsmpeg-scale`
-- [ ] 播放核心位於 `rsmpeg-player`
-- [ ] CLI 與 GUI 共用同一套 player
+- [x] 播放核心位於 `rsmpeg-player`
+- [x] CLI 與 GUI 共用同一套 player
+
 - [ ] 有音訊時以 AudioClock 作主時鐘
 - [ ] 支援 bounded queues
 - [ ] 支援正確 Pause／Resume

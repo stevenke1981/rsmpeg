@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第三刀）
+日期：2026-07-11（第四刀）
 
 ## 指令
 
@@ -15,27 +15,25 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player -p rsmpeg-format
 
 | 項目 | 結果 |
 |------|------|
-| `cargo test --workspace` | **PASS**（含 rsmpeg-format 10 tests、rsmpeg-player 19 tests） |
-| `cargo build --release -p rsmpeg-cli -p rsmpeg-player -p rsmpeg-format` | **PASS**（~5s incremental） |
+| `cargo test --workspace` | **PASS**（rsmpeg-player 20 tests、rsmpeg-format 10 tests） |
+| `cargo build --release -p rsmpeg-cli -p rsmpeg-player -p rsmpeg-format` | **PASS** |
 
 ## 本輪新增／強化測試
 
-### rsmpeg-format MP4
-- `build_sample_index_stts_stsz_stco`：sample offset / DTS / keyframe
-- `build_sample_index_ctts_pts`：B-frame 風格 PTS ≠ DTS
-- `demux_minimal_mp4_packets`：合成 MP4 連續讀出 3 個 packet
-- `seek_to_mid_resets_cursor`：毫秒 seek 後 cursor 正確
-- `extended_size_and_parent_bounds`：64-bit box header
+### rsmpeg-player native pipeline
+- `extract_asc_from_minimal_esds_like`：esds → AudioSpecificConfig
+- 既有 player 測試仍通過（missing file / seek / pause-resume）
 
 ### 整合行為（手動驗收建議）
 ```text
 cargo run --release -p rsmpeg-cli -- play sample.mp4
-cargo run --release -p rsmpeg-cli -- gui sample.mp4
+# 應出現 Warning: using native demux (mp4)
+# 若 native 失敗會 fallback Symphonia
 ```
 
 ## 已知限制
 
-- GUI/CLI 播放仍以 Symphonia demux 為主；native MP4 `read_frame` 已可獨立吐 packet，尚未接到 player worker
-- fragmented MP4（moof/traf）僅警告，不 demux
-- edit list（edts/elst）尚未修正 timeline
-- B-frame decoder reorder 尚未完整
+- Native path：MP4/WAV demux via `rsmpeg-format`；H.264→OpenH264；AAC/PCM→Symphonia **decode-only**
+- Symphonia 仍作 demux fallback（非 MP4、fragmented、無 sample table）
+- B-frame reorder、AudioClock master、rsmpeg-scale 尚未接入
+- AAC 需可解析 esds ASC；失敗時可能靜音但視訊可播

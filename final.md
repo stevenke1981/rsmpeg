@@ -1,20 +1,21 @@
-# rsmpeg 重構驗收摘要（第三刀）
+# rsmpeg 重構驗收摘要（第四刀）
 
 分支：`feat/native-playback-pipeline`
 
 ## 本輪完成
 
-### Phase 3.2–3.3：原生 MP4 sample-table demux
-- 有狀態 `MP4Demuxer`：解析 `moov` 後建立 sample index
-- 支援 `stts` / `ctts` / `stsc` / `stsz` / `stco` / `co64` / `stss`
-- `read_frame` 依 DTS 交錯多軌輸出真實 `Packet`（pts/dts/duration/flags/pos/time_base）
-- `seek(timestamp_ms)` 對齊最近 keyframe（有 stss 時）
-- `avc1`/`avc3` + `avcC` extradata；`mp4a` → `CodecId::Aac`
-- fragmented MP4（moof）明確警告，不假成功
-- 單元測試：合成 MP4 連續 packet、CTTS PTS、extended-size box
+### Milestone 2 收尾：Player 接上 native MP4 demux
+- 新增 `rsmpeg-player/src/native_pipeline.rs`
+- `prefer_native_pipeline`（預設 true）時優先：
+  1. `FormatContext::open_input` + `read_header` + `read_frame`
+  2. H.264 → OpenH264（avcC extradata / AVCC packet）
+  3. AAC/PCM → Symphonia **decode-only**（不 demux 同一檔）
+  4. Seek 走 `FormatContext::seek`（ms → keyframe）
+- Native 不可用時自動 fallback 既有 Symphonia demux 路徑
+- 發出 `using native demux (mp4)` / fallback 警告事件
 
-### Codec
-- 新增 `CodecId::Aac`
+### 與第三刀銜接
+- 依賴已完成的 MP4 sample-table demux
 
 ## 驗收
 
@@ -26,7 +27,7 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player -p rsmpeg-format  # PASS
 
 ## 下一刀建議
 
-1. 將 player worker 切換為 native MP4 demux → OpenH264/Symphonia decode
-2. edit list（edts/elst）與 multi-chunk stsc 邊界案例
-3. OpenH264 / Symphonia 包成 rsmpeg `Decoder` trait backend（Phase 4）
-4. AudioClock + VideoScheduler（Phase 7）
+1. Phase 4：OpenH264 / Symphonia 包成 rsmpeg `Decoder` trait
+2. Phase 6：YUV → RGBA 改走 `rsmpeg-scale`
+3. Phase 7：AudioClock + VideoScheduler
+4. 真實 H.264+AAC 素材整合測試（非合成 box）
