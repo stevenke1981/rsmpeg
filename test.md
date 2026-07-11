@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第十三刀 multi-agent round 9）
+日期：2026-07-11（第十四刀 multi-agent round 10）
 
 ## 指令
 
@@ -17,12 +17,12 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 |------|------|
 | workspace tests | **PASS** |
 | rsmpeg-player | **80**（+4：sync controller 4） |
-| rsmpeg-codec | 28（+1：new_audio 單測） |
-| rsmpeg-scale | 12（+2：rgb24） |
+| rsmpeg-codec | 29（+1：codec_parameters builders） |
+| rsmpeg-scale | 14（+2：nv12→rgba） |
 | rsmpeg-util | 16（+4：pixel_format helpers） |
 | rsmpeg-resample | 20（+9：channel mix helpers） |
 | rsmpeg-format | 14（+4：time_util） |
-| rsmpeg-filter | 10（+3：mirror） |
+| rsmpeg-filter | 13（+3：crop） |
 | release build | **PASS** |
 | fmt --check | **PASS** |
 
@@ -56,6 +56,11 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - rsmpeg-filter：新增 `MirrorFilter`（RGBA 水平翻轉，保留 alpha）+ 3 單測
 - rsmpeg-scale：新增 `yuv420p_frame_to_rgb24`（R,G,B 序、3 bytes/pixel，BT.601）+ 2 單測
 - rsmpeg-format：新增 `time_util.rs`（`samples_to_ms`/`ms_to_samples`/`samples_to_secs`，timescale 零安全）+ 4 單測
+
+## round 10 重點
+- rsmpeg-filter：新增 `CropFilter`（RGBA 子矩形裁切，越界自動 clamp）+ 3 單測
+- rsmpeg-scale：新增 `nv12_frame_to_rgba`（semi-planar NV12→RGBA，BT.601）+ 2 單測
+- rsmpeg-codec：新增 `CodecParameters::for_video`/`for_audio` 建構子（原僅有 `new`）+ 1 單測
 
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做

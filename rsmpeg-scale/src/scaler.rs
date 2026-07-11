@@ -513,6 +513,85 @@ pub fn yuv420p_frame_to_rgb24(frame: &Frame) -> RsResult<Vec<u8>> {
     Ok(out)
 }
 
+/// Convert an NV12 [`Frame`] into packed RGBA (`Vec<u8>`, 4 bytes/pixel, R,G,B,A order).
+///
+/// NV12 is a semi-planar 4:2:0 format: plane 0 is the full-resolution Y (luma) plane and
+/// plane 1 is interleaved UV (a `U` byte followed by a `V` byte per chroma sample). This reuses
+/// the same `yuv_to_rgb_bt601` BT.601 (limited range by default) conversion as the YUV420P
+/// paths, the same chroma-offset logic, and the same plane-capacity validation style.
+pub fn nv12_frame_to_rgba(frame: &Frame) -> RsResult<Vec<u8>> {
+    if frame.pixel_format != PixelFormat::Nv12 {
+        return Err(RsError::InvalidData(
+            format!(
+                "nv12_frame_to_rgba expects Nv12, got {:?}",
+                frame.pixel_format
+            )
+            .into(),
+        ));
+    }
+    if frame.data.len() < 2 || frame.linesize.len() < 2 {
+        return Err(RsError::InvalidData(
+            "NV12 frame requires 2 planes (Y, UV)".into(),
+        ));
+    }
+
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 {
+        return Err(RsError::InvalidData(
+            "nv12_frame_to_rgba requires non-zero width/height".into(),
+        ));
+    }
+
+    let y_plane = &frame.data[0];
+    let uv_plane = &frame.data[1];
+    let y_stride = frame.linesize[0];
+    let uv_stride = frame.linesize[1];
+
+    // Chroma dimensions for 4:2:0 (matches the Yuv420P paths).
+    let chroma_w = (w + 1) / 2;
+    let chroma_h = (h + 1) / 2;
+
+    // Validate plane capacity (allow extra padding in linesize), same as yuv420p_frame_to_rgb24.
+    let y_need = y_stride
+        .checked_mul(h.saturating_sub(1))
+        .and_then(|o| o.checked_add(w));
+    let uv_need = uv_stride
+        .checked_mul(chroma_h.saturating_sub(1))
+        .and_then(|o| o.checked_add(chroma_w * 2));
+    match (y_need, uv_need) {
+        (Some(yn), Some(uvn)) if y_plane.len() >= yn && uv_plane.len() >= uvn => {}
+        _ => {
+            return Err(RsError::InvalidData(
+                "NV12 plane buffers are too small for declared size/linesize".into(),
+            ));
+        }
+    }
+
+    // BT.601 limited range, matching the default Scaler Yuv420P → Rgba conversion.
+    let limited = true;
+    let mut out = vec![0u8; w * h * 4];
+
+    for y in 0..h {
+        let cy = y / 2;
+        for x in 0..w {
+            let cx = x / 2;
+            let yv = y_plane[y * y_stride + x];
+            let u = uv_plane[cy * uv_stride + cx * 2];
+            let v = uv_plane[cy * uv_stride + cx * 2 + 1];
+
+            let (r, g, b) = yuv_to_rgb_bt601(yv, u, v, limited);
+            let off = (y * w + x) * 4;
+            out[off] = r;
+            out[off + 1] = g;
+            out[off + 2] = b;
+            out[off + 3] = 255;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Build a correctly sized synthetic YUV420P frame (not using broken `Frame::new_video` plane sizes).
 #[cfg(test)]
 pub(crate) fn make_yuv420p_frame(width: usize, height: usize, y: u8, u: u8, v: u8) -> Frame {
@@ -526,6 +605,36 @@ pub(crate) fn make_yuv420p_frame(width: usize, height: usize, y: u8, u: u8, v: u
         width,
         height,
         pixel_format: PixelFormat::Yuv420P,
+        sample_format: rsmpeg_util::SampleFormat::None,
+        sample_rate: 0,
+        channels: 0,
+        samples: 0,
+        pts: Some(0),
+        duration: 1,
+        time_base: Rational::new(1, 25),
+        key_frame: true,
+        pict_type: rsmpeg_codec::PictureType::I,
+    }
+}
+
+/// Build a correctly sized synthetic NV12 frame with interleaved UV plane
+/// (not using broken `Frame::new_video` plane sizes). The UV plane is filled with
+/// repeated `[u, v]` pairs.
+#[cfg(test)]
+pub(crate) fn make_nv12_frame(width: usize, height: usize, y: u8, u: u8, v: u8) -> Frame {
+    let y_size = width * height;
+    let uv_size = width * (height / 2);
+    let mut uv = vec![0u8; uv_size];
+    for i in 0..uv_size / 2 {
+        uv[i * 2] = u;
+        uv[i * 2 + 1] = v;
+    }
+    Frame {
+        data: vec![vec![y; y_size], uv],
+        linesize: vec![width, width],
+        width,
+        height,
+        pixel_format: PixelFormat::Nv12,
         sample_format: rsmpeg_util::SampleFormat::None,
         sample_rate: 0,
         channels: 0,
@@ -761,6 +870,30 @@ mod tests {
         // Not a Yuv420P frame — must be rejected.
         frame.pixel_format = PixelFormat::Rgb24;
         let res = yuv420p_frame_to_rgb24(&frame);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_nv12_to_rgba_buffer_len_and_black() {
+        let w = 2usize;
+        let h = 2usize;
+        // Y=0 (limited-range black), neutral chroma U=V=128 → near-black.
+        let frame = make_nv12_frame(w, h, 0, 128, 128);
+        let out = nv12_frame_to_rgba(&frame).unwrap();
+        assert_eq!(out.len(), w * h * 4);
+        // First pixel ≈ black. Order is R,G,B,A; all color channels small, alpha 255.
+        assert!(out[0] < 16, "R={}", out[0]);
+        assert!(out[1] < 16, "G={}", out[1]);
+        assert!(out[2] < 16, "B={}", out[2]);
+        assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn test_nv12_to_rgba_rejects_wrong_format() {
+        let mut frame = make_nv12_frame(2, 2, 16, 128, 128);
+        // Not an NV12 frame — must be rejected.
+        frame.pixel_format = PixelFormat::Rgb24;
+        let res = nv12_frame_to_rgba(&frame);
         assert!(res.is_err());
     }
 }

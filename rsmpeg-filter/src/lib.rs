@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod builtin;
+pub mod crop;
 pub mod filter;
 pub mod filter_graph;
 pub mod grayscale;

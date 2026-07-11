@@ -48,4 +48,80 @@ impl CodecParameters {
             h264_bitstream_format: H264BitstreamFormat::Unknown,
         }
     }
+
+    /// Build video `CodecParameters` with sensible defaults.
+    ///
+    /// Sets `width`/`height`/`codec_id` (and derives `media_type`), while all
+    /// audio-related fields stay `None`/zero and `h264_bitstream_format` defaults
+    /// to `Unknown`. Mirrors how a player typically constructs video params.
+    pub fn for_video(width: usize, height: usize, codec_id: CodecId) -> Self {
+        CodecParameters {
+            codec_id,
+            media_type: codec_id.media_type(),
+            width: Some(width),
+            height: Some(height),
+            pixel_format: None,
+            sample_rate: None,
+            channels: None,
+            sample_format: None,
+            bit_rate: None,
+            extradata: None,
+            h264_bitstream_format: H264BitstreamFormat::Unknown,
+        }
+    }
+
+    /// Build audio `CodecParameters` with sensible defaults.
+    ///
+    /// Sets `sample_rate`/`channels`/`codec_id` (and derives `media_type`),
+    /// while all video-related fields stay `None`/zero and
+    /// `h264_bitstream_format` defaults to `Unknown`. Mirrors how a player
+    /// typically constructs audio params.
+    pub fn for_audio(sample_rate: u32, channels: u16, codec_id: CodecId) -> Self {
+        CodecParameters {
+            codec_id,
+            media_type: codec_id.media_type(),
+            width: None,
+            height: None,
+            pixel_format: None,
+            sample_rate: Some(sample_rate),
+            channels: Some(channels),
+            sample_format: None,
+            bit_rate: None,
+            extradata: None,
+            h264_bitstream_format: H264BitstreamFormat::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec_id::CodecId;
+
+    #[test]
+    fn codec_parameters_builders() {
+        let video = CodecParameters::for_video(1920, 1080, CodecId::H264);
+        assert_eq!(video.codec_id, CodecId::H264);
+        assert_eq!(video.media_type, rsmpeg_util::MediaType::Video);
+        assert_eq!(video.width, Some(1920));
+        assert_eq!(video.height, Some(1080));
+        assert_eq!(video.sample_rate, None);
+        assert_eq!(video.channels, None);
+        assert_eq!(video.pixel_format, None);
+        assert_eq!(video.bit_rate, None);
+        assert_eq!(video.extradata, None);
+        assert_eq!(video.h264_bitstream_format, H264BitstreamFormat::Unknown);
+
+        let audio = CodecParameters::for_audio(44100, 2, CodecId::Aac);
+        assert_eq!(audio.codec_id, CodecId::Aac);
+        assert_eq!(audio.media_type, rsmpeg_util::MediaType::Audio);
+        assert_eq!(audio.sample_rate, Some(44100));
+        assert_eq!(audio.channels, Some(2));
+        assert_eq!(audio.width, None);
+        assert_eq!(audio.height, None);
+        assert_eq!(audio.sample_format, None);
+        assert_eq!(audio.bit_rate, None);
+        assert_eq!(audio.extradata, None);
+        assert_eq!(audio.h264_bitstream_format, H264BitstreamFormat::Unknown);
+    }
 }
