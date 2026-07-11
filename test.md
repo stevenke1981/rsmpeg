@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第十一刀 multi-agent round 7）
+日期：2026-07-11（第十二刀 multi-agent round 8）
 
 ## 指令
 
@@ -17,10 +17,10 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 |------|------|
 | workspace tests | **PASS** |
 | rsmpeg-player | **80**（+4：sync controller 4） |
-| rsmpeg-codec | 27 |
+| rsmpeg-codec | 28（+1：new_audio 單測） |
 | rsmpeg-scale | 10（+2：bgr24） |
-| rsmpeg-util | 12 |
-| rsmpeg-resample | 11 |
+| rsmpeg-util | 16（+4：pixel_format helpers） |
+| rsmpeg-resample | 20（+9：channel mix helpers） |
 | rsmpeg-format | 10 |
 | rsmpeg-filter | 7（+3：grayscale） |
 | release build | **PASS** |
@@ -46,6 +46,11 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - SyncController（player/src/sync.rs）：A/V drift 決策 Render/Drop/Duplicate（預設 40ms 容差）+ 4 單測
 - rsmpeg-scale：新增 `yuv420p_frame_to_bgr24`（BGR 序、3 bytes/pixel，複用 BT.601 數學）+ 2 單測
 - rsmpeg-filter：新增 `GrayscaleFilter`（RGBA→灰階，保留 alpha，符合 Filter trait）+ 3 單測
+
+## round 8 重點
+- rsmpeg-util：PixelFormat 新增 `is_yuv()`/`is_rgb()`/`channels()`（`planes()` 已存在）+ 4 單測
+- rsmpeg-codec：`new_audio` 已存在，補 `new_audio_sets_fields` 單測（+1）
+- rsmpeg-resample：新增 `channel.rs`（stereo↔mono f32/i16mix 4 助手）+ 9 單測
 
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做

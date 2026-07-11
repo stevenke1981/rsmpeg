@@ -155,4 +155,21 @@ mod tests {
         assert_eq!(gray.linesize, vec![w]);
         assert_eq!(gray.data[0].len(), w * h);
     }
+
+    #[test]
+    fn new_audio_sets_fields() {
+        // Existing factory signature: new_audio(sample_format, sample_rate, channels, samples)
+        let frame = Frame::new_audio(SampleFormat::S16, 44_100, 2, 1024);
+        assert_eq!(frame.channels, 2);
+        assert_eq!(frame.sample_rate, 44_100);
+        assert_eq!(frame.sample_format, SampleFormat::S16);
+        assert_eq!(frame.samples, 1024);
+        assert_eq!(frame.pixel_format, PixelFormat::None);
+        assert_eq!(frame.width, 0);
+        assert_eq!(frame.height, 0);
+        assert_eq!(frame.time_base, Rational::new(1, 44_100));
+        assert_eq!(frame.pts, None);
+        assert!(frame.key_frame);
+        assert_eq!(frame.pict_type, PictureType::I);
+    }
 }

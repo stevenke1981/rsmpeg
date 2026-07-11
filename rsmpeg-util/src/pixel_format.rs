@@ -136,6 +136,49 @@ impl PixelFormat {
         }
     }
 
+    /// Whether this is a YUV (or NV) family planar/semi-planar format.
+    pub fn is_yuv(self) -> bool {
+        matches!(
+            self,
+            PixelFormat::Yuv420P
+                | PixelFormat::Yuv422P
+                | PixelFormat::Yuv444P
+                | PixelFormat::Yuv420P10
+                | PixelFormat::Yuv420P12
+                | PixelFormat::Nv12
+                | PixelFormat::Nv21
+        )
+    }
+
+    /// Whether this is a packed RGB/RGBA family format.
+    pub fn is_rgb(self) -> bool {
+        matches!(
+            self,
+            PixelFormat::Rgb24
+                | PixelFormat::Bgr24
+                | PixelFormat::Rgba
+                | PixelFormat::Bgra
+                | PixelFormat::Argb
+        )
+    }
+
+    /// Samples per pixel for packed formats; 3 for planar/semi-planar YUV (Y/U/V).
+    pub fn channels(self) -> usize {
+        match self {
+            PixelFormat::Rgb24 | PixelFormat::Bgr24 => 3,
+            PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => 4,
+            PixelFormat::Yuv420P
+            | PixelFormat::Yuv422P
+            | PixelFormat::Yuv444P
+            | PixelFormat::Yuv420P10
+            | PixelFormat::Yuv420P12
+            | PixelFormat::Nv12
+            | PixelFormat::Nv21 => 3,
+            PixelFormat::Gray8 | PixelFormat::Gray16 => 1,
+            PixelFormat::None => 0,
+        }
+    }
+
     pub fn from_name(s: &str) -> Option<Self> {
         match s {
             "yuv420p" => Some(PixelFormat::Yuv420P),
@@ -191,5 +234,53 @@ mod tests {
         );
         assert_eq!(PixelFormat::Rgba.plane_sizes(10, 8), vec![(10 * 8 * 4, 40)]);
         assert_eq!(PixelFormat::Gray8.plane_sizes(10, 8), vec![(80, 10)]);
+    }
+
+    #[test]
+    fn is_yuv_true_for_yuv() {
+        assert!(PixelFormat::Yuv420P.is_yuv());
+        assert!(PixelFormat::Nv12.is_yuv());
+        assert!(PixelFormat::Nv21.is_yuv());
+        assert!(PixelFormat::Yuv420P12.is_yuv());
+        assert!(!PixelFormat::Rgba.is_yuv());
+        assert!(!PixelFormat::Rgb24.is_yuv());
+        assert!(!PixelFormat::Gray8.is_yuv());
+        assert!(!PixelFormat::None.is_yuv());
+    }
+
+    #[test]
+    fn is_rgb_true_for_rgb() {
+        assert!(PixelFormat::Rgba.is_rgb());
+        assert!(PixelFormat::Argb.is_rgb());
+        assert!(PixelFormat::Bgr24.is_rgb());
+        assert!(!PixelFormat::Yuv420P.is_rgb());
+        assert!(!PixelFormat::Nv12.is_rgb());
+        assert!(!PixelFormat::Gray8.is_rgb());
+        assert!(!PixelFormat::None.is_rgb());
+    }
+
+    #[test]
+    fn planes_counts() {
+        assert_eq!(PixelFormat::Yuv420P.planes(), 3);
+        assert_eq!(PixelFormat::Yuv420P12.planes(), 3);
+        assert_eq!(PixelFormat::Nv12.planes(), 2);
+        assert_eq!(PixelFormat::Nv21.planes(), 2);
+        assert_eq!(PixelFormat::Rgba.planes(), 1);
+        assert_eq!(PixelFormat::Rgb24.planes(), 1);
+        assert_eq!(PixelFormat::Gray8.planes(), 1);
+        assert_eq!(PixelFormat::None.planes(), 0);
+    }
+
+    #[test]
+    fn channels_counts() {
+        assert_eq!(PixelFormat::Rgba.channels(), 4);
+        assert_eq!(PixelFormat::Argb.channels(), 4);
+        assert_eq!(PixelFormat::Rgb24.channels(), 3);
+        assert_eq!(PixelFormat::Bgr24.channels(), 3);
+        assert_eq!(PixelFormat::Yuv420P.channels(), 3);
+        assert_eq!(PixelFormat::Yuv420P10.channels(), 3);
+        assert_eq!(PixelFormat::Nv12.channels(), 3);
+        assert_eq!(PixelFormat::Gray8.channels(), 1);
+        assert_eq!(PixelFormat::None.channels(), 0);
     }
 }

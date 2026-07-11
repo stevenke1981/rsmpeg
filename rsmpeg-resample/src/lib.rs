@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod channel;
 pub mod channel_mapping;
 pub mod dither;
 pub mod resampler;
