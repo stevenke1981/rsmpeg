@@ -12,7 +12,7 @@ use rsmpeg_codec::CodecId;
 use rsmpeg_format::FormatContext;
 use rsmpeg_util::MediaType;
 
-use crate::clock::MasterClock;
+use crate::clock::AudioPlaybackClock;
 use crate::command::PlayerCommand;
 use crate::event::{PlayerEvent, PlayerSnapshot};
 use crate::frame_pool::FramePool;
@@ -176,12 +176,13 @@ fn run_native_inner(
     let mut playing = true;
     let mut stop = false;
     let mut position = Duration::ZERO;
-    let mut audio_master = MasterClock::new();
-    audio_master.set_audio_master(true);
-    let mut appended_samples: u64 = 0;
+    // `rodio::Sink` has no rendered-sample counter. Keep an output-timeline
+    // clock instead of treating queued samples as already played.
+    let mut audio_clock = AudioPlaybackClock::new();
     let mut force_one_frame = false;
     let mut was_playing = true;
     let mut playback_start: Option<Instant> = None;
+    let mut playback_rate = 1.0f64;
     let mut video_frame_index = 0u64;
     let assumed_frame_dur = 1.0 / 30.0;
     // ~50 ms late-drop threshold (VideoScheduler::new default).
@@ -289,7 +290,9 @@ fn run_native_inner(
                             if !was_playing {
                                 playback_start = Some(
                                     Instant::now()
-                                        - Duration::from_secs_f64(position.as_secs_f64()),
+                                        - Duration::from_secs_f64(
+                                            position.as_secs_f64() / playback_rate,
+                                        ),
                                 );
                                 if let Some(ref s) = sink {
                                     s.play();
@@ -297,6 +300,7 @@ fn run_native_inner(
                             }
                             playing = true;
                             was_playing = true;
+                            audio_clock.resume();
                             emit(
                                 event_tx,
                                 snap(true, position, duration, volume, g, "playing"),
@@ -305,6 +309,7 @@ fn run_native_inner(
                         PlayerCommand::Pause { .. } => {
                             playing = false;
                             was_playing = false;
+                            audio_clock.pause();
                             if let Some(ref s) = sink {
                                 s.pause();
                             }
@@ -335,6 +340,7 @@ fn run_native_inner(
                                 }
                             };
                             position = Duration::from_secs_f64(capped);
+                            audio_clock.seek(position);
                             let ts_ms = (capped * 1000.0) as i64;
                             let _ = ctx.seek(ts_ms);
                             pending = ctx.read_frame().ok().flatten();
@@ -350,10 +356,16 @@ fn run_native_inner(
                                     s.play();
                                 }
                             }
-                            playback_start = Some(Instant::now() - Duration::from_secs_f64(capped));
+                            playback_start = Some(
+                                Instant::now() - Duration::from_secs_f64(capped / playback_rate),
+                            );
                             video_frame_index = 0;
                             base_video_pts = None;
-                            force_one_frame = true;
+                            // A paused seek may request one video preview, but
+                            // audio-only playback must stay paused at the
+                            // target instead of consuming its newly sought
+                            // packets before Play resumes.
+                            force_one_frame = video_si.is_some();
                             video_scheduler.reset_stats();
                             emit(
                                 event_tx,
@@ -380,15 +392,30 @@ fn run_native_inner(
                                 snap(playing, position, duration, volume, g, "volume"),
                             );
                         }
-                        other => {
+                        PlayerCommand::SetPlaybackRate {
+                            rate,
+                            generation: g,
+                        } if rate.is_finite() && (0.25..=4.0).contains(&rate) => {
+                            playback_rate = rate;
+                            audio_clock.set_rate(rate);
+                            playback_start = Some(
+                                Instant::now()
+                                    - Duration::from_secs_f64(position.as_secs_f64() / rate),
+                            );
+                            if let Some(ref s) = sink {
+                                s.set_speed(rate as f32);
+                            }
+                            emit(
+                                event_tx,
+                                snap(playing, position, duration, volume, g, "rate"),
+                            );
+                        }
+                        PlayerCommand::SetPlaybackRate { rate, generation } => {
                             emit(
                                 event_tx,
                                 PlayerEvent::Warning {
-                                    message: format!(
-                                        "command not implemented: gen={}",
-                                        other.generation()
-                                    ),
-                                    generation: other.generation(),
+                                    message: format!("unsupported playback rate: {rate}"),
+                                    generation,
                                 },
                             );
                         }
@@ -408,6 +435,23 @@ fn run_native_inner(
         if !playing && !force_one_frame {
             thread::sleep(Duration::from_millis(16));
             continue;
+        }
+
+        // A queued rodio source must never advance playback position. The
+        // output clock advances only from the first submitted source after a
+        // clear and is frozen by Pause/Seek until output resumes.
+        if video_si.is_none() && audio_clock.is_output_active() {
+            let audio_position = audio_clock.now();
+            if audio_position != position {
+                position = audio_position;
+                emit(
+                    event_tx,
+                    PlayerEvent::PositionChanged {
+                        position,
+                        generation,
+                    },
+                );
+            }
         }
 
         if let Some(ref s) = sink {
@@ -462,7 +506,7 @@ fn run_native_inner(
                                             playback_start = Some(Instant::now());
                                         }
                                         let now = playback_start
-                                            .map(|t0| t0.elapsed())
+                                            .map(|t0| t0.elapsed().mul_f64(playback_rate))
                                             .unwrap_or(Duration::ZERO);
                                         match video_scheduler.schedule(frame_pts, now) {
                                             ScheduleAction::DropLate => {
@@ -475,20 +519,6 @@ fn run_native_inner(
                                                 while rem > Duration::ZERO {
                                                     thread::sleep(rem.min(MAX_PACE_SLEEP));
                                                     rem = rem.saturating_sub(MAX_PACE_SLEEP);
-                                                    if matches!(
-                                                        cmd_rx.try_recv(),
-                                                        Ok(PlayerCommand::Stop { .. })
-                                                            | Ok(PlayerCommand::Shutdown { .. })
-                                                            | Err(TryRecvError::Disconnected)
-                                                    ) {
-                                                        stop = true;
-                                                        present = false;
-                                                        break;
-                                                    }
-                                                    if !playing && !force_one_frame {
-                                                        present = false;
-                                                        break;
-                                                    }
                                                 }
                                                 if present {
                                                     video_scheduler.mark_displayed();
@@ -564,7 +594,6 @@ fn run_native_inner(
                                 let device_rate = audio_rate.max(1);
                                 let samples = frame_to_s16_device(&f, device_rate, device_ch)
                                     .unwrap_or_default();
-                                let sample_count = samples.len();
                                 if !samples.is_empty() {
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
@@ -572,24 +601,30 @@ fn run_native_inner(
                                             device_rate,
                                             samples,
                                         ));
+
+                                        // Do not count queued samples as played. `rodio`
+                                        // cannot report its rendered sample cursor, so
+                                        // anchor once at the first source PTS and use a
+                                        // monotonic timeline until Pause or Seek.
+                                        if video_si.is_none() && !audio_clock.is_output_active() {
+                                            let frame_position = f
+                                                .pts
+                                                .map(|pts| {
+                                                    let seconds = pts as f64 * f.time_base.to_f64();
+                                                    Duration::from_secs_f64(seconds.max(0.0))
+                                                })
+                                                .unwrap_or(position);
+                                            audio_clock.start_output_at(frame_position);
+                                            position = audio_clock.now();
+                                            emit(
+                                                event_tx,
+                                                PlayerEvent::PositionChanged {
+                                                    position,
+                                                    generation,
+                                                },
+                                            );
+                                        }
                                     }
-                                }
-                                // Drive position from audio when no video.
-                                if video_si.is_none() {
-                                    if audio_master.audio_sample_rate() == 0 {
-                                        audio_master.set_audio_sample_rate(device_rate);
-                                    }
-                                    // samples is interleaved i16; frames = len / channels.
-                                    appended_samples += sample_count as u64 / device_ch as u64;
-                                    audio_master.set_audio_samples_played(appended_samples);
-                                    position = audio_master.now();
-                                    emit(
-                                        event_tx,
-                                        PlayerEvent::PositionChanged {
-                                            position,
-                                            generation,
-                                        },
-                                    );
                                 }
                             }
                             Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {

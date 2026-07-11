@@ -33,14 +33,6 @@ pub enum PlayerCommand {
         volume: f32,
         generation: u64,
     },
-    SelectAudioTrack {
-        index: usize,
-        generation: u64,
-    },
-    SelectVideoTrack {
-        index: usize,
-        generation: u64,
-    },
     SetPlaybackRate {
         rate: f64,
         generation: u64,
@@ -58,8 +50,6 @@ impl PlayerCommand {
             | Self::Stop { generation }
             | Self::Seek { generation, .. }
             | Self::SetVolume { generation, .. }
-            | Self::SelectAudioTrack { generation, .. }
-            | Self::SelectVideoTrack { generation, .. }
             | Self::SetPlaybackRate { generation, .. }
             | Self::Shutdown { generation } => *generation,
         }

@@ -36,6 +36,8 @@ pub enum PlayerError {
     NoInput,
     #[error("command queue full")]
     CommandQueueFull,
+    #[error("playback rate must be finite and between 0.25 and 4.0")]
+    InvalidPlaybackRate,
     #[error("player already shut down")]
     ShutDown,
     #[error("{0}")]
@@ -101,6 +103,7 @@ pub struct Player {
     state: PlayerState,
     generation: AtomicU64,
     volume: f32,
+    playback_rate: f64,
     position: Duration,
     duration: Duration,
     playing: bool,
@@ -124,6 +127,7 @@ impl Player {
             state: PlayerState::Opening,
             generation: AtomicU64::new(1),
             volume,
+            playback_rate: 1.0,
             position: Duration::ZERO,
             duration: Duration::ZERO,
             playing: autoplay,
@@ -163,6 +167,10 @@ impl Player {
 
     pub fn volume(&self) -> f32 {
         self.volume
+    }
+
+    pub fn playback_rate(&self) -> f64 {
+        self.playback_rate
     }
 
     pub fn is_playing(&self) -> bool {
@@ -236,6 +244,22 @@ impl Player {
             generation: g,
         })?;
         self.volume = volume;
+        Ok(())
+    }
+
+    /// Change playback speed for both audio and video. Supported rates are
+    /// deliberately bounded to keep the video scheduler and audio backend in
+    /// a range they can service reliably.
+    pub fn set_playback_rate(&mut self, rate: f64) -> Result<(), PlayerError> {
+        if !rate.is_finite() || !(0.25..=4.0).contains(&rate) {
+            return Err(PlayerError::InvalidPlaybackRate);
+        }
+        let g = self.generation();
+        self.send_command(PlayerCommand::SetPlaybackRate {
+            rate,
+            generation: g,
+        })?;
+        self.playback_rate = rate;
         Ok(())
     }
 
@@ -405,5 +429,51 @@ mod tests {
             let _ = p.pause();
         }
         assert_eq!(p.state(), PlayerState::Paused);
+    }
+
+    #[test]
+    fn rejects_invalid_playback_rate_before_enqueueing() {
+        let mut p = Player::builder()
+            .input("definitely-missing-file-xyz.mp4")
+            .autoplay(false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            p.set_playback_rate(0.0),
+            Err(PlayerError::InvalidPlaybackRate)
+        ));
+        assert_eq!(p.playback_rate(), 1.0);
+    }
+
+    #[test]
+    fn playback_rate_enqueues_validated_command() {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(1);
+        let (_event_tx, event_rx) = mpsc::sync_channel(1);
+        let mut p = Player {
+            path: PathBuf::from("test.mp4"),
+            prefer_native: true,
+            state: PlayerState::Ready,
+            generation: AtomicU64::new(7),
+            volume: 0.8,
+            playback_rate: 1.0,
+            position: Duration::ZERO,
+            duration: Duration::ZERO,
+            playing: false,
+            cmd_tx,
+            event_rx,
+            handle: None,
+            shut_down: false,
+            last_error: None,
+        };
+
+        p.set_playback_rate(1.5).unwrap();
+        assert_eq!(p.playback_rate(), 1.5);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(PlayerCommand::SetPlaybackRate {
+                rate,
+                generation: 7
+            }) if rate == 1.5
+        ));
     }
 }

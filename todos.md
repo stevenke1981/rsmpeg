@@ -7,6 +7,78 @@
 
 ---
 
+## 2026-07-12 現況檢視：合併 native pipeline 後的優先待辦
+
+> 範圍：基於 `65552b0` 的靜態檢視。下列項目優先於後方的歷史階段清單；
+> 完成時須補上相應的回歸測試，並將實測結果更新至 `test.md`。
+
+### P0 — 修正音訊主時鐘的資料來源
+
+- [x] 不得以「已 `Sink::append` 的樣本數」當作已播放樣本數；目前 native path 在
+  `rsmpeg-player/src/native_pipeline.rs` 對 `appended_samples` 累加後立即更新
+  `MasterClock`，裝置佇列累積時會讓 audio-only position 提前。
+- [x] 由音訊輸出端回報實際消耗的 frame/sample position；無法取得時以 monotonic
+  wall clock 加上已知輸出延遲估算，並明確標示為估算值。
+- [x] Seek、Pause/Resume、裝置重建與 underflow 時須重設/重錨定 clock，且不可倒退或
+  瞬間跳至已排隊音訊的尾端。
+- [x] 新增可注入 fake audio sink 的單元/整合測試：預先排入 500 ms 音訊時 position
+  仍接近實際消耗時間；pause 10 秒後恢復；underflow 後重新同步。
+
+### P0 — 命令處理不得在節流等待期間遺失
+
+- [x] 將 native path 的 pacing wait（`native_pipeline.rs`）改為集中式 command pump。
+  現在 `cmd_rx.try_recv()` 在 wait loop 中只處理 Stop/Shutdown，卻會取走並丟棄
+  Pause、Seek、SetVolume、選軌與變速命令。
+- [x] fallback path 採用相同的 command-dispatch 介面，確保任一命令在 bounded latency
+  內只處理一次，並保留 generation 語意。
+- [ ] 為 `Wait` 中送入 Pause、Seek、SetVolume、Shutdown 的情境新增回歸測試；不得靠
+  `sleep` 長時間等待，且 seek 後不得再顯示舊 generation 的 frame。
+
+### P0 — 落實或移除未實作的公開控制命令
+
+- [x] 已移除尚無安全 backend 實作的 `SelectAudioTrack`、`SelectVideoTrack` 命令，並實作
+  `Player::set_playback_rate`（0.25–4.0）及 native/fallback 音視訊速率同步；不再對選軌
+  或變速回傳模糊的 `command not implemented` warning。
+- [ ] 未來重新引入選軌時，必須驗證 index、重建受影響 decoder、清空對應 queue、遞增 generation，
+  並送出成功或具體錯誤事件。
+- [x] 變速已同步套用至視訊排程、rodio output speed 與 audio-only clock；使用者 API 對
+  非有限值及 0.25–4.0 以外的值明確回傳錯誤。
+- [ ] 新增 worker-level tests，驗證這三種命令不再只產生 warning，並覆蓋無效 track index。
+
+### P1 — 讓控制面錯誤可診斷並能安全收尾
+
+- [ ] 將 `Player::send_command` 區分 `TrySendError::Full` 與
+  `TrySendError::Disconnected`；目前 worker 已結束也會回報 `CommandQueueFull`，會誤導
+  呼叫端與 UI。
+- [ ] 建立非 UI-thread 的 shutdown reaper/owner：UI 可以非阻塞地發出 Shutdown，但應有
+  可觀測的 worker 結束結果與資源釋放確認，不能僅 detach `JoinHandle`。
+- [ ] 新增 command channel 已斷線、queue 滿載、以及 shutdown 後重複控制的測試。
+
+### P1 — 先恢復本機 workspace 測試的可編譯性
+
+- [ ] 同步 `rsmpeg-cli/tests/openh264_sequential_decode.rs`、
+  `openh264_noflush_test.rs` 與 `openh264_via_lib.rs` 對 SPS/PPS helper 的使用方式。
+  現在 helper 已回傳 `Result<Vec<u8>, H264BitstreamError>`，但這些測試仍直接對
+  `Result` 呼叫 `len`、`extend_from_slice` 與 decoder API，導致
+  `cargo test --workspace` 無法通過編譯。
+- [ ] 測試須以具體錯誤訊息處理失敗路徑（例如 `expect("valid avcC fixture")`），而非
+  不加說明地 `unwrap`；並確認 fixture 與目前 AVCC/Annex B 契約一致。
+- [ ] 修正後執行 `cargo test --workspace`，再把通過結果寫入 `test.md`；未追蹤的實驗
+  測試應先決定是否納入版本控制，避免本機與 CI 的測試集合漂移。
+
+### P1 — 將可重現媒體納入 CI 的端到端驗收
+
+- [ ] 目前播放器測試主要是純邏輯與 synthetic packet，沒有受控的真正 MP4/H.264/AAC、
+  audio-only 與 seek fixture。加入小型、授權清楚的 fixture 或在測試期產生 fixture，
+  驗證 native 與 fallback 的 open/play/seek/pause/EOF 行為。
+- [x] 將 clippy job 移除 `continue-on-error: true`，並以
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` 作為 required gate；
+  若平台依賴不適合 all-features，應拆分並記錄每個 feature matrix，而不是靜默放過。
+- [x] CI 應保留最少一個 `--no-default-features`/minimal-feature 組合，確保 optional backend
+  宣告與實際編譯條件一致。
+
+---
+
 ## 0. 執行原則
 
 - [x] 所有修改先建立獨立分支，例如 `feat/native-playback-pipeline`
@@ -593,7 +665,8 @@ pub trait Decoder: Send {
 - [ ] pause 時 clock 停止
 - [ ] resume 時 clock 連續
 - [ ] 音訊裝置不存在時切換為 wall clock
-- [x] audio-only 播放的 UI position 必須由 AudioClock 更新（MasterClock 接 native path）
+- [ ] audio-only 播放的 UI position 必須由 AudioClock 更新（MasterClock 已接 native path，
+  但目前以已排入裝置的樣本數推進，尚非實際播放位置）
 - [ ] 允許查詢 clock drift 與 underflow 次數
 
 ---

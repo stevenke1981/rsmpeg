@@ -1,5 +1,17 @@
 # rsmpeg 重構驗收摘要（第八刀 — multi-agent round 4）
 
+## 2026-07-12 — P0 playback hardening follow-up
+
+- Audio-only position 改由 `AudioPlaybackClock` 的單調時間軸估算，不再使用已排入 rodio
+  的樣本總數；Pause、Resume、Seek 與變速均維持連續語意。
+- Native 與 fallback video pacing wait 不再消耗/遺失 Pause、Seek 或 SetVolume 命令。
+- 移除尚未有安全後端實作的選音/選視訊 track 命令；新增受限於 0.25–4.0 的變速 API。
+- CI 的 clippy 改為 required，並加入 `--no-default-features` workspace check。
+
+驗收：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、
+`cargo check --workspace --no-default-features`、`cargo test --workspace` 皆通過；
+`scripts/build-release.ps1 -RunTests` 成功產出 `target/release/rsmpeg.exe`。
+
 分支：`feat/native-playback-pipeline`
 
 ## 本輪完成

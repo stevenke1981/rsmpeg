@@ -44,11 +44,6 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 PlayerEvent::Warning { message, .. } => {
                     eprintln!("  Warning: {}", message);
                 }
-                PlayerEvent::Snapshot(s) => {
-                    if s.duration > Duration::ZERO {
-                        // optional: print once
-                    }
-                }
                 _ => {}
             }
         }

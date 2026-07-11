@@ -369,6 +369,7 @@ fn run_worker(
         .filter(|s| s.is_finite() && *s > 0.0);
     let assumed_frame_dur = 1.0 / 30.0;
     let mut playback_start: Option<Instant> = None;
+    let mut playback_rate = 1.0f64;
     let mut video_scheduler = VideoScheduler::new();
     let mut base_video_pts: Option<i64> = None;
     let mut video_frame_index = 0u64;
@@ -514,7 +515,9 @@ fn run_worker(
                             if !was_playing {
                                 playback_start = Some(
                                     Instant::now()
-                                        - Duration::from_secs_f64(position.as_secs_f64()),
+                                        - Duration::from_secs_f64(
+                                            position.as_secs_f64() / playback_rate,
+                                        ),
                                 );
                                 if let Some(ref s) = sink {
                                     s.play();
@@ -596,7 +599,9 @@ fn run_worker(
                                     s.play();
                                 }
                             }
-                            playback_start = Some(Instant::now() - Duration::from_secs_f64(capped));
+                            playback_start = Some(
+                                Instant::now() - Duration::from_secs_f64(capped / playback_rate),
+                            );
                             video_scheduler.reset_stats();
                             video_frame_index = 0;
                             base_video_pts = None;
@@ -626,15 +631,29 @@ fn run_worker(
                                 snap(playing, position, duration, volume, g, "volume"),
                             );
                         }
-                        other => {
+                        PlayerCommand::SetPlaybackRate {
+                            rate,
+                            generation: g,
+                        } if rate.is_finite() && (0.25..=4.0).contains(&rate) => {
+                            playback_rate = rate;
+                            playback_start = Some(
+                                Instant::now()
+                                    - Duration::from_secs_f64(position.as_secs_f64() / rate),
+                            );
+                            if let Some(ref s) = sink {
+                                s.set_speed(rate as f32);
+                            }
+                            emit(
+                                &event_tx,
+                                snap(playing, position, duration, volume, g, "rate"),
+                            );
+                        }
+                        PlayerCommand::SetPlaybackRate { rate, generation } => {
                             emit(
                                 &event_tx,
                                 PlayerEvent::Warning {
-                                    message: format!(
-                                        "command not implemented: {:?}",
-                                        other.generation()
-                                    ),
-                                    generation: other.generation(),
+                                    message: format!("unsupported playback rate: {rate}"),
+                                    generation,
                                 },
                             );
                         }
@@ -727,7 +746,7 @@ fn run_worker(
                                             playback_start = Some(Instant::now());
                                         }
                                         if let Some(t0) = playback_start {
-                                            let now_d = t0.elapsed();
+                                            let now_d = t0.elapsed().mul_f64(playback_rate);
                                             let frame_pts =
                                                 Duration::from_secs_f64(abs_pos.max(0.0));
                                             match video_scheduler.schedule(frame_pts, now_d) {
@@ -737,22 +756,6 @@ fn run_worker(
                                                     while rem > Duration::ZERO {
                                                         thread::sleep(rem.min(MAX_PACE_SLEEP));
                                                         rem = rem.saturating_sub(MAX_PACE_SLEEP);
-                                                        if matches!(
-                                                            cmd_rx.try_recv(),
-                                                            Ok(PlayerCommand::Stop { .. })
-                                                                | Ok(
-                                                                    PlayerCommand::Shutdown { .. }
-                                                                )
-                                                                | Err(TryRecvError::Disconnected)
-                                                        ) {
-                                                            stop = true;
-                                                            present = false;
-                                                            break;
-                                                        }
-                                                        if !playing && !force_one_frame {
-                                                            present = false;
-                                                            break;
-                                                        }
                                                     }
                                                 }
                                                 ScheduleAction::Display => {

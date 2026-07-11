@@ -107,11 +107,7 @@ impl PCMAudioDecoder {
     fn packet_to_frame(&self, packet: &Packet) -> Frame {
         let bytes_per_sample = self.sample_format.bytes();
         let frame_size = bytes_per_sample * self.channels as usize;
-        let nb_samples = if frame_size > 0 {
-            packet.data.len() / frame_size
-        } else {
-            0
-        };
+        let nb_samples = packet.data.len().checked_div(frame_size).unwrap_or(0);
 
         Frame {
             data: vec![packet.data.to_vec()],

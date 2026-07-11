@@ -114,6 +114,104 @@ impl PlaybackClock {
     }
 }
 
+/// Playback position estimated from the audio output timeline.
+///
+/// `rodio::Sink` deliberately does not expose a rendered-sample counter.  In
+/// particular, the number of sources appended to a sink is *not* a playback
+/// position because those sources may still be queued.  This clock therefore
+/// anchors itself at the PTS of the first source sent to a cleared sink and
+/// advances only with monotonic wall time while that output is running.
+///
+/// The clock is intentionally independent from a decoder's cumulative sample
+/// count, which makes its pause, resume, and seek semantics deterministic and
+/// testable without an audio device.
+#[derive(Debug, Clone)]
+pub struct AudioPlaybackClock {
+    position: Duration,
+    started_at: Option<Instant>,
+    output_active: bool,
+    rate: f64,
+}
+
+impl Default for AudioPlaybackClock {
+    fn default() -> Self {
+        Self {
+            position: Duration::ZERO,
+            started_at: None,
+            output_active: false,
+            rate: 1.0,
+        }
+    }
+}
+
+impl AudioPlaybackClock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start timing when the first source after opening or seeking is handed
+    /// to the audio output. Repeated appends deliberately do not re-anchor the
+    /// clock because they are queued behind the source already playing.
+    pub fn start_output_at(&mut self, position: Duration) {
+        if self.output_active {
+            return;
+        }
+        self.position = position;
+        self.started_at = Some(Instant::now());
+        self.output_active = true;
+    }
+
+    /// Freeze the output timeline at its current position.
+    pub fn pause(&mut self) {
+        self.position = self.now();
+        self.started_at = None;
+    }
+
+    /// Resume a previously started output timeline. If no source has yet been
+    /// sent to the sink (for example immediately after seek), this remains
+    /// frozen until [`Self::start_output_at`] is called.
+    pub fn resume(&mut self) {
+        if self.output_active && self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+    }
+
+    /// Clear the output anchor and hold at `position` until a replacement
+    /// source is submitted to the sink.
+    pub fn seek(&mut self, position: Duration) {
+        self.position = position;
+        self.started_at = None;
+        self.output_active = false;
+    }
+
+    /// Change the output speed without introducing a discontinuity in the
+    /// reported media position. This must match the speed applied to the
+    /// `rodio::Sink`.
+    pub fn set_rate(&mut self, rate: f64) {
+        self.position = self.now();
+        self.started_at = self.started_at.map(|_| Instant::now());
+        self.rate = rate.max(0.01);
+    }
+
+    pub fn now(&self) -> Duration {
+        self.started_at
+            .map(|started| self.position + started.elapsed().mul_f64(self.rate))
+            .unwrap_or(self.position)
+    }
+
+    pub fn is_output_active(&self) -> bool {
+        self.output_active
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.started_at.is_some()
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+}
+
 /// Selects audio vs wall master later; currently wraps [`PlaybackClock`].
 #[derive(Debug, Clone, Default)]
 pub struct MasterClock {
@@ -377,5 +475,65 @@ mod tests {
         // After resume, audio-driven position is reported again.
         m.set_audio_samples_played(96_000);
         assert!((m.now().as_secs_f64() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_playback_clock_ignores_queued_appends() {
+        let mut c = AudioPlaybackClock::new();
+        c.start_output_at(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(15));
+        let before_queued_append = c.now();
+
+        // A second source can be queued in rodio, but it must not move the
+        // playback position ahead to that source's PTS.
+        c.start_output_at(Duration::from_secs(10));
+        let after_queued_append = c.now();
+        assert!(after_queued_append < Duration::from_secs(3));
+        assert!(after_queued_append >= before_queued_append);
+    }
+
+    #[test]
+    fn audio_playback_clock_pause_resume_and_seek() {
+        let mut c = AudioPlaybackClock::new();
+        c.start_output_at(Duration::from_secs(3));
+        thread::sleep(Duration::from_millis(10));
+        c.pause();
+        let paused = c.now();
+        thread::sleep(Duration::from_millis(15));
+        assert_eq!(c.now(), paused);
+
+        c.resume();
+        thread::sleep(Duration::from_millis(10));
+        assert!(c.now() > paused);
+
+        c.seek(Duration::from_secs(40));
+        assert_eq!(c.now(), Duration::from_secs(40));
+        assert!(!c.is_output_active());
+        c.resume();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(c.now(), Duration::from_secs(40));
+
+        c.start_output_at(Duration::from_secs(40));
+        thread::sleep(Duration::from_millis(10));
+        assert!(c.now() > Duration::from_secs(40));
+    }
+
+    #[test]
+    fn audio_playback_clock_rate_change_is_continuous() {
+        let mut c = AudioPlaybackClock::new();
+        c.start_output_at(Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(10));
+        let before = c.now();
+        c.set_rate(2.0);
+        let after = c.now();
+        assert!((after.as_secs_f64() - before.as_secs_f64()).abs() < 0.005);
+        thread::sleep(Duration::from_millis(15));
+        assert!(c.now() - after >= Duration::from_millis(25));
+
+        c.pause();
+        let paused = c.now();
+        c.set_rate(0.5);
+        assert_eq!(c.now(), paused);
+        assert_eq!(c.rate(), 0.5);
     }
 }

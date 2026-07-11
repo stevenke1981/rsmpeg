@@ -1,5 +1,19 @@
 # rsmpeg 測試紀錄
 
+## 2026-07-12 — P0 playback control and release gate
+
+| 指令 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
+| `cargo check --workspace --no-default-features` | PASS |
+| `cargo test --workspace` | PASS（本機未追蹤的 5 個需要 `target/debug/123.mp4` 的 OpenH264 手動媒體測試為 ignored） |
+| `scripts/build-release.ps1 -RunTests` | PASS，產出 `target/release/rsmpeg.exe` |
+
+本輪新增 `AudioPlaybackClock`，避免把送入 rodio 的佇列樣本誤當成已播放；pacing wait
+不再取走後丟棄控制命令；變速 API 支援 0.25–4.0，並同步音訊輸出與視訊排程。CI 現在把
+clippy 視為 required gate，且包含 minimal-feature 編譯檢查。
+
 分支：`feat/native-playback-pipeline`  
 日期：2026-07-11（第十六刀 multi-agent round 12）
 
