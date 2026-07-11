@@ -5,6 +5,7 @@ pub mod builtin;
 pub mod filter;
 pub mod filter_graph;
 pub mod grayscale;
+pub mod mirror;
 pub mod pad;
 
 pub use buffer::BufferSink;

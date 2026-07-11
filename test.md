@@ -1,7 +1,7 @@
 # rsmpeg 測試紀錄
 
 分支：`feat/native-playback-pipeline`  
-日期：2026-07-11（第十二刀 multi-agent round 8）
+日期：2026-07-11（第十三刀 multi-agent round 9）
 
 ## 指令
 
@@ -18,11 +18,11 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 | workspace tests | **PASS** |
 | rsmpeg-player | **80**（+4：sync controller 4） |
 | rsmpeg-codec | 28（+1：new_audio 單測） |
-| rsmpeg-scale | 10（+2：bgr24） |
+| rsmpeg-scale | 12（+2：rgb24） |
 | rsmpeg-util | 16（+4：pixel_format helpers） |
 | rsmpeg-resample | 20（+9：channel mix helpers） |
-| rsmpeg-format | 10 |
-| rsmpeg-filter | 7（+3：grayscale） |
+| rsmpeg-format | 14（+4：time_util） |
+| rsmpeg-filter | 10（+3：mirror） |
 | release build | **PASS** |
 | fmt --check | **PASS** |
 
@@ -51,6 +51,11 @@ cargo build --release -p rsmpeg-cli -p rsmpeg-player
 - rsmpeg-util：PixelFormat 新增 `is_yuv()`/`is_rgb()`/`channels()`（`planes()` 已存在）+ 4 單測
 - rsmpeg-codec：`new_audio` 已存在，補 `new_audio_sets_fields` 單測（+1）
 - rsmpeg-resample：新增 `channel.rs`（stereo↔mono f32/i16mix 4 助手）+ 9 單測
+
+## round 9 重點
+- rsmpeg-filter：新增 `MirrorFilter`（RGBA 水平翻轉，保留 alpha）+ 3 單測
+- rsmpeg-scale：新增 `yuv420p_frame_to_rgb24`（R,G,B 序、3 bytes/pixel，BT.601）+ 2 單測
+- rsmpeg-format：新增 `time_util.rs`（`samples_to_ms`/`ms_to_samples`/`samples_to_secs`，timescale 零安全）+ 4 單測
 
 ## 已知限制
 - ring 播放估算為近似；低/高水位、silence-on-underflow 未做
