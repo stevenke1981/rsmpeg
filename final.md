@@ -1,5 +1,33 @@
 # rsmpeg 重構驗收摘要（第八刀 — multi-agent round 4）
 
+## 2026-07-23 — AcmeUI Native GUI 與實機播放
+
+- `eframe/egui` 已從 `rsmpeg-cli` 與 lockfile 移除，GUI 改為 AcmeUI Native
+  `Application`、`WidgetNode`/Taffy、One Dark semantic theme 與 wgpu renderer。
+- AcmeUI Native 新增 backend-neutral RGBA8 image primitive、contain fit、revision cache、
+  painter-order、clip、texture-limit 與 GPU recovery CPU backing。
+- GUI 保留 `rsmpeg-player` 背景 demux/decode 邊界，8 ms 輪詢 latest frame；支援開檔、
+  拖放、播放/暫停、停止、75 ms seek preview、音量、Tab/Enter/方向鍵與 Replay。
+- 播放結束保留最後畫面；視窗支援 320x220 起的 compact responsive geometry。
+- 實際以 4 秒 640x360 H.264 baseline + AAC MP4 驗證，release binary 可完整播放並顯示
+  最後幀。產物：`target/release/rsmpeg.exe`。
+
+AcmeUI Native 已固定到公開 revision `f34a5a6`，乾淨 clone 與 CI 不再依賴本機 E 槽。
+已知限制：Acme real-GPU recovery ignored smoke 在本機曾以 access violation 結束，
+不能宣稱已通過。
+
+## 2026-07-23 — 專案檢視與控制面改善
+
+- `git pull --ff-only`：本機 `master` 已是最新。
+- 修正 GUI stroke 寬度的明確 `f32` 型別，恢復新版 Rust 的 `-D warnings` gate。
+- `Player::send_command` 現在區分 command queue 滿載與 playback worker 斷線，
+  避免把 worker 結束誤診為背壓。
+- 新增 worker 斷線回歸測試；既有 queue-full 測試持續通過。
+
+驗收：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`
+與 `cargo test --workspace --all-targets` 皆通過；`scripts/build-release.ps1 -CliOnly`
+成功產出 `target/release/rsmpeg.exe`。
+
 ## 2026-07-12 — GUI timeline preview seek
 
 - 根因：拖曳期間只更新 GUI 本地時間，放開時才 seek；seek 後重設視訊 PTS 基準，首張

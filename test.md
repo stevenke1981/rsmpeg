@@ -1,5 +1,32 @@
 # rsmpeg 測試紀錄
 
+## 2026-07-23 — AcmeUI Native 播放器遷移
+
+| 指令／驗證 | 結果 |
+|---|---|
+| `cargo test --workspace --all-targets` | PASS（GUI 10 tests；5 個外部 H.264 fixture 測試為 ignored） |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
+| `cargo test -p acme-platform` | PASS（15 tests，1 doctest ignored） |
+| `cargo build --release -p rsmpeg-cli` | PASS |
+| `rsmpeg.exe gui rsmpeg-acmeui-test.mp4` | PASS；實際完成 4 秒 H.264/AAC 播放並顯示最後 RGBA frame |
+
+Visual QA 使用 320x220、400x280、720x500 與 960x600 邏輯尺寸檢查高 DPI 行為。
+影片、時間軸與音量軌可見；窄視窗採固定 responsive geometry，避免 Taffy intrinsic
+高度把控制區推離 viewport。Computer Use 的 Windows.Graphics.Capture 在本機回報
+`SetIsBorderRequired ... 0x80004002`，因此改用專案外的 OS screenshot helper 留存畫面。
+
+## 2026-07-23 — Rust 相容性與播放器控制面診斷
+
+| 指令 | 結果 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
+| `cargo test --workspace --all-targets` | PASS（5 個外部 H.264 fixture 測試為 ignored） |
+| `scripts/build-release.ps1 -CliOnly` | PASS，產出 `target/release/rsmpeg.exe` |
+
+修正新版 Rust 對 GUI `f32` literal fallback 的警告，並新增 command channel 斷線回歸測試。
+`Player::send_command` 現在會分別回報 queue full 與 worker disconnected。
+
 ## 2026-07-12 — GUI timeline seek preview
 
 | 指令 | 結果 |

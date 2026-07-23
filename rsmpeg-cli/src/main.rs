@@ -52,7 +52,7 @@ enum Commands {
     ListFormats,
     /// List registered codecs
     ListCodecs,
-    /// Launch the egui graphical media player
+    /// Launch the AcmeUI Native graphical media player
     Gui {
         /// Optional media file to open on startup
         input: Option<String>,
@@ -334,7 +334,7 @@ fn cmd_play(input: &str, info_only: bool) {
     }
 }
 
-/// Launch the egui GUI player.
+/// Launch the AcmeUI Native GUI player.
 fn cmd_gui(input: Option<&str>) {
     match gui::run_gui(input) {
         Ok(()) => {}

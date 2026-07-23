@@ -1,5 +1,14 @@
 # rsmpeg 改善開發待辦清單
 
+## 2026-07-23 AcmeUI Native GUI
+
+- [x] 移除 `eframe/egui`，以 AcmeUI Native `Application` + wgpu Scene 取代。
+- [x] 新增 RGBA8 video primitive、contain aspect fit、bounded live cache 與 GPU recovery backing。
+- [x] 接回 Player event polling、播放控制、seek preview、拖放與鍵盤 focus。
+- [x] 以真實 H.264/AAC MP4 驗證 release GUI 能顯示並完成播放。
+- [x] 將 AcmeUI Native 固定到公開 git revision `f34a5a6`，移除本機絕對 path dependency。
+- [ ] 補 offscreen real-GPU pixel readback 與 recovery 測試。
+
 > 專案：`stevenke1981/rsmpeg`  
 > 目標：讓播放、解碼、重採樣與縮放功能真正走 `rsmpeg` 自己的  
 > `demux → decode → resample/scale → sync → output` 管線。  
@@ -67,12 +76,13 @@
 
 ### P1 — 讓控制面錯誤可診斷並能安全收尾
 
-- [ ] 將 `Player::send_command` 區分 `TrySendError::Full` 與
+- [x] 將 `Player::send_command` 區分 `TrySendError::Full` 與
   `TrySendError::Disconnected`；目前 worker 已結束也會回報 `CommandQueueFull`，會誤導
   呼叫端與 UI。
 - [ ] 建立非 UI-thread 的 shutdown reaper/owner：UI 可以非阻塞地發出 Shutdown，但應有
   可觀測的 worker 結束結果與資源釋放確認，不能僅 detach `JoinHandle`。
 - [ ] 新增 command channel 已斷線、queue 滿載、以及 shutdown 後重複控制的測試。
+  已覆蓋前兩者；shutdown 後重複控制仍待補。
 
 ### P1 — 先恢復本機 workspace 測試的可編譯性
 

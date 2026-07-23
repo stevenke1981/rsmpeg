@@ -36,6 +36,8 @@ pub enum PlayerError {
     NoInput,
     #[error("command queue full")]
     CommandQueueFull,
+    #[error("playback worker disconnected")]
+    CommandChannelDisconnected,
     #[error("playback rate must be finite and between 0.25 and 4.0")]
     InvalidPlaybackRate,
     #[error("player already shut down")]
@@ -190,9 +192,10 @@ impl Player {
         if self.shut_down {
             return Err(PlayerError::ShutDown);
         }
-        self.cmd_tx
-            .try_send(cmd)
-            .map_err(|_| PlayerError::CommandQueueFull)
+        self.cmd_tx.try_send(cmd).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => PlayerError::CommandQueueFull,
+            mpsc::TrySendError::Disconnected(_) => PlayerError::CommandChannelDisconnected,
+        })
     }
 
     pub fn play(&mut self) -> Result<(), PlayerError> {
@@ -519,6 +522,34 @@ mod tests {
         ));
         assert_eq!(p.generation(), 7);
         assert!(matches!(cmd_rx.try_recv(), Ok(PlayerCommand::Pause { .. })));
+    }
+
+    #[test]
+    fn send_command_reports_disconnected_worker() {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(1);
+        drop(cmd_rx);
+        let (_event_tx, event_rx) = mpsc::sync_channel(1);
+        let p = Player {
+            path: PathBuf::from("test.mp4"),
+            prefer_native: true,
+            state: PlayerState::Ready,
+            generation: AtomicU64::new(7),
+            volume: 0.8,
+            playback_rate: 1.0,
+            position: Duration::ZERO,
+            duration: Duration::ZERO,
+            playing: false,
+            cmd_tx,
+            event_rx,
+            handle: None,
+            shut_down: false,
+            last_error: None,
+        };
+
+        assert!(matches!(
+            p.send_command(PlayerCommand::Play { generation: 7 }),
+            Err(PlayerError::CommandChannelDisconnected)
+        ));
     }
 
     #[test]
