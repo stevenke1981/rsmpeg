@@ -610,23 +610,58 @@ impl Scaler {
         // Resample first, convert second: the planes stay 8-bit so the same
         // kernel code that drives the planar paths is reused verbatim.
         let y_out = resample_plane(y_plane, y_stride, src_w, src_h, dst_w, dst_h, method);
-        let u_out = resample_plane(u_plane, u_stride, src_cw, src_ch, dst_cw, dst_ch, method);
-        let v_out = resample_plane(v_plane, v_stride, src_cw, src_ch, dst_cw, dst_ch, method);
+        // Nearest chroma is *not* taken from a resampled chroma grid: chroma is
+        // subsampled, so its own grid is half-width and usually a different size
+        // than the luma one. Resampling chroma onto `dst_cw × dst_ch` and then
+        // doubling the index moved the chroma boundary by one luma pixel on
+        // non-integer upscales (4×2 → 6×2 split blue as `000011` instead of the
+        // historical `000111`). Nearest therefore keeps the original mapping —
+        // source luma position → source chroma index — and reads the source
+        // planes directly; only the interpolating kernels use resampled chroma.
+        let nearest = matches!(method, InterpolationMethod::NearestNeighbor);
+        let u_out = if nearest {
+            Vec::new()
+        } else {
+            resample_plane(u_plane, u_stride, src_cw, src_ch, dst_cw, dst_ch, method)
+        };
+        let v_out = if nearest {
+            Vec::new()
+        } else {
+            resample_plane(v_plane, v_stride, src_cw, src_ch, dst_cw, dst_ch, method)
+        };
 
         let limited = self.color.src_range == ColorRange::Limited;
         let out_stride = dst_w * bytes_per_pixel;
         let mut out = vec![0u8; out_stride * dst_h];
         let last_cx = dst_cw.saturating_sub(1);
         let last_cy = dst_ch.saturating_sub(1);
+        let last_sx = src_w.saturating_sub(1);
+        let last_sy = src_h.saturating_sub(1);
+        let last_scx = src_cw.saturating_sub(1);
+        let last_scy = src_ch.saturating_sub(1);
 
         for dy in 0..dst_h {
-            // One chroma sample covers `chroma_step` luma rows and 2 columns.
-            let cy = if chroma_step > 1 { dy / 2 } else { dy }.min(last_cy);
             for dx in 0..dst_w {
-                let cx = (dx / 2).min(last_cx);
                 let y = y_out[dy * dst_w + dx];
-                let u = u_out[cy * dst_cw + cx];
-                let v = v_out[cy * dst_cw + cx];
+                let (u, v) = if nearest {
+                    // Historical mapping: `floor(d*s/t)` onto the luma grid, then
+                    // `/2` onto the corresponding chroma sample.
+                    let sy = ((dy as u64 * src_h as u64 / dst_h as u64) as usize).min(last_sy);
+                    let sx = ((dx as u64 * src_w as u64 / dst_w as u64) as usize).min(last_sx);
+                    let cy = if chroma_step > 1 { sy / 2 } else { sy }.min(last_scy);
+                    let cx = (sx / 2).min(last_scx);
+                    (
+                        u_plane[cy * u_stride + cx],
+                        v_plane[cy * v_stride + cx],
+                    )
+                } else {
+                    // One chroma sample covers `chroma_step` luma rows and 2 columns
+                    // of the *resampled* destination, so the index follows the
+                    // destination chroma grid.
+                    let cy = if chroma_step > 1 { dy / 2 } else { dy }.min(last_cy);
+                    let cx = (dx / 2).min(last_cx);
+                    (u_out[cy * dst_cw + cx], v_out[cy * dst_cw + cx])
+                };
 
                 let (r, g, b) = yuv_to_rgb_bt601(y, u, v, limited);
                 let off = dy * out_stride + dx * bytes_per_pixel;
@@ -3016,11 +3051,26 @@ mod review_sixth {
             .collect()
     }
 
+    fn blue_row(frame: &Frame) -> Vec<u8> {
+        frame.data[0][..frame.width * 4]
+            .chunks_exact(4)
+            .map(|p| p[2])
+            .collect()
+    }
+
     fn black_white_rgb24() -> Frame {
         let mut frame = Frame::new_video(2, 2, PixelFormat::Rgb24);
         frame.data = vec![vec![0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]];
         frame.linesize = vec![6];
         frame
+    }
+
+    fn blue_neutral_yuv420p() -> Frame {
+        // Luma 100, chroma U 16 (blue) / V 128 (neutral): blue on the left half.
+        let mut color = Frame::new_video(4, 2, PixelFormat::Yuv420P);
+        color.data = vec![vec![100; 8], vec![16, 240], vec![128, 128]];
+        color.linesize = vec![4, 2, 2];
+        color
     }
 
     #[test]
@@ -3124,6 +3174,73 @@ mod review_sixth {
                         "{sw}x{sh}->{dw}x{dh} at ({dx},{dy})"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn yuv420p_packed_nearest_preserves_legacy_chroma_mapping() {
+        // Sixth review P1-2: 4×2 blue/neutral Yuv420P widened to 6×2. The
+        // fifth-round change sampled chroma on the *destination* chroma grid
+        // (3 wide) and doubled the index, which moved the chroma boundary one
+        // luma pixel right: `0,0,0,0,255,255` instead of `0,0,0,255,255,255`.
+        // Nearest must map source luma position → source chroma index.
+        let color = blue_neutral_yuv420p();
+
+        // Reference: convert at the source size, then take the legacy nearest
+        // neighbour of that image.
+        let source = scaled_rgba(&color, InterpolationMethod::NearestNeighbor, 4);
+        let legacy: Vec<u8> = (0..6)
+            .flat_map(|dx| {
+                let sx = dx * 4 / 6;
+                source.data[0][sx * 4..sx * 4 + 4].iter().copied()
+            })
+            .collect();
+
+        let actual = scaled_rgba(&color, InterpolationMethod::NearestNeighbor, 6);
+        assert_eq!(
+            &actual.data[0][..24],
+            &legacy[..],
+            "nearest chroma must match the source-luma → source-chroma mapping"
+        );
+        assert_eq!(
+            blue_row(&actual),
+            vec![0, 0, 0, 255, 255, 255],
+            "the blue boundary must stay on luma column 3"
+        );
+        // Bilinear still uses the resampled chroma grid, so it is not a copy of
+        // the nearest result.
+        let bilinear = scaled_rgba(&color, InterpolationMethod::Bilinear, 6);
+        assert_ne!(blue_row(&bilinear), blue_row(&actual));
+    }
+
+    #[test]
+    fn yuv420p_nearest_chroma_mapping_holds_across_odd_scales() {
+        // Sweep non-integer upscales where the destination chroma grid and the
+        // source chroma grid disagree — exactly the cases that regressed.
+        for dw in [5u32, 6, 7, 9, 11] {
+            for dh in [2u32, 3, 5] {
+                let color = blue_neutral_yuv420p();
+                let source = scaled_rgba(&color, InterpolationMethod::NearestNeighbor, 4);
+                let legacy: Vec<u8> = {
+                    let mut v = Vec::with_capacity((dw * dh) as usize * 4);
+                    for dy in 0..dh {
+                        let sy = (dy * 2 / dh) as usize;
+                        for dx in 0..dw {
+                            let sx = (dx * 4 / dw) as usize;
+                            let o = (sy * 4 + sx) * 4;
+                            v.extend_from_slice(&source.data[0][o..o + 4]);
+                        }
+                    }
+                    v
+                };
+                let cfg = ScalerConfig::new(4, 2, PixelFormat::Yuv420P, dw, dh, PixelFormat::Rgba)
+                    .with_interpolation(InterpolationMethod::NearestNeighbor);
+                let actual = Scaler::new(cfg).unwrap().scale(&color).unwrap();
+                assert_eq!(
+                    actual.data[0], legacy,
+                    "4x2 -> {dw}x{dh} nearest must keep the historical chroma mapping"
+                );
             }
         }
     }
