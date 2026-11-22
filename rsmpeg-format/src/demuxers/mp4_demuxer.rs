@@ -36,6 +36,9 @@ struct TrackState {
 struct TrackTables {
     timescale: u32,
     duration: u64,
+    /// Length of the enclosing file, used to bound sample ranges. `0` means
+    /// "unknown" (buffer-backed inputs of unknown size).
+    file_size: u64,
     media_type: MediaType,
     codec_id: CodecId,
     width: u16,
@@ -58,6 +61,7 @@ impl Default for TrackTables {
         Self {
             timescale: 0,
             duration: 0,
+            file_size: 0,
             media_type: MediaType::Data,
             codec_id: CodecId::Unknown,
             width: 0,
@@ -165,8 +169,15 @@ impl InputFormat for MP4Demuxer {
             return Ok(());
         }
 
+        // Sample ranges are validated against the real file length.
+        for tables in &mut track_builds {
+            tables.file_size = file_end;
+        }
+
         let mut max_duration_ms: i64 = 0;
-        for (idx, tables) in track_builds.into_iter().enumerate() {
+        let track_total = track_builds.len();
+        let mut skipped_invalid_time_base = 0usize;
+        for (trak_idx, tables) in track_builds.into_iter().enumerate() {
             let samples = build_sample_index(&tables);
             if samples.is_empty()
                 && tables.media_type != MediaType::Data
@@ -174,24 +185,25 @@ impl InputFormat for MP4Demuxer {
             {
                 tracing::warn!(
                     "MP4: track {} has no samples (fragmented or incomplete stbl)",
-                    idx
+                    trak_idx
                 );
             }
 
-            let timescale = tables.timescale.max(1);
-            // `tb = 1/timescale` must be representable as an `i32` pair. The
-            // previous fallback to 1/1 silently re-interpreted every DTS/PTS in
-            // seconds instead of ticks, so refuse the track rather than publish
-            // metadata we cannot honour.
-            let Some(time_base) = timescale_den(timescale) else {
+            // `tb = 1/timescale` must be representable as an `i32` pair, and a
+            // missing (`mdhd` timescale 0) or out-of-range value is not. The
+            // previous `max(1)` turned 0 into 1/1, re-interpreting every
+            // DTS/PTS in seconds: refuse the track instead.
+            let Some(time_base) = timescale_den(tables.timescale) else {
                 tracing::error!(
                     "MP4: track {} has timescale {} which cannot be represented as a \
                      time base; skipping the track",
-                    idx,
+                    trak_idx,
                     tables.timescale
                 );
+                skipped_invalid_time_base += 1;
                 continue;
             };
+            let timescale = time_base as u32;
             let duration_tb = if tables.duration > 0 {
                 tables.duration as i64
             } else {
@@ -203,7 +215,14 @@ impl InputFormat for MP4Demuxer {
             let duration_ms = (duration_tb as i128 * 1000 / timescale as i128) as i64;
             max_duration_ms = max_duration_ms.max(duration_ms);
 
-            let mut stream = Stream::new(idx, tables.codec_id);
+            // The stream index must match the position in `ctx.streams`: the
+            // player picks a stream by index (`find_best_stream`) and routes
+            // packets by `packet.stream_index`. Keeping the original `trak`
+            // ordinal after dropping a track left both readers pointing at the
+            // wrong slot (and at a stream that no longer exists).
+            let index = ctx.streams.len();
+
+            let mut stream = Stream::new(index, tables.codec_id);
             stream.media_type = tables.media_type;
             stream.codec_params.codec_id = tables.codec_id;
             stream.codec_params.media_type = tables.media_type;
@@ -226,11 +245,25 @@ impl InputFormat for MP4Demuxer {
             ctx.streams.push(stream);
 
             self.tracks.push(TrackState {
-                stream_index: idx,
+                stream_index: index,
                 timescale,
                 samples,
                 next_sample: 0,
             });
+        }
+
+        // Every track was rejected for its time base: report the failure instead
+        // of returning success with an empty stream list (which looks like an
+        // intentionally empty file to the caller).
+        if ctx.streams.is_empty() && skipped_invalid_time_base > 0 && skipped_invalid_time_base == track_total
+        {
+            return Err(RsError::InvalidData(
+                format!(
+                    "MP4: all {track_total} track(s) have a timescale that cannot be \
+                     represented as a time base"
+                )
+                .into(),
+            ));
         }
 
         ctx.duration = max_duration_ms;
@@ -472,6 +505,26 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
             off = off.saturating_add(sizes.get(sample_i).copied().unwrap_or(0) as u64);
             sample_i += 1;
         }
+    }
+
+    // A chunk that starts at byte 0 (or whose samples run past the end of the
+    // file) cannot be read as media: byte 0 is the `ftyp`/`moov` header, and
+    // reading it produced packets that looked structurally fine. Dropping just
+    // the offending entries is not enough — the sample/duration tables are
+    // indexed by ordinal, so removing the middle of a chunk shifts every later
+    // sample's DTS/size onto the wrong bytes. Treat the whole track as
+    // unaddressable instead.
+    let valid_chunks = offsets.iter().zip(&sizes).take(offsets.len()).all(|(&off, &size)| {
+        off != 0
+            && (t.file_size == 0 || (off as u128 + size as u128) <= t.file_size as u128)
+    });
+    if !valid_chunks {
+        tracing::warn!(
+            "MP4: sample/chunk table is inconsistent (chunk offset 0 or payload past \
+             end of file); dropping {} locatable samples of this track",
+            offsets.len()
+        );
+        offsets.clear();
     }
 
     // Any sample without a chunk of its own cannot be located. Padding it with
@@ -1288,7 +1341,7 @@ mod tests {
             ctts: vec![(1, 40), (1, 0)],
             stsc: vec![(1, 2, 1)],
             stsz: vec![1, 1],
-            stco: vec![0],
+            stco: vec![2048],
             stss: vec![],
             ..Default::default()
         };
@@ -1501,7 +1554,7 @@ mod tests {
             stts: vec![(4, 10)],
             stsc: vec![(1, 4, 1)],
             stsz: vec![3, 3],
-            stco: vec![0],
+            stco: vec![2048],
             stss: vec![99],
             ..Default::default()
         };
@@ -1571,12 +1624,237 @@ mod tests {
             format_name: Some("mp4".into()),
         };
         let mut demuxer = MP4Demuxer::default();
-        demuxer.read_header(&mut ctx).unwrap();
+        // All tracks rejected ⇒ report an error instead of a successful empty
+        // stream list (which reads like a legitimately empty file).
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("every track has an unusable timescale");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
         assert!(
             ctx.streams.is_empty(),
             "a track whose timescale cannot form a time base must not be published: {:?}",
             ctx.streams.iter().map(|s| s.time_base).collect::<Vec<_>>()
         );
-        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
+    }
+
+    // ── Regression tests mirroring the independent boundary probe ─────────
+
+    /// Build a one- or two-track MP4 with the given `mdhd` timescale and chunk
+    /// offset, mirroring the reviewer's fixture generator.
+    fn build_probe_mp4(tracks: &[(u32, usize, usize, u64)]) -> Vec<u8> {
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\0\0isom");
+        let media: [&[u8]; 2] = [b"AAA", b"BBBB"];
+        let mdat = box_bytes(b"mdat", b"AAABBBB");
+        let first_payload = (ftyp.len() + 8) as u64;
+
+        let mut moov_payload = Vec::new();
+        for &(timescale, sample_count, per_chunk, offset) in tracks {
+            let sizes: Vec<u32> = media[..sample_count].iter().map(|m| m.len() as u32).collect();
+
+            let mut audio_entry = vec![0u8; 28];
+            audio_entry[16..18].copy_from_slice(&be16(2)); // channel count
+            audio_entry[18..20].copy_from_slice(&be16(16)); // sample size
+            audio_entry[24..28].copy_from_slice(&be32(48_000 << 16));
+            let mut stsd_rest = be32(1).to_vec();
+            stsd_rest.extend_from_slice(&box_bytes(b"mp4a", &audio_entry));
+            let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+            let mut stts_rest = be32(1).to_vec();
+            stts_rest.extend_from_slice(&be32(sample_count as u32));
+            stts_rest.extend_from_slice(&be32(1000));
+            let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+            let mut stsc_rest = be32(1).to_vec();
+            stsc_rest.extend_from_slice(&be32(1));
+            stsc_rest.extend_from_slice(&be32(per_chunk as u32));
+            stsc_rest.extend_from_slice(&be32(1));
+            let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+            let mut stsz_rest = be32(0).to_vec();
+            stsz_rest.extend_from_slice(&be32(sample_count as u32));
+            for size in &sizes {
+                stsz_rest.extend_from_slice(&be32(*size));
+            }
+            let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+            let actual_offset = offset.max(first_payload);
+            let actual_offset = if offset == u64::MAX { offset } else { actual_offset };
+            let mut stco_rest = be32(1).to_vec();
+            stco_rest.extend_from_slice(&be32(actual_offset as u32));
+            let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+            let mut mdhd_rest = be32(0).to_vec();
+            mdhd_rest.extend_from_slice(&be32(0));
+            mdhd_rest.extend_from_slice(&be32(timescale));
+            mdhd_rest.extend_from_slice(&be32(1000 * sample_count as u32));
+            mdhd_rest.extend_from_slice(&be16(0x55c4));
+            mdhd_rest.extend_from_slice(&be16(0));
+            let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_rest));
+
+            let mut hdlr_rest = be32(0).to_vec();
+            hdlr_rest.extend_from_slice(b"soun");
+            hdlr_rest.extend_from_slice(&[0u8; 13]);
+            let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_rest));
+
+            let stbl = box_bytes(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+            let minf = box_bytes(b"minf", &stbl);
+            let mdia = box_bytes(b"mdia", &[mdhd, hdlr, minf].concat());
+            moov_payload.extend_from_slice(&box_bytes(b"trak", &mdia));
+        }
+
+        let moov = box_bytes(b"moov", &moov_payload);
+        [ftyp, mdat, moov].concat()
+    }
+
+    fn ctx_from(data: Vec<u8>) -> FormatContext {
+        FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        }
+    }
+
+    fn read_all(demuxer: &mut MP4Demuxer, ctx: &mut FormatContext) -> Vec<Packet> {
+        let mut out = Vec::new();
+        while let Some(p) = demuxer.read_frame(ctx).unwrap() {
+            out.push(p);
+            assert!(out.len() < 10, "unexpected packet count");
+        }
+        out
+    }
+
+    #[test]
+    fn probe_control_two_samples_read_back_verbatim() {
+        let mut ctx = ctx_from(build_probe_mp4(&[(1000, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].data.as_ref(), b"AAA");
+        assert_eq!(packets[0].stream_index, 0);
+        assert_eq!(packets[1].data.as_ref(), b"BBBB");
+        assert_eq!(packets[1].dts, Some(1000));
+    }
+
+    #[test]
+    fn probe_locatable_prefix_kept_without_fake_tail() {
+        // stsc maps only one sample per chunk while stsz/stts describe two: the
+        // locatable prefix is kept, and no invented tail packet appears.
+        let mut ctx = ctx_from(build_probe_mp4(&[(1000, 2, 1, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert_eq!(packets.len(), 1, "got {:?}", packets.len());
+        assert_eq!(packets[0].data.as_ref(), b"AAA");
+        assert_eq!(packets[0].dts, Some(0));
+    }
+
+    #[test]
+    fn probe_surviving_track_packets_match_the_selected_stream() {
+        // Review P1: dropping track 0 left the surviving track's Stream and
+        // Packet indices at 1, while the player selects position 0.
+        // Track 1 starts at the second payload ("BBBB").
+        let second_payload = (box_bytes(b"ftyp", b"isom    isom").len() + 8 + 3) as u64;
+        let data = build_probe_mp4(&[(0x8000_0000, 1, 1, 0), (1000, 2, 1, second_payload)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        assert_eq!(ctx.streams.len(), 1);
+        assert_eq!(
+            ctx.streams[0].index, 0,
+            "the surviving stream must be renumbered to its position"
+        );
+        let selected = ctx
+            .find_best_stream(MediaType::Audio)
+            .expect("one audio stream survives");
+        assert_eq!(selected, 0);
+
+        let packets = read_all(&mut demuxer, &mut ctx);
+        // Only one chunk is declared, so one sample is locatable; what matters
+        // is that it is routed to the stream the player actually selected.
+        assert_eq!(packets.len(), 1, "got {packets:?}");
+        assert_eq!(
+            packets[0].stream_index, selected,
+            "packet.stream_index must match the selected stream"
+        );
+        assert_eq!(&packets[0].data[..], b"BBB");
+        assert!(packets.iter().all(|p| p.stream_index == selected));
+    }
+
+    #[test]
+    fn probe_zero_timescale_is_an_error_not_seconds() {
+        // mdhd timescale 0 must not be coerced to 1/1 (which read ticks as seconds).
+        let mut ctx = ctx_from(build_probe_mp4(&[(0, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("timescale 0 cannot form a time base");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert!(ctx.streams.is_empty());
+    }
+
+    #[test]
+    fn probe_all_tracks_invalid_reports_error() {
+        let mut ctx = ctx_from(build_probe_mp4(&[(0x8000_0000, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("no usable track remains");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert_eq!(ctx.streams.len(), 0);
+    }
+
+    #[test]
+    fn probe_zero_chunk_offset_never_reads_the_header() {
+        // A chunk starting at byte 0 would hand back `\x14 f t y p`. Without a
+        // file-size bound the accumulated sizes gave later samples a nonzero
+        // offset, so a single-sample check is not enough — the whole track must
+        // be dropped.
+        let data = build_probe_mp4(&[(1000, 2, 2, u64::MAX)]); // u64::MAX ⇒ patched to 0 below
+        let mut data = data;
+        // Locate the first `stco` entry and force it to 0.
+        let pos = data.windows(4).position(|w| w == b"stco").expect("stco box");
+        // stco payload: version/flags(4) + entry_count(4) + first offset(4)
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(0));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "no packet may be produced from a chunk at offset 0: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn probe_track_payload_past_eof_is_dropped() {
+        // A chunk offset inside the file but whose payload runs past EOF must
+        // not be read either.
+        let mut data = build_probe_mp4(&[(1000, 2, 2, 0)]);
+        let pos = data.windows(4).position(|w| w == b"stco").expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        // Point the chunk at the last byte of the file: 7 bytes cannot fit.
+        let last = (data.len() - 1) as u32;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(last));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert!(packets.is_empty(), "samples past EOF must be dropped");
     }
 }
