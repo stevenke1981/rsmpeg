@@ -90,6 +90,13 @@ impl InputFormat for WAVDemuxer {
         let bytes_per_sample = (bits_per_sample / 8) as u64;
         let frame_size = bytes_per_sample * channels as u64;
 
+        // Exact frame (sample-per-channel) count from the `data` chunk. This is
+        // the authoritative length: the stream's time base is 1/sample_rate, so
+        // `duration` must be this number of ticks. Deriving ticks from a
+        // millisecond figure first truncated anything shorter than 1 ms to zero
+        // (41 samples at 48 kHz → 0 ms → 0 ticks → "0.000 s").
+        let total_frames = data_size.checked_div(frame_size).unwrap_or(0);
+
         let duration_ms = if sample_rate > 0 && frame_size > 0 {
             // `data_size * 1000` can overflow u64 for multi-exabyte claims; use a
             // widening multiply and clamp into the i64 the API exposes.
@@ -163,8 +170,10 @@ impl InputFormat for WAVDemuxer {
         };
         stream.time_base = rsmpeg_util::Rational::new(1, time_base_den);
         // `Stream::duration` is in `time_base` ticks, not milliseconds: storing
-        // ms here made a 80 ms file report 0.01 s (4 ticks × 1/44100).
-        stream.set_duration_ms(duration_ms);
+        // ms here made a 80 ms file report 0.01 s (4 ticks × 1/44100). The tick
+        // count comes straight from the sample count (1 tick = 1 frame) so
+        // sub-millisecond files keep their real length instead of rounding to 0.
+        stream.duration = total_frames.min(i64::MAX as u64) as i64;
         ctx.duration = duration_ms;
         ctx.bit_rate = bit_rate;
         ctx.streams.push(stream);
@@ -418,6 +427,62 @@ mod tests {
         assert_eq!(stream.duration, 44_100, "44 100 ticks at 1/44100");
         assert!((stream.duration_seconds() - 1.0).abs() < 1e-9);
         assert_eq!(ctx.duration, 1_000);
+    }
+
+    #[test]
+    fn review_sub_millisecond_wav_keeps_its_sample_count_as_ticks() {
+        // Fifth review P2, the reviewer's `fractional_ms.wav`: 41 samples at
+        // 48 kHz mono 16-bit is ~0.854 ms. Deriving the tick count from a
+        // millisecond figure rounded it to `0 ms → 0 ticks → 0.000 s`, so a
+        // legal file claimed to have no duration at all. The stream time base is
+        // 1/48000, so the tick count must be the real sample count.
+        let nb = 41u32;
+        let data = build_wav(nb, 48_000, 1, 16);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        let stream = &ctx.streams[0];
+        assert_eq!(
+            stream.duration, 41,
+            "stream ticks must be the real sample count, not a quantised ms value"
+        );
+        let seconds = stream.duration_seconds();
+        assert!(
+            (seconds - 41.0 / 48_000.0).abs() < 1e-12,
+            "0.854 ms must be reported exactly, got {seconds}"
+        );
+        // The container-level field stays in whole milliseconds by definition.
+        assert_eq!(ctx.duration, 0, "container duration is milliseconds");
+    }
+
+    #[test]
+    fn review_wav_ticks_are_not_derived_from_rounded_milliseconds() {
+        // Sweep lengths around the 1 ms boundary: a tick count derived from a
+        // rounded millisecond value collapses to 0 for every length below one
+        // millisecond, and drifts above it. Each of these must be exact.
+        for rate in [8_000u32, 44_100, 48_000, 96_000] {
+            for frames in [1u32, 2, 41, 43, 44, 47, 48, 95, 96, 479] {
+                let data = build_wav(frames, rate, 1, 16);
+                let mut ctx = ctx_with(data);
+                let mut demuxer = WAVDemuxer::default();
+                demuxer
+                    .read_header(&mut ctx)
+                    .unwrap_or_else(|e| panic!("{frames} frames @ {rate} Hz: {e}"));
+                let stream = &ctx.streams[0];
+                assert_eq!(
+                    stream.duration,
+                    i64::from(frames),
+                    "{frames} frames @ {rate} Hz must be {frames} ticks"
+                );
+                let expected = f64::from(frames) / f64::from(rate);
+                assert!(
+                    (stream.duration_seconds() - expected).abs() < 1e-12,
+                    "{frames} frames @ {rate} Hz: {} != {expected}",
+                    stream.duration_seconds()
+                );
+            }
+        }
     }
 
     #[test]
