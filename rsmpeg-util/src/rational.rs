@@ -145,7 +145,22 @@ fn best_approximation(num: Wide, den: Wide) -> Option<Rational> {
     // The optimum is one of the two neighbours of the target on the bounded
     // grid: the last fitting convergent, or the maximal semiconvergent between
     // it and the first one that overflowed.
-    let k = (max - q0) / q1.max(1);
+    //
+    // `k` is bounded by *both* components: `q0 + k*q1 <= max` and
+    // `p0 + k*p1 <= max`. Checking only the denominator lost valid candidates
+    // whenever the numerator bound bit first — which is the normal case for
+    // values around and above 1. For `(50001/50000)^2` ≈ 1.0000400004 the
+    // denominator allowed `k = 21474` while the numerator allowed only
+    // `k = 21473`; the resulting semiconvergent overshot the box, so the search
+    // fell back to the plain convergent `100003/99999` even though
+    // `2147389420/2147303527` is representable and closer.
+    let k_den = (max - q0) / q1.max(1);
+    let k_num = if p1 > 0 {
+        (max - p0) / p1
+    } else {
+        k_den
+    };
+    let k = k_den.min(k_num);
     if k > 0 {
         let (p, q) = (p0 + k * p1, q0 + k * q1);
         consider(p, q);
@@ -159,6 +174,13 @@ fn best_approximation(num: Wide, den: Wide) -> Option<Rational> {
     // expansion overflows immediately, and only `round(2^31/1) = i32::MAX` at
     // denominator 1 is within one unit of the target.
     for q in [1, q1, q0.max(1), max, max - 1] {
+        consider(round_div(num * q, den).min(max), q);
+    }
+    // The denominator that exactly spends the numerator budget is another
+    // boundary candidate: it is what the semiconvergent would use if the
+    // numerator, not the denominator, were the last constraint to be reached.
+    if k_num > 0 && k_num < k_den {
+        let q = q0 + k_num * q1;
         consider(round_div(num * q, den).min(max), q);
     }
 
@@ -1064,6 +1086,99 @@ mod review_fifth {
                 "{r:?} escapes the representable box"
             );
             assert_ne!(r, Rational::new(0, 1), "{num}/{den} collapsed to zero");
+        }
+    }
+}
+
+/// Sixth review round: the numerator-bound neighbour of the fifth-round fix.
+#[cfg(test)]
+mod review_sixth {
+    use super::*;
+
+    /// `|p*den - num*q|`, i.e. the value error times the constant `den`.
+    fn scaled_error(num: Wide, den: Wide, r: Rational) -> Wide {
+        (num * r.den as Wide - den * r.num as Wide).abs()
+    }
+
+    #[test]
+    fn rational_numerator_bound_neighbor_is_not_lost() {
+        // Sixth review P2: `(50001/50000)^2` ≈ 1.0000400004 returned
+        // `100003/99999` while `2147389420/2147303527` is representable and
+        // closer. The semiconvergent multiplier `k` was bounded only by the
+        // remaining *denominator* budget (`k = 21474`), but the numerator budget
+        // allows only `k = 21473`; with the larger `k` the candidate fell outside
+        // the representable box and the search dropped back to the plain
+        // convergent altogether.
+        let exact_num: Wide = 50_001 * 50_001;
+        let exact_den: Wide = 50_000 * 50_000;
+        let got = approximate_wide(exact_num, exact_den).unwrap();
+        let witness = Rational::new(2_147_389_420, 2_147_303_527);
+        assert_eq!(
+            got, witness,
+            "the numerator-bound semiconvergent is the documented nearest value"
+        );
+        assert!(
+            scaled_error(exact_num, exact_den, got) * (witness.den as Wide)
+                <= scaled_error(exact_num, exact_den, witness) * (got.den as Wide),
+            "{got:?} must be at least as close as {witness:?}"
+        );
+        // The operator path agrees with the raw approximation.
+        let operand = Rational::new(50_001, 50_000);
+        assert_eq!(operand.mul(operand), witness);
+    }
+
+    #[test]
+    fn numerator_bound_semiconvergent_is_the_true_minimum() {
+        // Same contract checked the hard way for the neighbouring value on both
+        // sides of 1: no representable `p/q` may be closer than the result. The
+        // box is sampled exhaustively over the numerators that the bound
+        // actually limits, which is where the old code lost candidates.
+        let max = i32::MAX as Wide;
+        for (num, den) in [
+            (50_001 as Wide * 50_001, 50_000 * 50_000),
+            (50_000 * 50_000, 50_001 * 50_001),
+            (100_003, 100_001),
+            (99_999, 100_003),
+        ] {
+            let got = approximate_wide(num, den).unwrap();
+            let got_error = scaled_error(num, den, got);
+            // Dense sweep of denominators around the boundary the result uses.
+            let base = got.den as Wide;
+            let mut qs: Vec<Wide> = (1..=300).collect();
+            qs.extend([base - 2, base - 1, base, base + 1, max - 1, max]);
+            qs.extend((base.saturating_sub(64)..=base + 64).filter(|q| *q >= 1));
+            for q in qs {
+                for p in [round_div(num * q, den) - 1, round_div(num * q, den), round_div(num * q, den) + 1] {
+                    if p < 0 || p > max || q < 1 || q > max {
+                        continue;
+                    }
+                    let rival_error = scaled_error(num, den, Rational { num: p as i32, den: q as i32 });
+                    assert!(
+                        rival_error * (got.den as Wide) >= got_error * q,
+                        "{num}/{den}: {p}/{q} (err {rival_error}) is closer than the \
+                         chosen {got:?} (err {got_error})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numerator_bound_candidates_never_escape_the_box() {
+        // The semiconvergent must stay inside *both* bounds now that `k` honours
+        // the numerator: an out-of-box candidate silently discarded was the bug.
+        let max = i32::MAX as Wide;
+        for (num, den) in [
+            (50_001 as Wide * 50_001, 50_000 * 50_000),
+            (50_000 * 50_000, 50_001 * 50_001),
+            (max, 1),
+            (max + 1, 1),
+            (max * 2, max),
+            (1, max),
+        ] {
+            let r = approximate_wide(num, den).expect("non-zero denominator");
+            assert!(r.num >= 0 && (r.num as Wide) <= max, "{num}/{den} -> {r:?}");
+            assert!(r.den >= 1 && (r.den as Wide) <= max, "{num}/{den} -> {r:?}");
         }
     }
 }
