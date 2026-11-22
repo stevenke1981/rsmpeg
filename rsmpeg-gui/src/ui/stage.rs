@@ -421,22 +421,48 @@ fn render_error_stage(
                 )
                 .child(
                     div()
-                        .id("error-open-btn")
                         .mt_2()
-                        .px_5()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(theme::bg_elevated())
-                        .hover(|s| s.bg(theme::bg_hover()))
-                        .border_1()
-                        .border_color(theme::border_strong())
-                        .text_sm()
-                        .text_color(theme::text_primary())
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_file_dialog(window, cx);
-                        }))
-                        .child(strings.open_file_btn),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("error-open-btn")
+                                .px_5()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(theme::bg_elevated())
+                                .hover(|s| s.bg(theme::bg_hover()))
+                                .border_1()
+                                .border_color(theme::border_strong())
+                                .text_sm()
+                                .text_color(theme::text_primary())
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_file_dialog(window, cx);
+                                }))
+                                .child(strings.open_file_btn),
+                        )
+                        .when(state.playlist.has_next(), |el| {
+                            el.child(
+                                div()
+                                    .id("error-next-btn")
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(theme::accent())
+                                    .hover(|s| s.bg(theme::accent_hover()))
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::accent_text_on_fill())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.play_next(window, cx);
+                                    }))
+                                    .child(format!("{} ⏭", strings.next_track)),
+                            )
+                        }),
                 ),
         )
         .into_any_element()

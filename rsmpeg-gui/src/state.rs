@@ -65,6 +65,7 @@ pub struct PlaybackUiState {
     pub current_rms: f32,
     pub current_peak: f32,
     pub has_video_frame: bool,
+    pub video_unsupported: bool,
     pub video_resolution: Option<(usize, usize)>,
     pub error_message: Option<String>,
     pub warning_message: Option<String>,
@@ -97,6 +98,7 @@ impl PlaybackUiState {
             current_rms: 0.0,
             current_peak: 0.0,
             has_video_frame: false,
+            video_unsupported: false,
             video_resolution: None,
             error_message: None,
             warning_message: None,
@@ -116,6 +118,7 @@ impl PlaybackUiState {
         self.scrubbing = false;
         self.scrub_fraction = 0.0;
         self.has_video_frame = false;
+        self.video_unsupported = false;
         self.video_resolution = None;
         self.error_message = None;
         self.warning_message = None;
@@ -281,9 +284,11 @@ impl PlaybackUiState {
         if self.has_video_frame {
             return false;
         }
-        self.media_info
-            .as_ref()
-            .is_some_and(MediaInfo::is_audio_only)
+        self.video_unsupported
+            || self
+                .media_info
+                .as_ref()
+                .is_some_and(MediaInfo::is_audio_only)
     }
 
     /// Apply a [`PlayerEvent`] emitted by `rsmpeg-player`.
@@ -351,15 +356,20 @@ impl PlaybackUiState {
             }
             PlayerEvent::Error { message, .. } => {
                 self.status = PlaybackStatus::Error;
-                self.error_message = Some(message.clone());
+                self.error_message = Some(localize_player_error(message));
                 EventOutcome::None
             }
             PlayerEvent::Warning { message, .. } => {
+                if message.contains("Unsupported video codec")
+                    || message.contains("failed to open OpenH264")
+                {
+                    self.video_unsupported = true;
+                }
                 // Keep internal pipeline info warnings quiet; surface codec/decoder issues.
                 if !message.starts_with("using native demux")
                     && !message.starts_with("native pipeline unavailable")
                 {
-                    self.warning_message = Some(message.clone());
+                    self.warning_message = Some(localize_player_warning(message));
                 }
                 EventOutcome::None
             }
@@ -398,6 +408,66 @@ pub fn compute_aspect_fit(src_w: f32, src_h: f32, dst_w: f32, dst_h: f32) -> (f3
     }
     let scale = (dst_w / src_w).min(dst_h / src_h);
     (src_w * scale, src_h * scale)
+}
+
+/// Convert raw engine errors into clear Traditional Chinese messages while preserving technical detail.
+pub fn localize_player_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("no such file")
+        || lower.contains("cannot find the file")
+        || lower.contains("not found")
+        || lower.contains("os error 2")
+    {
+        format!("找不到指定的媒體檔案（{raw}）")
+    } else if lower.contains("unsupported")
+        || lower.contains("no playable")
+        || lower.contains("no tracks")
+    {
+        format!("不支援此媒體格式或無可播放串流（{raw}）")
+    } else if lower.contains("eof")
+        || lower.contains("corrupt")
+        || lower.contains("invalid")
+        || lower.contains("malformed")
+    {
+        format!("檔案格式無效或已損毀（{raw}）")
+    } else {
+        format!("播放失敗：{raw}")
+    }
+}
+
+/// Format non-fatal engine warnings into user-friendly Traditional Chinese text.
+pub fn localize_player_warning(raw: &str) -> String {
+    if raw.contains("Unsupported video codec") {
+        format!("視訊編碼不受支援，已改以純音訊模式播放（{raw}）")
+    } else if raw.contains("audio muted") {
+        format!("音訊解碼器不可用，將以靜音模式播放（{raw}）")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Expand dropped paths (files + 1-level directories of supported media) off the UI thread.
+pub fn expand_dropped_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    use crate::playlist::is_supported_media_extension;
+
+    let mut result = Vec::new();
+    for path in paths {
+        if path.is_file() {
+            result.push(path);
+        } else if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                let mut child_media: Vec<std::path::PathBuf> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && is_supported_media_extension(p))
+                    .collect();
+                child_media.sort();
+                result.extend(child_media);
+            }
+        }
+    }
+    result.sort_by_key(|p| !is_supported_media_extension(p));
+    result
 }
 
 #[cfg(test)]
@@ -538,7 +608,60 @@ mod tests {
             generation: 1,
         });
         assert_eq!(st.status, PlaybackStatus::Error);
-        assert_eq!(st.error_message.as_deref(), Some("unsupported codec"));
+        assert!(
+            st.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("unsupported codec") && m.contains("不支援")),
+            "got {:?}",
+            st.error_message
+        );
+    }
+
+    #[test]
+    fn unsupported_video_warning_switches_stage_to_audio_only() {
+        let mut st = PlaybackUiState::new();
+        assert!(!st.is_audio_only_stage());
+
+        st.apply_player_event(&PlayerEvent::Warning {
+            message: "Unsupported video codec 'hevc' — audio only".into(),
+            generation: 1,
+        });
+        assert!(st.video_unsupported);
+        assert!(st.is_audio_only_stage());
+        assert!(st
+            .warning_message
+            .as_deref()
+            .is_some_and(|m| m.contains("純音訊模式")));
+    }
+
+    #[test]
+    fn localize_player_error_categorizes_common_failures() {
+        assert!(localize_player_error("os error 2: not found").contains("找不到"));
+        assert!(localize_player_error("No playable audio tracks").contains("不支援"));
+        assert!(localize_player_error("unexpected EOF in header").contains("損毀"));
+        assert!(localize_player_error("custom failure").contains("播放失敗"));
+    }
+
+    #[test]
+    fn expand_dropped_paths_scans_directory_and_prioritizes_media() {
+        let dir = std::env::temp_dir().join("rsmpeg_gui_drop_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a_txt = dir.join("notes.txt");
+        let b_wav = dir.join("clip.wav");
+        let c_mp4 = dir.join("demo.mp4");
+        std::fs::write(&a_txt, b"text").unwrap();
+        std::fs::write(&b_wav, b"wav").unwrap();
+        std::fs::write(&c_mp4, b"mp4").unwrap();
+
+        // Direct drop of txt + directory containing wav & mp4 -> media files sorted first.
+        let expanded = expand_dropped_paths(vec![a_txt.clone(), dir.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[0], b_wav);
+        assert_eq!(expanded[1], c_mp4);
+        assert_eq!(expanded[2], a_txt);
     }
 
     #[test]

@@ -20,10 +20,11 @@ use rsmpeg_player::{Player, PlayerEvent};
 
 use crate::i18n::{strings, Locale, UiStrings};
 use crate::media_info::probe_file;
-use crate::playlist::{is_supported_media_extension, RemoveOutcome, MEDIA_EXTENSIONS};
+use crate::playlist::{RemoveOutcome, MEDIA_EXTENSIONS};
 use crate::shortcuts::{map_key_to_action, KeyInput, ShortcutAction, SEEK_STEP_SECS, VOLUME_STEP};
 use crate::state::{
-    fraction_from_pointer, EventOutcome, PlaybackStatus, PlaybackUiState, SidePanel,
+    expand_dropped_paths, fraction_from_pointer, EventOutcome, PlaybackStatus, PlaybackUiState,
+    SidePanel,
 };
 use crate::video::build_render_image;
 
@@ -367,6 +368,7 @@ impl PlayerView {
         self.state.position = Duration::ZERO;
         self.state.duration = Duration::ZERO;
         self.state.has_video_frame = false;
+        self.state.video_unsupported = false;
         self.state.video_resolution = None;
         self.state.media_info = None;
         self.state.error_message = None;
@@ -457,25 +459,28 @@ impl PlayerView {
         }));
     }
 
-    /// Handle OS drag-and-drop onto the window.
+    /// Handle OS drag-and-drop onto the window (file scanning runs off the UI thread).
     pub(crate) fn handle_external_drop(
         &mut self,
         external: &ExternalPaths,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut paths: Vec<PathBuf> = external
-            .paths()
-            .iter()
-            .filter(|p| p.is_file())
-            .cloned()
-            .collect();
-        if paths.is_empty() {
+        let raw_paths = external.paths().to_vec();
+        if raw_paths.is_empty() {
             return;
         }
-        // Place recognized media files ahead of unrecognized dropped files.
-        paths.sort_by_key(|p| !is_supported_media_extension(p));
-        self.enqueue_and_play(paths, true, window, cx);
+        self.dialog_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let expanded = cx
+                .background_executor()
+                .spawn(async move { expand_dropped_paths(raw_paths) })
+                .await;
+            if !expanded.is_empty() {
+                let _ = this.update_in(cx, |view, window, cx| {
+                    view.enqueue_and_play(expanded, true, window, cx);
+                });
+            }
+        }));
     }
 
     /// Add one or more paths to the playlist; optionally start playing the first added track.
@@ -683,6 +688,14 @@ impl PlayerView {
             .unwrap_or_else(|| s.no_file_loaded.to_string());
 
         let resolution_chip = self.state.video_resolution.map(|(w, h)| format!("{w}×{h}"));
+        let playlist_pos_chip = if self.state.playlist.len() > 1 {
+            self.state
+                .playlist
+                .current_index()
+                .map(|i| format!("{} / {}", i + 1, self.state.playlist.len()))
+        } else {
+            None
+        };
 
         div()
             .flex()
@@ -734,6 +747,20 @@ impl PlayerView {
                                 .text_xs()
                                 .text_color(theme::text_secondary())
                                 .child(res),
+                        )
+                    })
+                    .when_some(playlist_pos_chip, |el, pos| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(theme::bg_elevated())
+                                .font_family(theme::MONO_FONT_FAMILY)
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(pos),
                         )
                     }),
             )
