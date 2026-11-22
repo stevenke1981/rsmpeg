@@ -165,16 +165,21 @@ mod tests {
 
     #[test]
     fn test_global_registry() {
-        let registry = global_codec_registry();
-        // Other tests in this binary may call `register_builtin_codecs()`
-        // first (the registry is process-global), so only assert that the lock
-        // is usable and that the reported length is self-consistent.
-        let len = registry
+        // Hold a single read guard: other tests in this binary may call
+        // `register_builtin_codecs()` at any time (the registry is
+        // process-global), so taking two guards and comparing could observe
+        // two different states.
+        let guard = global_codec_registry()
             .read()
-            .expect("codec registry lock")
-            .list()
-            .len();
-        assert_eq!(len == 0, { let r = registry.read().unwrap(); r.is_empty() });
+            .expect("codec registry lock");
+        // Both views must agree inside one guard snapshot.
+        let listed = guard.list().len();
+        assert_eq!(listed, guard.len(), "list() and len() must agree");
+        assert_eq!(
+            guard.is_empty(),
+            listed == 0,
+            "is_empty() must agree with the entry count"
+        );
     }
 
     #[test]

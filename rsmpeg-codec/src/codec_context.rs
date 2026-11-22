@@ -29,12 +29,24 @@ impl CodecContext {
         CodecContextBuilder::new()
     }
 
-    /// Open the codec context — finds the codec in the registry and creates
-    /// a decoder or encoder instance.
+    /// Open the codec context — finds the codec in the registry and creates a
+    /// decoder or encoder instance.
     ///
-    /// Re-opening an already-open context replaces the previous codec
-    /// instance, which drops the old decoder/encoder (and any buffered frames
-    /// or packets it owned) before the new one is created.
+    /// # Re-opening
+    ///
+    /// The new backend is created **first**; only after that succeeds is the old
+    /// one replaced. In other words the order is *create → replace → drop*, never
+    /// *drop → create*:
+    ///
+    /// - If creation fails, this method returns the error and the context is left
+    ///   untouched — the previously opened backend is still installed and usable,
+    ///   and [`is_open`](Self::is_open) still reports `true`.
+    /// - If creation succeeds, the old backend is dropped at that point (releasing
+    ///   whatever buffers it owned) and the new one takes its place.
+    ///
+    /// This is why a failed re-open never leaves the context half-open. Call
+    /// [`close`](Self::close) first if you need the old backend released
+    /// regardless of whether opening the replacement works.
     pub fn open(&mut self) -> RsResult<()> {
         let registry = global_codec_registry()
             .read()
