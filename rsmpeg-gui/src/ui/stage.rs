@@ -34,7 +34,6 @@ pub fn render_stage(
     };
 
     div()
-        .relative()
         .flex()
         .flex_col()
         .flex_1()
@@ -42,12 +41,11 @@ pub fn render_stage(
         .min_h_0()
         .bg(theme::bg_canvas())
         .overflow_hidden()
-        .child(body)
         .when(
             state.error_message.is_some() && current_frame.is_some(),
             |el| {
                 let msg = state.error_message.clone().unwrap_or_default();
-                el.child(render_floating_banner(
+                el.child(render_inline_banner(
                     strings.error_title,
                     msg,
                     true,
@@ -57,7 +55,7 @@ pub fn render_stage(
             },
         )
         .when_some(state.warning_message.clone(), |el, msg| {
-            el.child(render_floating_banner(
+            el.child(render_inline_banner(
                 strings.warning_title,
                 msg,
                 false,
@@ -65,6 +63,15 @@ pub fn render_stage(
                 cx,
             ))
         })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(body),
+        )
         .into_any_element()
 }
 
@@ -460,7 +467,7 @@ fn render_error_stage(
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.play_next(window, cx);
                                     }))
-                                    .child(format!("{} ⏭", strings.next_track)),
+                                    .child(format!("{} ▶|", strings.next_track)),
                             )
                         }),
                 ),
@@ -468,7 +475,7 @@ fn render_error_stage(
         .into_any_element()
 }
 
-fn render_floating_banner(
+fn render_inline_banner(
     title: &'static str,
     message: String,
     is_error: bool,
@@ -486,20 +493,16 @@ fn render_floating_banner(
     };
 
     div()
-        .absolute()
-        .top_3()
-        .left_3()
-        .right_3()
         .flex()
+        .flex_none()
         .flex_row()
         .items_center()
         .justify_between()
         .gap_3()
-        .px_3()
+        .px_4()
         .py_2()
-        .rounded_lg()
         .bg(bg)
-        .border_1()
+        .border_b_1()
         .border_color(border)
         .child(
             div()

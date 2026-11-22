@@ -188,7 +188,7 @@ fn render_transport_buttons(
                         }))
                 })
                 .when(!has_prev, |el| el.text_color(theme::text_muted()))
-                .child(format!("⏮ {}", strings.prev_track)),
+                .child(format!("|◀ {}", strings.prev_track)),
         )
         .child(
             div()
@@ -207,7 +207,7 @@ fn render_transport_buttons(
                     this.toggle_play_pause(window, cx);
                 }))
                 .child(if is_playing {
-                    format!("⏸ {}", strings.pause)
+                    format!("❚❚ {}", strings.pause)
                 } else {
                     format!("▶ {}", strings.play)
                 }),
@@ -232,7 +232,7 @@ fn render_transport_buttons(
                         }))
                 })
                 .when(!has_media, |el| el.text_color(theme::text_muted()))
-                .child(format!("⏹ {}", strings.stop)),
+                .child(format!("■ {}", strings.stop)),
         )
         .child(
             div()
@@ -254,7 +254,7 @@ fn render_transport_buttons(
                         }))
                 })
                 .when(!has_next, |el| el.text_color(theme::text_muted()))
-                .child(format!("{} ⏭", strings.next_track)),
+                .child(format!("{} ▶|", strings.next_track)),
         )
         .into_any_element()
 }
@@ -267,12 +267,10 @@ fn render_right_controls(
 ) -> AnyElement {
     let eff_vol = state.effective_volume();
     let vol_pct = format_volume_percent(eff_vol);
-    let mute_icon = if state.muted || eff_vol <= 0.001 {
-        "🔇"
-    } else if eff_vol < 0.5 {
-        "🔉"
+    let mute_label = if state.muted || eff_vol <= 0.001 {
+        format!("× {}", strings.unmute)
     } else {
-        "🔊"
+        format!("♪ {}", strings.mute)
     };
     let rate_text = format_rate(state.playback_rate);
     let fs_label = if state.is_fullscreen {
@@ -308,14 +306,7 @@ fn render_right_controls(
                     this.focus_root(window);
                     this.toggle_mute(cx);
                 }))
-                .child(format!(
-                    "{mute_icon} {}",
-                    if state.muted {
-                        strings.unmute
-                    } else {
-                        strings.mute
-                    }
-                )),
+                .child(mute_label),
         )
         .child(
             // Draggable volume slider

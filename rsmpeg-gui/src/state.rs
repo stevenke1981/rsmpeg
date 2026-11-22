@@ -425,6 +425,7 @@ pub fn localize_player_error(raw: &str) -> String {
     {
         format!("不支援此媒體格式或無可播放串流（{raw}）")
     } else if lower.contains("eof")
+        || lower.contains("end of stream")
         || lower.contains("corrupt")
         || lower.contains("invalid")
         || lower.contains("malformed")
@@ -439,6 +440,8 @@ pub fn localize_player_error(raw: &str) -> String {
 pub fn localize_player_warning(raw: &str) -> String {
     if raw.contains("Unsupported video codec") {
         format!("視訊編碼不受支援，已改以純音訊模式播放（{raw}）")
+    } else if raw.contains("failed to open Symphonia audio decoder") {
+        format!("音訊解碼初始化失敗，目前僅播放視訊（{raw}）")
     } else if raw.contains("audio muted") {
         format!("音訊解碼器不可用，將以靜音模式播放（{raw}）")
     } else {
@@ -639,6 +642,7 @@ mod tests {
         assert!(localize_player_error("os error 2: not found").contains("找不到"));
         assert!(localize_player_error("No playable audio tracks").contains("不支援"));
         assert!(localize_player_error("unexpected EOF in header").contains("損毀"));
+        assert!(localize_player_error("end of stream").contains("損毀"));
         assert!(localize_player_error("custom failure").contains("播放失敗"));
     }
 
