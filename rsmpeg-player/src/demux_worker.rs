@@ -624,6 +624,7 @@ fn run_worker(
     );
 
     let mut deferred_cmd: Option<PlayerCommand> = None;
+    let mut eof_draining = false;
 
     loop {
         // ── Drain commands ──
@@ -734,6 +735,7 @@ fn run_worker(
                             video_scheduler.reset_stats();
                             video_frame_index = 0;
                             force_one_frame = true;
+                            eof_draining = false;
                             emit(
                                 &event_tx,
                                 PlayerEvent::SeekCompleted {
@@ -809,6 +811,17 @@ fn run_worker(
                                 audio_target_samples = 0;
                                 audio_play_start = None;
                                 audio_played_base = 0;
+                                if eof_draining {
+                                    let cur_secs = position.as_secs_f64().max(0.0);
+                                    let _ = format.seek(
+                                        SeekMode::Coarse,
+                                        SeekTo::Time {
+                                            time: Time::from(cur_secs),
+                                            track_id: seek_track_id,
+                                        },
+                                    );
+                                    eof_draining = false;
+                                }
                                 if let Some(ref s) = sink {
                                     s.clear();
                                     s.set_volume(volume);
@@ -937,6 +950,7 @@ fn run_worker(
                                 clock_started = true;
                                 video_scheduler.reset_stats();
                                 force_one_frame = true;
+                                eof_draining = false;
                                 emit(
                                     &event_tx,
                                     PlayerEvent::Tracks {
@@ -979,6 +993,15 @@ fn run_worker(
             continue;
         }
 
+        if eof_draining {
+            let sink_empty = sink.as_ref().map_or(true, |s| s.empty());
+            if sink_empty {
+                break;
+            }
+            thread::sleep(Duration::from_millis(12));
+            continue;
+        }
+
         if let Some(ref s) = sink {
             // Sample-based throttle (approximate, rodio backstop below is authoritative).
             if let Some(t0) = audio_play_start {
@@ -1002,9 +1025,69 @@ fn run_worker(
 
         let packet = match format.next_packet() {
             Ok(p) => p,
-            Err(Error::ResetRequired) => break,
-            Err(Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(_) => break,
+            Err(Error::ResetRequired) | Err(_) => {
+                // EOS: send_packet(None) + drain remaining frames, then drain sink inside main loop.
+                if let Some(ref mut dec) = video_dec {
+                    if dec.send_packet(None).is_ok() {
+                        loop {
+                            match dec.receive_frame() {
+                                Ok(DecodeStatus::Frame(f)) => {
+                                    if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
+                                        let w = f.width;
+                                        let h = f.height;
+                                        if w > 0 && h > 0 {
+                                            emit(
+                                                &event_tx,
+                                                PlayerEvent::VideoFrame {
+                                                    width: w,
+                                                    height: h,
+                                                    rgba: std::sync::Arc::new(rgba),
+                                                    pts: position,
+                                                    generation,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                if let Some(ref mut dec) = audio_dec {
+                    let _ = dec.send_packet(None);
+                    loop {
+                        match dec.receive_frame() {
+                            Ok(DecodeStatus::Frame(f)) => {
+                                let samples = frame_to_s16_device(
+                                    &f,
+                                    audio_rate.max(1),
+                                    audio_channels.max(1),
+                                )
+                                .unwrap_or_default();
+                                if !samples.is_empty() {
+                                    if let Some(ref s) = sink {
+                                        s.append(rodio::buffer::SamplesBuffer::new(
+                                            f.channels.max(1),
+                                            f.sample_rate.max(1),
+                                            samples,
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                eof_draining = true;
+                continue;
+            }
         };
         let tid = packet.track_id();
 
@@ -1296,127 +1379,7 @@ fn run_worker(
     }
 
     if !stop {
-        // EOS: send_packet(None) + drain remaining frames (same as native_pipeline).
-        if let Some(ref mut dec) = video_dec {
-            if dec.send_packet(None).is_ok() {
-                loop {
-                    match dec.receive_frame() {
-                        Ok(DecodeStatus::Frame(f)) => {
-                            if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
-                                let w = f.width;
-                                let h = f.height;
-                                if w > 0 && h > 0 {
-                                    emit(
-                                        &event_tx,
-                                        PlayerEvent::VideoFrame {
-                                            width: w,
-                                            height: h,
-                                            rgba: std::sync::Arc::new(rgba),
-                                            pts: position,
-                                            generation,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => break,
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        if let Some(ref mut dec) = audio_dec {
-            let _ = dec.send_packet(None);
-            loop {
-                match dec.receive_frame() {
-                    Ok(DecodeStatus::Frame(f)) => {
-                        let samples =
-                            frame_to_s16_device(&f, audio_rate.max(1), audio_channels.max(1))
-                                .unwrap_or_default();
-                        if !samples.is_empty() {
-                            if let Some(ref s) = sink {
-                                s.append(rodio::buffer::SamplesBuffer::new(
-                                    f.channels.max(1),
-                                    f.sample_rate.max(1),
-                                    samples,
-                                ));
-                            }
-                        }
-                    }
-                    Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => break,
-                    Err(_) => break,
-                }
-            }
-        }
-        if let Some(ref s) = sink {
-            while !s.empty() && !stop {
-                match cmd_rx.try_recv() {
-                    Ok(PlayerCommand::Stop { .. })
-                    | Ok(PlayerCommand::Shutdown { .. })
-                    | Err(TryRecvError::Disconnected) => {
-                        stop = true;
-                        s.pause();
-                        s.clear();
-                        break;
-                    }
-                    Ok(PlayerCommand::Pause { generation: g }) => {
-                        playing = false;
-                        playback_clock.pause();
-                        s.pause();
-                        emit(
-                            &event_tx,
-                            snap(false, position, duration, volume, g, "paused"),
-                        );
-                    }
-                    Ok(PlayerCommand::Play { generation: g }) => {
-                        playing = true;
-                        playback_clock.resume();
-                        s.play();
-                        emit(
-                            &event_tx,
-                            snap(true, position, duration, volume, g, "playing"),
-                        );
-                    }
-                    Ok(PlayerCommand::SetVolume {
-                        volume: v,
-                        generation: g,
-                    }) => {
-                        volume = v.clamp(0.0, 1.0);
-                        s.set_volume(volume);
-                        emit(
-                            &event_tx,
-                            snap(playing, position, duration, volume, g, "volume"),
-                        );
-                    }
-                    Ok(PlayerCommand::SetPlaybackRate {
-                        rate,
-                        generation: g,
-                    }) => {
-                        playback_rate = if rate.is_finite() {
-                            rate.clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
-                        } else {
-                            1.0
-                        };
-                        playback_clock.set_rate(playback_rate);
-                        s.set_speed(playback_rate as f32);
-                        emit(
-                            &event_tx,
-                            snap(playing, position, duration, volume, g, "rate"),
-                        );
-                    }
-                    Ok(_) | Err(TryRecvError::Empty) => {}
-                }
-                thread::sleep(Duration::from_millis(12));
-            }
-        }
-        if !stop {
-            emit(&event_tx, PlayerEvent::Ended { generation });
-        } else {
-            emit(
-                &event_tx,
-                snap(false, position, duration, volume, generation, "stopped"),
-            );
-        }
+        emit(&event_tx, PlayerEvent::Ended { generation });
     } else {
         emit(
             &event_tx,

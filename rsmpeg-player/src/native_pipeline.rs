@@ -367,6 +367,7 @@ fn run_native_inner(
     });
     let mut base_video_pts: Option<i64> = None;
     let mut deferred_cmd: Option<PlayerCommand> = None;
+    let mut eof_draining = false;
 
     loop {
         // ── Commands ──
@@ -463,6 +464,7 @@ fn run_native_inner(
                                 MasterClock::duration_to_audio_samples(position, audio_rate);
                             video_frame_index = 0;
                             force_one_frame = true;
+                            eof_draining = false;
                             video_scheduler.reset_stats();
                             emit(
                                 event_tx,
@@ -531,6 +533,12 @@ fn run_native_inner(
                                 audio_dec = dec;
                                 audio_channels = ch;
                                 audio_rate = rate;
+                                if eof_draining {
+                                    let ts_ms = (position.as_secs_f64().max(0.0) * 1000.0) as i64;
+                                    let _ = ctx.seek(ts_ms);
+                                    pending = ctx.read_frame().ok().flatten();
+                                    eof_draining = false;
+                                }
                                 audio_master.set_audio_sample_rate(audio_rate);
                                 appended_samples =
                                     MasterClock::duration_to_audio_samples(position, audio_rate);
@@ -604,6 +612,7 @@ fn run_native_inner(
                                 clock_started = true;
                                 video_scheduler.reset_stats();
                                 force_one_frame = true;
+                                eof_draining = false;
                                 emit(
                                     event_tx,
                                     PlayerEvent::Tracks {
@@ -635,6 +644,30 @@ fn run_native_inner(
 
         if !playing && !force_one_frame {
             thread::sleep(Duration::from_millis(16));
+            continue;
+        }
+
+        if eof_draining {
+            let sink_empty = sink.as_ref().map_or(true, |s| s.empty());
+            if sink_empty {
+                break;
+            }
+            if video_si.is_none() && playing && clock_started {
+                let now = playback_clock.now();
+                position = if duration > Duration::ZERO {
+                    now.min(duration)
+                } else {
+                    now
+                };
+                emit(
+                    event_tx,
+                    PlayerEvent::PositionChanged {
+                        position,
+                        generation,
+                    },
+                );
+            }
+            thread::sleep(Duration::from_millis(12));
             continue;
         }
 
@@ -672,8 +705,65 @@ fn run_native_inner(
             Some(p) => p,
             None => match ctx.read_frame() {
                 Ok(Some(p)) => p,
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) | Err(_) => {
+                    // Flush video decoder: send_packet(None) + drain remaining frames.
+                    if let Some(ref mut dec) = video_dec {
+                        if dec.send_packet(None).is_ok() {
+                            loop {
+                                match dec.receive_frame() {
+                                    Ok(DecodeStatus::Frame(f)) => {
+                                        if let Ok(converted) = yuv420p_frame_to_rgba_cached(&f) {
+                                            let w = f.width;
+                                            let h = f.height;
+                                            if w > 0 && h > 0 {
+                                                emit(
+                                                    event_tx,
+                                                    PlayerEvent::VideoFrame {
+                                                        width: w,
+                                                        height: h,
+                                                        rgba: Arc::new(converted),
+                                                        pts: position,
+                                                        generation,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(DecodeStatus::NeedMoreInput)
+                                    | Ok(DecodeStatus::EndOfStream) => break,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    // Soft-flush audio decoder (append tail to sink, then drain inside main loop).
+                    if let Some(ref mut dec) = audio_dec {
+                        let _ = dec.send_packet(None);
+                        loop {
+                            match dec.receive_frame() {
+                                Ok(DecodeStatus::Frame(f)) => {
+                                    let ch = f.channels.max(1);
+                                    let rate = f.sample_rate.max(1);
+                                    let samples =
+                                        frame_to_s16_device(&f, rate, ch).unwrap_or_default();
+                                    if !samples.is_empty() {
+                                        if let Some(ref s) = sink {
+                                            s.append(rodio::buffer::SamplesBuffer::new(
+                                                ch, rate, samples,
+                                            ));
+                                        }
+                                    }
+                                }
+                                Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    eof_draining = true;
+                    continue;
+                }
             },
         };
         let si = packet.stream_index;
@@ -888,139 +978,7 @@ fn run_native_inner(
     }
 
     if !stop {
-        // Flush video decoder: send_packet(None) + drain remaining frames.
-        if let Some(ref mut dec) = video_dec {
-            if dec.send_packet(None).is_ok() {
-                loop {
-                    match dec.receive_frame() {
-                        Ok(DecodeStatus::Frame(f)) => {
-                            if let Ok(converted) = yuv420p_frame_to_rgba_cached(&f) {
-                                let w = f.width;
-                                let h = f.height;
-                                if w > 0 && h > 0 {
-                                    emit(
-                                        event_tx,
-                                        PlayerEvent::VideoFrame {
-                                            width: w,
-                                            height: h,
-                                            rgba: Arc::new(converted),
-                                            pts: position,
-                                            generation,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => break,
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        // Soft-flush audio decoder (no presentation frames beyond sink queue).
-        if let Some(ref mut dec) = audio_dec {
-            let _ = dec.send_packet(None);
-            loop {
-                match dec.receive_frame() {
-                    Ok(DecodeStatus::Frame(f)) => {
-                        let ch = f.channels.max(1);
-                        let rate = f.sample_rate.max(1);
-                        let samples = frame_to_s16_device(&f, rate, ch).unwrap_or_default();
-                        if !samples.is_empty() {
-                            if let Some(ref s) = sink {
-                                s.append(rodio::buffer::SamplesBuffer::new(ch, rate, samples));
-                            }
-                        }
-                    }
-                    Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => break,
-                    Err(_) => break,
-                }
-            }
-        }
-        if let Some(ref s) = sink {
-            while !s.empty() && !stop {
-                match cmd_rx.try_recv() {
-                    Ok(PlayerCommand::Stop { .. })
-                    | Ok(PlayerCommand::Shutdown { .. })
-                    | Err(TryRecvError::Disconnected) => {
-                        stop = true;
-                        s.pause();
-                        s.clear();
-                        break;
-                    }
-                    Ok(PlayerCommand::Pause { generation: g }) => {
-                        playing = false;
-                        playback_clock.pause();
-                        s.pause();
-                        emit(
-                            event_tx,
-                            snap(false, position, duration, volume, g, "paused"),
-                        );
-                    }
-                    Ok(PlayerCommand::Play { generation: g }) => {
-                        playing = true;
-                        playback_clock.resume();
-                        s.play();
-                        emit(
-                            event_tx,
-                            snap(true, position, duration, volume, g, "playing"),
-                        );
-                    }
-                    Ok(PlayerCommand::SetVolume {
-                        volume: v,
-                        generation: g,
-                    }) => {
-                        volume = v.clamp(0.0, 1.0);
-                        s.set_volume(volume);
-                        emit(
-                            event_tx,
-                            snap(playing, position, duration, volume, g, "volume"),
-                        );
-                    }
-                    Ok(PlayerCommand::SetPlaybackRate {
-                        rate,
-                        generation: g,
-                    }) => {
-                        playback_rate = if rate.is_finite() {
-                            rate.clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
-                        } else {
-                            1.0
-                        };
-                        playback_clock.set_rate(playback_rate);
-                        s.set_speed(playback_rate as f32);
-                        emit(
-                            event_tx,
-                            snap(playing, position, duration, volume, g, "rate"),
-                        );
-                    }
-                    Ok(_) | Err(TryRecvError::Empty) => {}
-                }
-                if video_si.is_none() && playing && clock_started {
-                    let now = playback_clock.now();
-                    position = if duration > Duration::ZERO {
-                        now.min(duration)
-                    } else {
-                        now
-                    };
-                    emit(
-                        event_tx,
-                        PlayerEvent::PositionChanged {
-                            position,
-                            generation,
-                        },
-                    );
-                }
-                thread::sleep(Duration::from_millis(12));
-            }
-        }
-        if !stop {
-            emit(event_tx, PlayerEvent::Ended { generation });
-        } else {
-            emit(
-                event_tx,
-                snap(false, position, duration, volume, generation, "stopped"),
-            );
-        }
+        emit(event_tx, PlayerEvent::Ended { generation });
     } else {
         emit(
             event_tx,
