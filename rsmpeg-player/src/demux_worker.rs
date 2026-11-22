@@ -615,7 +615,6 @@ fn run_worker(
                             clock_started = true;
                             video_scheduler.reset_stats();
                             video_frame_index = 0;
-                            base_video_pts = None;
                             force_one_frame = true;
                             emit(
                                 &event_tx,

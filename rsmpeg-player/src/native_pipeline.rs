@@ -358,7 +358,6 @@ fn run_native_inner(
                             appended_samples =
                                 MasterClock::duration_to_audio_samples(position, audio_rate);
                             video_frame_index = 0;
-                            base_video_pts = None;
                             force_one_frame = true;
                             video_scheduler.reset_stats();
                             emit(
