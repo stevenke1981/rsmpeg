@@ -80,8 +80,12 @@ fn main() {
     let scaler = rsmpeg::scale::Scaler::new(scaler_config).unwrap();
     let scaled = scaler.scale(&frame).unwrap();
     println!(
-        "  Scaled: {}x{} -> {}x{}",
-        frame.width, frame.height, scaled.width, scaled.height
+        "  Scaled: {}x{} -> {}x{} (interpolation: {})",
+        frame.width,
+        frame.height,
+        scaled.width,
+        scaled.height,
+        scaler.config().interpolation.name()
     );
     println!();
 

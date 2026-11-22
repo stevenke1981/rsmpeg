@@ -16,6 +16,21 @@ pub enum InterpolationMethod {
 }
 
 impl InterpolationMethod {
+    /// Whether [`Scaler`] implements this kernel for real.
+    ///
+    /// Everything else is rejected by [`Scaler::new`] instead of silently
+    /// producing nearest-neighbour output: a configuration that asks for
+    /// `Lanczos` and gets a pixel-picked image is worse than an error.
+    pub fn is_supported(self) -> bool {
+        matches!(
+            self,
+            InterpolationMethod::NearestNeighbor
+                | InterpolationMethod::Bilinear
+                | InterpolationMethod::Bicubic
+                | InterpolationMethod::Lanczos
+        )
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             InterpolationMethod::NearestNeighbor => "nearest",
@@ -114,6 +129,13 @@ impl Scaler {
                 "scaler destination size must be non-zero".into(),
             ));
         }
+        // Fail loudly rather than quietly falling back to nearest neighbour.
+        if !config.interpolation.is_supported() {
+            return Err(unsupported!(
+                "scaler interpolation '{}' is not implemented; use one of nearest/bilinear/bicubic/lanczos",
+                config.interpolation.name()
+            ));
+        }
 
         let color = config.color_conversion.clone().unwrap_or_else(|| {
             ColorConversion::new(
@@ -150,7 +172,11 @@ impl Scaler {
     /// - `Rgb24` → `Rgba`
     /// - same format → same format (with dimension scaling)
     ///
-    /// Dimension changes use nearest-neighbor sampling of the source.
+    /// Dimension changes are performed with the kernel named by
+    /// [`ScalerConfig::interpolation`] — `nearest`, `bilinear`, `bicubic` or
+    /// `lanczos` (see [`InterpolationMethod::is_supported`]). The
+    /// `Yuv420P → Yuv420P` path resamples all three planes with that kernel;
+    /// the packed-output paths use it for the luma sampling as well.
     /// Returns a new frame with correctly sized packed planes.
     pub fn scale(&self, frame: &Frame) -> RsResult<Frame> {
         tracing::debug!(
@@ -887,34 +913,13 @@ impl Scaler {
         let mut u_out = vec![0u8; c_len];
         let mut v_out = vec![0u8; c_len];
 
-        // Precompute the source-column mapping once; it is shared by every row
-        // and by both chroma planes.
-        let x_map: Vec<usize> = (0..dst_w)
-            .map(|dx| ((dx as u64 * use_w as u64 / dst_w as u64) as usize).min(use_w - 1))
-            .collect();
-        let cx_map: Vec<usize> = (0..dst_cw)
-            .map(|dx| ((dx as u64 * src_cw as u64 / dst_cw as u64) as usize).min(src_cw - 1))
-            .collect();
-
-        for dy in 0..dst_h {
-            let sy = ((dy as u64 * use_h as u64 / dst_h as u64) as usize).min(use_h - 1);
-            let src_row = sy * y_stride;
-            let dst_row = dy * dst_w;
-            for (dx, &sx) in x_map.iter().enumerate() {
-                y_out[dst_row + dx] = y_plane[src_row + sx];
-            }
-        }
-
-        for dy in 0..dst_ch {
-            let sy = ((dy as u64 * src_ch as u64 / dst_ch as u64) as usize).min(src_ch - 1);
-            let u_row = sy * u_stride;
-            let v_row = sy * v_stride;
-            let dst_row = dy * dst_cw;
-            for (dx, &cx) in cx_map.iter().enumerate() {
-                u_out[dst_row + dx] = u_plane[u_row + cx];
-                v_out[dst_row + dx] = v_plane[v_row + cx];
-            }
-        }
+        // Resample every plane with the configured kernel. This used to be a
+        // hard-coded nearest-neighbour copy, so a `Lanczos` configuration
+        // silently produced nearest-neighbour output.
+        let method = self.config.interpolation;
+        y_out = resample_plane(y_plane, y_stride, use_w, use_h, dst_w, dst_h, method);
+        u_out = resample_plane(u_plane, u_stride, src_cw, src_ch, dst_cw, dst_ch, method);
+        v_out = resample_plane(v_plane, v_stride, src_cw, src_ch, dst_cw, dst_ch, method);
 
         let mut result = clone_frame_metadata(frame, vec![y_out, u_out, v_out], vec![
             dst_w, dst_cw, dst_cw,
@@ -993,6 +998,164 @@ fn yuv_to_rgb_bt601(y: u8, u: u8, v: u8, limited: bool) -> (u8, u8, u8) {
     let g = y_scaled - gu * d - gv * e;
     let b = y_scaled + bu * d;
     (clamp_fixed_u8(r), clamp_fixed_u8(g), clamp_fixed_u8(b))
+}
+
+/// Per-output-sample source coverage implied by an [`InterpolationMethod`].
+///
+/// Returns the number of source samples on each side of the centre that
+/// contribute (`0` = nearest neighbour, `1` = bilinear, `2` = bicubic,
+/// `a` = Lanczos window width).
+fn kernel_radius(method: InterpolationMethod) -> usize {
+    match method {
+        InterpolationMethod::NearestNeighbor => 0,
+        InterpolationMethod::Bilinear => 1,
+        InterpolationMethod::Bicubic | InterpolationMethod::Spline => 2,
+        InterpolationMethod::Lanczos | InterpolationMethod::Sinc => 3,
+        InterpolationMethod::Gaussian => 2,
+    }
+}
+
+/// Interpolation weight for a normalised sample distance `x` (in source
+/// samples) under `method`.
+///
+/// All kernels are normalised to `w(0) == 1`, so they can be applied by
+/// accumulate-and-normalise without per-pixel rescaling.
+fn kernel_weight(method: InterpolationMethod, x: f64) -> f64 {
+    let x = x.abs();
+    match method {
+        InterpolationMethod::NearestNeighbor => {
+            if x < 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        InterpolationMethod::Bilinear => (1.0 - x).max(0.0),
+        InterpolationMethod::Bicubic | InterpolationMethod::Spline => {
+            // Keys cubic convolution with a = -0.5 (Catmull-Rom).
+            const A: f64 = -0.5;
+            if x <= 1.0 {
+                (A + 2.0) * x * x * x - (A + 3.0) * x * x + 1.0
+            } else if x < 2.0 {
+                A * x * x * x - 5.0 * A * x * x + 8.0 * A * x - 4.0 * A
+            } else {
+                0.0
+            }
+        }
+        InterpolationMethod::Lanczos | InterpolationMethod::Sinc => {
+            // Lanczos-3: sinc(x) * sinc(x/3), windowed to |x| < 3.
+            const A: f64 = 3.0;
+            if x < 1e-12 {
+                1.0
+            } else if x < A {
+                let px = std::f64::consts::PI * x;
+                (px.sin() / px) * ((px / A).sin() / (px / A))
+            } else {
+                0.0
+            }
+        }
+        InterpolationMethod::Gaussian => (-x * x / 0.8).exp(),
+    }
+}
+
+/// Resample one 8-bit plane from `src_w × src_h` to `dst_w × dst_h`.
+///
+/// Horizontal and vertical passes are separable, but for the small kernels used
+/// here a direct 2-D accumulation per output pixel is both simpler and cache
+/// friendly. Nearest-neighbour keeps the historical `floor(d*s/t)` mapping so
+/// existing callers see identical output.
+fn resample_plane(
+    src: &[u8],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    method: InterpolationMethod,
+) -> Vec<u8> {
+    let mut out = vec![0u8; dst_w * dst_h];
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return out;
+    }
+    if matches!(method, InterpolationMethod::NearestNeighbor) {
+        for dy in 0..dst_h {
+            let sy = ((dy as u64 * src_h as u64 / dst_h as u64) as usize).min(src_h - 1);
+            let row = sy * src_stride;
+            for dx in 0..dst_w {
+                let sx = ((dx as u64 * src_w as u64 / dst_w as u64) as usize).min(src_w - 1);
+                out[dy * dst_w + dx] = src[row + sx];
+            }
+        }
+        return out;
+    }
+
+    // Map destination centres onto source coordinates (half-pixel centres, the
+    // convention every resampler in FFmpeg uses).
+    let scale_x = src_w as f64 / dst_w as f64;
+    let scale_y = src_h as f64 / dst_h as f64;
+    let radius = kernel_radius(method) as isize;
+
+    for dy in 0..dst_h {
+        let center_y = (dy as f64 + 0.5) * scale_y - 0.5;
+        let base_y = center_y.floor() as isize;
+        let mut wy = [(0.0f64, 0usize); 16];
+        let mut ny = 0usize;
+        for k in -radius..=radius {
+            let sy = (base_y + k).clamp(0, src_h as isize - 1) as usize;
+            let w = kernel_weight(method, center_y - (base_y + k) as f64);
+            if w != 0.0 && ny < wy.len() {
+                wy[ny] = (w, sy);
+                ny += 1;
+            }
+        }
+        if ny == 0 {
+            let sy = (center_y.round() as isize).clamp(0, src_h as isize - 1) as usize;
+            wy[0] = (1.0, sy);
+            ny = 1;
+        }
+
+        for dx in 0..dst_w {
+            let center_x = (dx as f64 + 0.5) * scale_x - 0.5;
+            let base_x = center_x.floor() as isize;
+            let mut wx = [(0.0f64, 0usize); 16];
+            let mut nx = 0usize;
+            for k in -radius..=radius {
+                let sx = (base_x + k).clamp(0, src_w as isize - 1) as usize;
+                let w = kernel_weight(method, center_x - (base_x + k) as f64);
+                if w != 0.0 && nx < wx.len() {
+                    wx[nx] = (w, sx);
+                    nx += 1;
+                }
+            }
+            if nx == 0 {
+                let sx = (center_x.round() as isize).clamp(0, src_w as isize - 1) as usize;
+                wx[0] = (1.0, sx);
+                nx = 1;
+            }
+
+            let mut acc = 0.0f64;
+            let mut wsum = 0.0f64;
+            for &(w_y, sy) in &wy[..ny] {
+                let row = sy * src_stride;
+                for &(w_x, sx) in &wx[..nx] {
+                    let w = w_y * w_x;
+                    acc += w * src[row + sx] as f64;
+                    wsum += w;
+                }
+            }
+            let v = if wsum.abs() > 1e-12 {
+                acc / wsum
+            } else {
+                // Degenerate kernels (all weights cancelled): fall back to the
+                // nearest sample so output is never blank.
+                let sy = (center_y.round() as isize).clamp(0, src_h as isize - 1) as usize;
+                let sx = (center_x.round() as isize).clamp(0, src_w as isize - 1) as usize;
+                src[sy * src_stride + sx] as f64
+            };
+            out[dy * dst_w + dx] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 fn clone_frame_metadata(frame: &Frame, data: Vec<Vec<u8>>, linesize: Vec<usize>) -> Frame {
@@ -2280,6 +2443,137 @@ mod tests {
         // Correct frame still passes through.
         let ok = Frame::new_video(2, 2, PixelFormat::Rgb24);
         assert!(scaler.scale(&ok).is_ok());
+    }
+
+    /// Single-plane 8-bit ramp/step frame used by the interpolation tests.
+    fn luma_frame(w: usize, h: usize, px: impl Fn(usize, usize) -> u8) -> Frame {
+        let mut y = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                y[row * w + col] = px(col, row);
+            }
+        }
+        Frame {
+            data: vec![y, vec![128u8; w.div_ceil(2) * h.div_ceil(2)], vec![128u8; w.div_ceil(2) * h.div_ceil(2)]],
+            linesize: vec![w, w.div_ceil(2), w.div_ceil(2)],
+            width: w,
+            height: h,
+            pixel_format: PixelFormat::Yuv420P,
+            sample_format: rsmpeg_util::SampleFormat::None,
+            sample_rate: 0,
+            channels: 0,
+            samples: 0,
+            pts: Some(0),
+            duration: 1,
+            time_base: Rational::new(1, 25),
+            key_frame: true,
+            pict_type: rsmpeg_codec::PictureType::I,
+        }
+    }
+
+    #[test]
+    fn lanczos_differs_from_nearest_on_a_step_edge() {
+        // A hard black/white edge: nearest keeps the edge razor sharp, Lanczos
+        // rings and produces intermediate values. Before this change the
+        // configured method was ignored and both runs were byte-identical.
+        let frame = luma_frame(8, 2, |x, _| if x < 4 { 16 } else { 235 });
+        let cfg = ScalerConfig::new(8, 2, PixelFormat::Yuv420P, 16, 4, PixelFormat::Yuv420P);
+        let nearest = Scaler::new(cfg.clone().with_interpolation(InterpolationMethod::NearestNeighbor))
+            .unwrap()
+            .scale(&frame)
+            .unwrap();
+        let lanczos = Scaler::new(cfg.clone().with_interpolation(InterpolationMethod::Lanczos))
+            .unwrap()
+            .scale(&frame)
+            .unwrap();
+
+        assert_eq!(nearest.data[0].len(), lanczos.data[0].len());
+        assert_ne!(
+            nearest.data[0], lanczos.data[0],
+            "Lanczos must not be a silent alias of nearest"
+        );
+        // Nearest only reproduces the two original levels.
+        assert!(nearest.data[0].iter().all(|&v| v == 16 || v == 235));
+        // Lanczos produces interpolated values near the edge only.
+        assert!(
+            lanczos.data[0].iter().any(|&v| v != 16 && v != 235),
+            "expected interpolated samples"
+        );
+    }
+
+    #[test]
+    fn bilinear_and_bicubic_are_distinct_from_nearest() {
+        let frame = luma_frame(8, 2, |x, _| if x < 4 { 16 } else { 235 });
+        let cfg = ScalerConfig::new(8, 2, PixelFormat::Yuv420P, 16, 4, PixelFormat::Yuv420P);
+        let run = |m| {
+            Scaler::new(cfg.clone().with_interpolation(m))
+                .unwrap()
+                .scale(&frame)
+                .unwrap()
+                .data[0]
+                .clone()
+        };
+        let nearest = run(InterpolationMethod::NearestNeighbor);
+        let bilinear = run(InterpolationMethod::Bilinear);
+        let bicubic = run(InterpolationMethod::Bicubic);
+        assert_ne!(nearest, bilinear, "bilinear must interpolate");
+        assert_ne!(nearest, bicubic, "bicubic must interpolate");
+        assert_ne!(bilinear, bicubic, "bicubic and bilinear are different kernels");
+    }
+
+    #[test]
+    fn bilinear_preserves_a_flat_plane_exactly() {
+        // Interpolation must not shift DC level: a uniform plane stays uniform.
+        let frame = luma_frame(8, 4, |_, _| 137);
+        for method in [
+            InterpolationMethod::NearestNeighbor,
+            InterpolationMethod::Bilinear,
+            InterpolationMethod::Bicubic,
+            InterpolationMethod::Lanczos,
+        ] {
+            let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 5, 3, PixelFormat::Yuv420P)
+                .with_interpolation(method);
+            let out = Scaler::new(cfg).unwrap().scale(&frame).unwrap();
+            assert!(
+                out.data[0].iter().all(|&v| v == 137),
+                "{} changed a flat plane: {:?}",
+                method.name(),
+                out.data[0]
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_interpolation_methods_are_rejected_loudly() {
+        // Sinc/Spline/Gaussian are not implemented; asking for them must be an
+        // error rather than silently producing nearest-neighbour output.
+        for method in [
+            InterpolationMethod::Sinc,
+            InterpolationMethod::Spline,
+            InterpolationMethod::Gaussian,
+        ] {
+            assert!(!method.is_supported(), "{} should be unsupported", method.name());
+            let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 4, 2, PixelFormat::Yuv420P)
+                .with_interpolation(method);
+            match Scaler::new(cfg) {
+                Err(RsError::Unsupported(msg)) => {
+                    assert!(msg.contains(method.name()), "message should name the method: {msg}")
+                }
+                Err(other) => panic!("expected Unsupported for {}, got {other}", method.name()),
+                Ok(_) => panic!("expected Unsupported for {}, got Ok", method.name()),
+            }
+        }
+        // The supported set still constructs.
+        for method in [
+            InterpolationMethod::NearestNeighbor,
+            InterpolationMethod::Bilinear,
+            InterpolationMethod::Bicubic,
+            InterpolationMethod::Lanczos,
+        ] {
+            let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 4, 2, PixelFormat::Yuv420P)
+                .with_interpolation(method);
+            assert!(Scaler::new(cfg).is_ok(), "{} should construct", method.name());
+        }
     }
 
     #[test]
