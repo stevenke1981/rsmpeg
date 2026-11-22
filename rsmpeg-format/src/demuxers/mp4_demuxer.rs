@@ -2229,6 +2229,37 @@ mod tests {
     }
 
     #[test]
+    fn review_zero_sample_middle_run_rejects_entire_track() {
+        // Sixth review neighbour of `review_zero_sample_prefix_run_must_not_shift_the_valid_chunk`:
+        // the zero-sample run sits in the *middle* of a three-chunk table
+        // (`stsc` = (1,1), (2,0), (3,1)), so chunk 1 is mapped, chunk 2 is empty
+        // while samples are still unplaced, and chunk 3 holds the rest. This is
+        // the reviewer's `zero_middle.mp4` shape. Mirroring `extra-probe`, the
+        // demuxer must refuse the whole track: the surviving samples would
+        // otherwise slide down one ordinal and land on the wrong `stsz` size
+        // and `stts` DTS.
+        let data = build_mp4_with_chunks(&[b"AAA", b"BBBB", b"CC"], &[(1, 1), (2, 0), (3, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "a zero-sample middle run must not shift the remaining chunks: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+        // The track is unplayable, so it must not be published either.
+        assert!(
+            ctx.streams.is_empty() || header.is_err(),
+            "an unprovable track must not be offered to the player"
+        );
+    }
+
+    #[test]
     fn probe_surviving_track_packets_match_the_selected_stream() {
         // Review P1: dropping track 0 left the surviving track's Stream and
         // Packet indices at 1, while the player selects position 0.

@@ -510,6 +510,48 @@ mod tests {
     }
 
     #[test]
+    fn review_24_bit_stereo_ticks_match_frames_and_packet() {
+        // Sixth review neighbour of the sub-millisecond fix, mirroring the
+        // reviewer's `stereo_24bit_sub_ms.wav`: 44.1 kHz, 24-bit stereo, 37
+        // frames (data chunk 222 bytes, block align 6) is 0.839 ms. The stream
+        // and its packet must both carry 37 ticks (1 tick = 1 frame), and the
+        // container keeps its integer-millisecond field at 0.
+        let frames = 37u32;
+        let data = build_wav(frames, 44_100, 2, 24);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        {
+            let stream = &ctx.streams[0];
+            assert_eq!(
+                stream.time_base,
+                rsmpeg_util::Rational::new(1, 44_100),
+                "time base is 1/sample_rate"
+            );
+            assert_eq!(stream.duration, 37, "stream ticks must be the frame count");
+            assert!(
+                (stream.duration_seconds() - 37.0 / 44_100.0).abs() < 1e-12,
+                "got {}",
+                stream.duration_seconds()
+            );
+            // A 24-bit WAV is exposed as S32 samples, one block per frame.
+            assert_eq!(stream.codec_params.sample_format, Some(SampleFormat::S32));
+            assert_eq!(stream.codec_params.channels, Some(2));
+            assert_eq!(stream.codec_params.sample_rate, Some(44_100));
+        }
+        assert_eq!(ctx.duration, 0, "container duration is whole milliseconds");
+
+        let packet = demuxer.read_frame(&mut ctx).unwrap().expect("one packet");
+        assert_eq!(packet.duration, 37, "packet duration is in stream ticks");
+        assert_eq!(
+            packet.data.len(),
+            frames as usize * 6,
+            "24-bit stereo blocks are 6 bytes"
+        );
+    }
+
+    #[test]
     fn read_frame_on_empty_data_chunk_returns_none() {
         let data = build_wav(0, 44_100, 2, 16);
         let mut ctx = ctx_with(data);
