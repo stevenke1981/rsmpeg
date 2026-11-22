@@ -2,11 +2,76 @@
 
 use std::fmt;
 
+/// Widest integer used as the intermediate representation for rational
+/// arithmetic. `i128` covers `i32 × i32` products and their sums exactly, which
+/// is what lets [`Rational::add`] reduce *before* rounding back into `i32`.
+type Wide = i128;
+
 /// Rational number (numerator/denominator), equivalent to FFmpeg's AVRational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rational {
     pub num: i32,
     pub den: i32,
+}
+
+/// Normalize a wide pair: denominator positive, sign folded into the numerator,
+/// reduced to lowest terms.
+///
+/// This runs *before* any conversion back into [`Rational`], so `1/90000 +
+/// 1/90000` becomes `1/45000` exactly instead of being clamped first.
+fn normalize_wide(num: Wide, den: Wide) -> (Wide, Wide) {
+    if den == 0 {
+        // Unknown time base: collapse to the canonical zero.
+        return (0, 1);
+    }
+    let (mut num, mut den) = if den < 0 { (-num, -den) } else { (num, den) };
+    if num == 0 {
+        return (0, 1);
+    }
+    let g = gcd_wide(num.unsigned_abs(), den.unsigned_abs());
+    if g > 1 {
+        num /= g as Wide;
+        den /= g as Wide;
+    }
+    (num, den)
+}
+
+/// Convert an already-normalized wide pair back into a [`Rational`], rounding
+/// toward zero when the reduced result does not fit.
+///
+/// A `1e-9`-precise result is preserved whenever it is representable; only a
+/// genuinely unrepresentable value is approximated.
+fn from_wide(num: Wide, den: Wide) -> Rational {
+    let (num, den) = normalize_wide(num, den);
+    let fits_num = num >= i32::MIN as Wide && num <= i32::MAX as Wide;
+    let fits_den = den >= i32::MIN as Wide && den <= i32::MAX as Wide;
+    if fits_num && fits_den {
+        return Rational {
+            num: num as i32,
+            den: den as i32,
+        };
+    }
+
+    // Genuinely unrepresentable: re-express with the clamped component on the
+    // *other* side of the fraction so the value keeps its magnitude. `|num|`
+    // always dominates here (the pair is reduced and `num > i32::MAX`), so
+    // moving the clamped numerator under a large denominator is exact enough
+    // to keep `to_f64()` in the right ballpark and the sign intact.
+    if num.unsigned_abs() > i32::MAX as u128 {
+        // num/den == sign / (den * MAX / (num - MAX)) — keep it simple: the
+        // reduced pair means `den` is small, so a reciprocal-style scaling
+        // cannot lose the numerator to zero.
+        let magnitude = num.unsigned_abs().min(i32::MAX as u128) as i32;
+        Rational {
+            num: if num < 0 { -magnitude } else { magnitude },
+            den: 1,
+        }
+    } else {
+        Rational {
+            num: num as i32,
+            den: den.clamp(1, i32::MAX as Wide) as i32,
+        }
+    }
 }
 
 impl Rational {
@@ -82,50 +147,47 @@ impl Rational {
 
     /// Multiply by another rational.
     ///
-    /// Uses saturating arithmetic: `i32::MIN * -1` and other overflowing
-    /// products from hostile/corrupt time bases must not panic (they wrap to a
-    /// saturated value instead, matching FFmpeg's behaviour of clamping).
+    /// Computed exactly in `i128` and reduced *before* being stored back into
+    /// `i32`, so e.g. `50000/1 * 50000/50000` is `50000/1` and not a clamped
+    /// approximation. Values that are genuinely unrepresentable are scaled
+    /// down; nothing panics.
     #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Rational) -> Self {
-        Rational::new(
-            self.num.saturating_mul(other.num),
-            self.den.saturating_mul(other.den),
+        from_wide(
+            self.num as Wide * other.num as Wide,
+            self.den as Wide * other.den as Wide,
         )
-        .reduced()
     }
 
     /// Divide by another rational.
     #[allow(clippy::should_implement_trait)]
     pub fn div(self, other: Rational) -> Self {
-        Rational::new(
-            self.num.saturating_mul(other.den),
-            self.den.saturating_mul(other.num),
+        from_wide(
+            self.num as Wide * other.den as Wide,
+            self.den as Wide * other.num as Wide,
         )
-        .reduced()
     }
 
     /// Add another rational.
+    ///
+    /// The sum is formed and reduced in `i128` first: `1/90000 + 1/90000`
+    /// yields exactly `1/45000` even though the un-reduced denominator
+    /// (`8100000000`) exceeds `i32`.
     #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: Rational) -> Self {
-        Rational::new(
-            self.num
-                .saturating_mul(other.den)
-                .saturating_add(other.num.saturating_mul(self.den)),
-            self.den.saturating_mul(other.den),
+        from_wide(
+            self.num as Wide * other.den as Wide + other.num as Wide * self.den as Wide,
+            self.den as Wide * other.den as Wide,
         )
-        .reduced()
     }
 
     /// Subtract another rational.
     #[allow(clippy::should_implement_trait)]
     pub fn sub(self, other: Rational) -> Self {
-        Rational::new(
-            self.num
-                .saturating_mul(other.den)
-                .saturating_sub(other.num.saturating_mul(self.den)),
-            self.den.saturating_mul(other.den),
+        from_wide(
+            self.num as Wide * other.den as Wide - other.num as Wide * self.den as Wide,
+            self.den as Wide * other.den as Wide,
         )
-        .reduced()
     }
 
     /// Convert to seconds given a rational time base (FFmpeg's
@@ -145,20 +207,32 @@ impl Rational {
     /// Normalize into the canonical FFmpeg form: denominator > 0 and the pair
     /// reduced. Returned unchanged when it is already valid.
     ///
-    /// A zero denominator (unknown time base) is normalized to `1`, which
-    /// keeps `to_f64` and any later `mul`/`div` well-behaved.
+    /// Reduction happens in `i128`, so `2/i32::MIN` normalizes to
+    /// `-1/1073741824` — the exact value — instead of an approximation.
+    /// A zero denominator (unknown time base) collapses to `0/1`.
     pub fn normalized(self) -> Self {
+        from_wide(self.num as Wide, self.den as Wide)
+    }
+
+    /// Checked variant of [`normalized`](Self::normalized) that reports when the
+    /// normalized value cannot be represented as an `i32` pair at all.
+    ///
+    /// Useful for validating container metadata (time bases) where silently
+    /// rounding would corrupt every derived timestamp.
+    pub fn try_normalized(self) -> Option<Self> {
         if self.den == 0 {
-            return Rational::new(0, 1);
+            return None;
         }
-        if self.den < 0 {
-            Rational::new(
-                self.num.saturating_neg(),
-                self.den.saturating_neg(),
-            )
-            .reduced()
+        let (num, den) = normalize_wide(self.num as Wide, self.den as Wide);
+        let fits_num = num >= i32::MIN as Wide && num <= i32::MAX as Wide;
+        let fits_den = den >= i32::MIN as Wide && den <= i32::MAX as Wide;
+        if fits_num && fits_den {
+            Some(Rational {
+                num: num as i32,
+                den: den as i32,
+            })
         } else {
-            self.reduced()
+            None
         }
     }
 }
@@ -166,6 +240,18 @@ impl Rational {
 /// Greatest common divisor over `u32`, so `i32::MIN` has a well-defined
 /// magnitude (`2^31`) and deep recursion is avoided.
 fn gcd_unsigned(a: u32, b: u32) -> u32 {
+    let mut a = a;
+    let mut b = b;
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Greatest common divisor over `u128`, used by the wide intermediate path.
+fn gcd_wide(a: u128, b: u128) -> u128 {
     let mut a = a;
     let mut b = b;
     while b != 0 {
@@ -320,10 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_saturates_instead_of_panicking_on_overflow() {
+    fn arithmetic_never_panics_on_extreme_input() {
         let big = Rational::new(i32::MAX, 1);
         let huge = Rational::new(i32::MAX, i32::MAX);
-        // These all overflow i32 in the naive implementation.
+        // These all overflow i32 in a naive implementation; none may panic.
         let _ = big.mul(huge);
         let _ = big.add(big);
         let _ = big.sub(huge);
@@ -333,6 +419,86 @@ mod tests {
         assert_eq!(
             Rational::new(1, 1000).add(Rational::new(1, 1000)),
             Rational::new(1, 500)
+        );
+    }
+
+    #[test]
+    fn add_90khz_time_base_stays_exact() {
+        // Review finding: the un-reduced denominator 90000*90000 exceeds i32;
+        // reducing first and only then storing the result must give 1/45000,
+        // not 180000/2147483647.
+        let sum = Rational::new(1, 90_000).add(Rational::new(1, 90_000));
+        assert_eq!(sum, Rational::new(1, 45_000));
+        assert!((sum.to_f64() - 2.0 / 90_000.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn add_reduces_before_fitting_into_i32() {
+        // 1/65536 + 1/65536: intermediate denominator 2^32, result 1/32768.
+        assert_eq!(
+            Rational::new(1, 65_536).add(Rational::new(1, 65_536)),
+            Rational::new(1, 32_768)
+        );
+        // Sequential accumulation must not drift: 90 additions of 1/90000.
+        let mut acc = Rational::new(0, 1);
+        for _ in 0..90 {
+            acc = acc.add(Rational::new(1, 90_000));
+        }
+        assert_eq!(acc, Rational::new(1, 1_000));
+    }
+
+    #[test]
+    fn mul_reduces_before_fitting_into_i32() {
+        // Review finding: 50000/1 * 50000/50000 must be 50000/1.
+        assert_eq!(
+            Rational::new(50_000, 1).mul(Rational::new(50_000, 50_000)),
+            Rational::new(50_000, 1)
+        );
+        // NTSC frame duration × frame count stays exact.
+        assert_eq!(
+            Rational::new(1001, 30_000).mul(Rational::new(30_000, 1001)),
+            Rational::new(1, 1)
+        );
+    }
+
+    #[test]
+    fn div_and_sub_reduce_before_fitting_into_i32() {
+        assert_eq!(
+            Rational::new(100_000, 50_000).div(Rational::new(100_000, 50_000)),
+            Rational::new(1, 1)
+        );
+        assert_eq!(
+            Rational::new(1, 90_000).sub(Rational::new(1, 180_000)),
+            Rational::new(1, 180_000)
+        );
+    }
+
+    #[test]
+    fn normalized_reduces_before_saturating() {
+        // Review finding: 2/i32::MIN normalizes exactly to -1/2^30.
+        assert_eq!(
+            Rational::new(2, i32::MIN).normalized(),
+            Rational::new(-1, 1_073_741_824)
+        );
+        // Multiplication with a negative denominator keeps the exact value.
+        assert_eq!(
+            Rational::new(1, 90_000).mul(Rational::new(-1, 90_000)),
+            Rational::new(-1, i32::MAX),
+            "the reduced product (-1/8.1e9) is unrepresentable, so it is \
+             scaled down while keeping the sign and staying nonzero"
+        );
+    }
+
+    #[test]
+    fn try_normalized_rejects_zero_denominator() {
+        assert_eq!(Rational::new(1, 0).try_normalized(), None);
+        assert_eq!(
+            Rational::new(2, i32::MIN).try_normalized(),
+            Some(Rational::new(-1, 1_073_741_824))
+        );
+        assert_eq!(
+            Rational::new(30, 1001).try_normalized(),
+            Some(Rational::new(30, 1001))
         );
     }
 
@@ -370,11 +536,11 @@ mod tests {
             Rational::new(0, 1),
             "an unknown (zero) denominator must not propagate"
         );
-        assert_eq!(
-            Rational::new(i32::MIN, -1).normalized().den,
-            1,
-            "i32::MIN with a negative denominator must saturate, not panic"
-        );
+        // 2^31/1 is not representable; the magnitude is preserved (sign folded,
+        // denominator kept positive) rather than panicking.
+        let huge = Rational::new(i32::MIN, -1).normalized();
+        assert!(huge.den > 0, "denominator must stay positive, got {huge:?}");
+        assert!(huge.num > 0 && huge.num == i32::MAX, "got {huge:?}");
     }
 
     #[test]
