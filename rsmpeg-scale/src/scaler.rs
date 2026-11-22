@@ -201,9 +201,7 @@ impl Scaler {
         match (self.config.src_format, self.config.dst_format) {
             (PixelFormat::Yuv420P, PixelFormat::Rgba) => self.scale_yuv420p_to_packed(frame, 4),
             (PixelFormat::Yuv420P, PixelFormat::Rgb24) => self.scale_yuv420p_to_packed(frame, 3),
-            (PixelFormat::Yuv420P, PixelFormat::Bgr24) => {
-                self.scale_yuv420p_to_packed(frame, 0)
-            }
+            (PixelFormat::Yuv420P, PixelFormat::Bgr24) => self.scale_yuv420p_to_packed(frame, 0),
             (PixelFormat::Nv12, PixelFormat::Rgba) => self.scale_nv12_to_rgba(frame),
             (PixelFormat::Nv12, PixelFormat::Rgb24) => self.scale_nv12_to_rgb24(frame),
             (PixelFormat::Yuv422P, PixelFormat::Rgba) => self.scale_yuv422p_to_rgba(frame),
@@ -409,9 +407,7 @@ impl Scaler {
         // as 8-bit accepted a half-width plane and copied it verbatim.
         let bps = |format: PixelFormat| -> usize {
             match format {
-                PixelFormat::Gray16
-                | PixelFormat::Yuv420P10
-                | PixelFormat::Yuv420P12 => 2,
+                PixelFormat::Gray16 | PixelFormat::Yuv420P10 | PixelFormat::Yuv420P12 => 2,
                 _ => 1,
             }
         };
@@ -466,7 +462,6 @@ impl Scaler {
         Ok(())
     }
 
-
     fn validate_yuv420p_planes<'a>(
         &self,
         frame: &'a Frame,
@@ -483,7 +478,14 @@ impl Scaler {
         // declared `linesize` that does not match shifts every row.
         let chroma_w = use_w.div_ceil(2);
         let chroma_h = use_h.div_ceil(2);
-        Self::validate_plane(&frame.data[0], frame.linesize[0], use_w, use_h, 1, "YUV420P Y")?;
+        Self::validate_plane(
+            &frame.data[0],
+            frame.linesize[0],
+            use_w,
+            use_h,
+            1,
+            "YUV420P Y",
+        )?;
         Self::validate_plane(
             &frame.data[1],
             frame.linesize[1],
@@ -650,10 +652,7 @@ impl Scaler {
                     let sx = ((dx as u64 * src_w as u64 / dst_w as u64) as usize).min(last_sx);
                     let cy = if chroma_step > 1 { sy / 2 } else { sy }.min(last_scy);
                     let cx = (sx / 2).min(last_scx);
-                    (
-                        u_plane[cy * u_stride + cx],
-                        v_plane[cy * v_stride + cx],
-                    )
+                    (u_plane[cy * u_stride + cx], v_plane[cy * v_stride + cx])
                 } else {
                     // One chroma sample covers `chroma_step` luma rows and 2 columns
                     // of the *resampled* destination, so the index follows the
@@ -846,16 +845,8 @@ impl Scaler {
                 ));
             }
         }
-        let v_plane: &[u8] = if interleaved_uv {
-            &[]
-        } else {
-            &frame.data[2]
-        };
-        let v_stride = if interleaved_uv {
-            0
-        } else {
-            frame.linesize[2]
-        };
+        let v_plane: &[u8] = if interleaved_uv { &[] } else { &frame.data[2] };
+        let v_stride = if interleaved_uv { 0 } else { frame.linesize[2] };
 
         let bpp = if alpha { 4 } else { 3 };
 
@@ -951,7 +942,11 @@ impl Scaler {
         // Split the interleaved RGB into three 8-bit planes so the shared kernel
         // code can resample each channel independently, then interleave RGBA.
         let method = self.config.interpolation;
-        let mut planes: [Vec<u8>; 3] = [vec![0u8; use_w * use_h], vec![0u8; use_w * use_h], vec![0u8; use_w * use_h]];
+        let mut planes: [Vec<u8>; 3] = [
+            vec![0u8; use_w * use_h],
+            vec![0u8; use_w * use_h],
+            vec![0u8; use_w * use_h],
+        ];
         for sy in 0..use_h {
             let row = sy * src_stride;
             for sx in 0..use_w {
@@ -964,7 +959,9 @@ impl Scaler {
         }
         let mut resampled = Vec::with_capacity(3);
         for plane in &planes {
-            resampled.push(resample_plane(plane, use_w, use_w, use_h, dst_w, dst_h, method));
+            resampled.push(resample_plane(
+                plane, use_w, use_w, use_h, dst_w, dst_h, method,
+            ));
         }
 
         for dy in 0..dst_h {
@@ -1028,9 +1025,11 @@ impl Scaler {
         u_out = resample_plane(u_plane, u_stride, src_cw, src_ch, dst_cw, dst_ch, method);
         v_out = resample_plane(v_plane, v_stride, src_cw, src_ch, dst_cw, dst_ch, method);
 
-        let mut result = clone_frame_metadata(frame, vec![y_out, u_out, v_out], vec![
-            dst_w, dst_cw, dst_cw,
-        ]);
+        let mut result = clone_frame_metadata(
+            frame,
+            vec![y_out, u_out, v_out],
+            vec![dst_w, dst_cw, dst_cw],
+        );
         result.width = dst_w;
         result.height = dst_h;
         result.pixel_format = PixelFormat::Yuv420P;
@@ -2255,7 +2254,9 @@ mod tests {
         let cfg = ScalerConfig::new(8, 6, PixelFormat::Yuv420P, 4, 3, PixelFormat::Yuv420P);
         let scaler = Scaler::new(cfg).unwrap();
         let frame = make_yuv420p_frame(8, 6, 16, 128, 128);
-        let out = scaler.scale(&frame).expect("Yuv420P -> Yuv420P must be supported");
+        let out = scaler
+            .scale(&frame)
+            .expect("Yuv420P -> Yuv420P must be supported");
         assert_eq!(out.width, 4);
         assert_eq!(out.height, 3);
         assert_eq!(out.pixel_format, PixelFormat::Yuv420P);
@@ -2297,7 +2298,10 @@ mod tests {
         let (b, g, r) = (out.data[0][0], out.data[0][1], out.data[0][2]);
         assert!(r > 200, "BGR blue channel must be low, got B={b}");
         assert!(g < 40, "BGR green channel must be low, got G={g}");
-        assert!(b < 40, "BGR red channel must be high, got R={b} (byte0={r})");
+        assert!(
+            b < 40,
+            "BGR red channel must be high, got R={b} (byte0={r})"
+        );
     }
 
     #[test]
@@ -2467,10 +2471,7 @@ mod tests {
             f
         };
 
-        for (frame, format) in [
-            (nv12, PixelFormat::Nv12),
-            (yuv422p, PixelFormat::Yuv422P),
-        ] {
+        for (frame, format) in [(nv12, PixelFormat::Nv12), (yuv422p, PixelFormat::Yuv422P)] {
             let cfg = ScalerConfig::new(2, 2, format, 4, 2, PixelFormat::Rgba);
             let scale = |method| {
                 Scaler::new(cfg.clone().with_interpolation(method))
@@ -2552,9 +2553,15 @@ mod tests {
         let mut bgr = Frame::new_video(1, 1, PixelFormat::Bgr24);
         bgr.data = vec![vec![0, 0, 255]];
         bgr.linesize = vec![3];
-        let scaler =
-            Scaler::new(ScalerConfig::new(1, 1, PixelFormat::Rgb24, 1, 1, PixelFormat::Rgba))
-                .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            1,
+            1,
+            PixelFormat::Rgb24,
+            1,
+            1,
+            PixelFormat::Rgba,
+        ))
+        .unwrap();
         let err = scaler
             .scale(&bgr)
             .expect_err("a Bgr24 frame must not be read as Rgb24");
@@ -2575,9 +2582,15 @@ mod tests {
         let mut overlap = Frame::new_video(2, 2, PixelFormat::Rgb24);
         overlap.data = vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9]];
         overlap.linesize = vec![3];
-        let scaler =
-            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgba))
-                .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            2,
+            2,
+            PixelFormat::Rgb24,
+            2,
+            2,
+            PixelFormat::Rgba,
+        ))
+        .unwrap();
         let err = scaler
             .scale(&overlap)
             .expect_err("a stride shorter than the pixel row must be rejected");
@@ -2601,12 +2614,18 @@ mod tests {
         let scaler = Scaler::new(cfg).unwrap();
         let mut frame = make_yuv420p_frame(8, 4, 16, 128, 128);
         frame.linesize[0] = 2;
-        assert!(scaler.scale(&frame).is_err(), "luma stride must cover a row");
+        assert!(
+            scaler.scale(&frame).is_err(),
+            "luma stride must cover a row"
+        );
 
         // Chroma stride smaller than the chroma row.
         let mut frame = make_yuv420p_frame(8, 4, 16, 128, 128);
         frame.linesize[1] = 1;
-        assert!(scaler.scale(&frame).is_err(), "chroma stride must cover a row");
+        assert!(
+            scaler.scale(&frame).is_err(),
+            "chroma stride must cover a row"
+        );
 
         // Same for the Yuv420P → Yuv420P path.
         let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 4, 2, PixelFormat::Yuv420P);
@@ -2657,9 +2676,15 @@ mod tests {
 
         // Yuv420P → Yuv420P with a *different* size goes through the resampling
         // path (a same-size pair is the documented no-op copy).
-        let scaler =
-            Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv420P, 2, 2, PixelFormat::Yuv420P))
-                .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Yuv420P,
+            2,
+            2,
+            PixelFormat::Yuv420P,
+        ))
+        .unwrap();
         let nv12 = make_nv12_frame(4, 4, 16, 128, 128);
         let err = scaler
             .scale(&nv12)
@@ -2674,9 +2699,15 @@ mod tests {
         let mut bgr = Frame::new_video(1, 1, PixelFormat::Bgr24);
         bgr.data = vec![vec![0, 0, 255]];
         bgr.linesize = vec![3];
-        let scaler =
-            Scaler::new(ScalerConfig::new(1, 1, PixelFormat::Rgb24, 1, 1, PixelFormat::Rgb24))
-                .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            1,
+            1,
+            PixelFormat::Rgb24,
+            1,
+            1,
+            PixelFormat::Rgb24,
+        ))
+        .unwrap();
         let err = scaler
             .scale(&bgr)
             .expect_err("identity path must validate the frame's own format");
@@ -2693,19 +2724,31 @@ mod tests {
 
     #[test]
     fn identity_path_rejects_overlapping_or_truncated_planes() {
-        let scaler =
-            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgb24))
-                .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            2,
+            2,
+            PixelFormat::Rgb24,
+            2,
+            2,
+            PixelFormat::Rgb24,
+        ))
+        .unwrap();
         // Overlapping rows (linesize 3 for a 6-byte row).
         let mut overlap = Frame::new_video(2, 2, PixelFormat::Rgb24);
         overlap.data = vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9]];
         overlap.linesize = vec![3];
-        assert!(scaler.scale(&overlap).is_err(), "short stride must be rejected");
+        assert!(
+            scaler.scale(&overlap).is_err(),
+            "short stride must be rejected"
+        );
 
         // Truncated plane.
         let mut truncated = Frame::new_video(2, 2, PixelFormat::Rgb24);
         truncated.data[0].truncate(5);
-        assert!(scaler.scale(&truncated).is_err(), "short plane must be rejected");
+        assert!(
+            scaler.scale(&truncated).is_err(),
+            "short plane must be rejected"
+        );
 
         // Zero-sized frame.
         let empty = Frame::new_video(0, 0, PixelFormat::Rgb24);
@@ -2725,7 +2768,11 @@ mod tests {
             }
         }
         Frame {
-            data: vec![y, vec![128u8; w.div_ceil(2) * h.div_ceil(2)], vec![128u8; w.div_ceil(2) * h.div_ceil(2)]],
+            data: vec![
+                y,
+                vec![128u8; w.div_ceil(2) * h.div_ceil(2)],
+                vec![128u8; w.div_ceil(2) * h.div_ceil(2)],
+            ],
             linesize: vec![w, w.div_ceil(2), w.div_ceil(2)],
             width: w,
             height: h,
@@ -2749,10 +2796,13 @@ mod tests {
         // configured method was ignored and both runs were byte-identical.
         let frame = luma_frame(8, 2, |x, _| if x < 4 { 16 } else { 235 });
         let cfg = ScalerConfig::new(8, 2, PixelFormat::Yuv420P, 16, 4, PixelFormat::Yuv420P);
-        let nearest = Scaler::new(cfg.clone().with_interpolation(InterpolationMethod::NearestNeighbor))
-            .unwrap()
-            .scale(&frame)
-            .unwrap();
+        let nearest = Scaler::new(
+            cfg.clone()
+                .with_interpolation(InterpolationMethod::NearestNeighbor),
+        )
+        .unwrap()
+        .scale(&frame)
+        .unwrap();
         let lanczos = Scaler::new(cfg.clone().with_interpolation(InterpolationMethod::Lanczos))
             .unwrap()
             .scale(&frame)
@@ -2789,7 +2839,10 @@ mod tests {
         let bicubic = run(InterpolationMethod::Bicubic);
         assert_ne!(nearest, bilinear, "bilinear must interpolate");
         assert_ne!(nearest, bicubic, "bicubic must interpolate");
-        assert_ne!(bilinear, bicubic, "bicubic and bilinear are different kernels");
+        assert_ne!(
+            bilinear, bicubic,
+            "bicubic and bilinear are different kernels"
+        );
     }
 
     #[test]
@@ -2823,12 +2876,19 @@ mod tests {
             InterpolationMethod::Spline,
             InterpolationMethod::Gaussian,
         ] {
-            assert!(!method.is_supported(), "{} should be unsupported", method.name());
+            assert!(
+                !method.is_supported(),
+                "{} should be unsupported",
+                method.name()
+            );
             let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 4, 2, PixelFormat::Yuv420P)
                 .with_interpolation(method);
             match Scaler::new(cfg) {
                 Err(RsError::Unsupported(msg)) => {
-                    assert!(msg.contains(method.name()), "message should name the method: {msg}")
+                    assert!(
+                        msg.contains(method.name()),
+                        "message should name the method: {msg}"
+                    )
                 }
                 Err(other) => panic!("expected Unsupported for {}, got {other}", method.name()),
                 Ok(_) => panic!("expected Unsupported for {}, got Ok", method.name()),
@@ -2843,7 +2903,11 @@ mod tests {
         ] {
             let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 4, 2, PixelFormat::Yuv420P)
                 .with_interpolation(method);
-            assert!(Scaler::new(cfg).is_ok(), "{} should construct", method.name());
+            assert!(
+                Scaler::new(cfg).is_ok(),
+                "{} should construct",
+                method.name()
+            );
         }
     }
 
@@ -2852,10 +2916,18 @@ mod tests {
         // Third review round: a 1x1 frame handed to a 2x2 scaler came back as
         // 1x1, silently violating the requested destination size.
         let rgb = Frame::new_video(1, 1, PixelFormat::Rgb24);
-        let scaler =
-            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgb24))
-                .unwrap();
-        let err = scaler.scale(&rgb).expect_err("geometry must match the config");
+        let scaler = Scaler::new(ScalerConfig::new(
+            2,
+            2,
+            PixelFormat::Rgb24,
+            2,
+            2,
+            PixelFormat::Rgb24,
+        ))
+        .unwrap();
+        let err = scaler
+            .scale(&rgb)
+            .expect_err("geometry must match the config");
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
 
         // A frame that does match still round-trips.
@@ -2869,13 +2941,24 @@ mod tests {
         // 16-bit formats need a 2-bytes-per-pixel stride; an 8-bit stride was
         // accepted and copied verbatim.
         let mut gray = Frame::new_video(2, 2, PixelFormat::Gray16);
-        assert_eq!(gray.linesize[0], 4, "Frame::new_video gives a 16-bit stride");
+        assert_eq!(
+            gray.linesize[0], 4,
+            "Frame::new_video gives a 16-bit stride"
+        );
         gray.linesize[0] = 2;
         gray.data[0].truncate(4);
-        let scaler =
-            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Gray16, 2, 2, PixelFormat::Gray16))
-                .unwrap();
-        let err = scaler.scale(&gray).expect_err("8-bit stride must be rejected");
+        let scaler = Scaler::new(ScalerConfig::new(
+            2,
+            2,
+            PixelFormat::Gray16,
+            2,
+            2,
+            PixelFormat::Gray16,
+        ))
+        .unwrap();
+        let err = scaler
+            .scale(&gray)
+            .expect_err("8-bit stride must be rejected");
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
 
         // The correctly sized frame is accepted.
@@ -2900,7 +2983,9 @@ mod tests {
             PixelFormat::Yuv420P10,
         ))
         .unwrap();
-        let err = scaler.scale(&frame).expect_err("chroma planes are required");
+        let err = scaler
+            .scale(&frame)
+            .expect_err("chroma planes are required");
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
 
         // 16-bit sample widths are enforced per plane, too.
@@ -2918,9 +3003,15 @@ mod tests {
         // count; for 1920x1080 RGB24 that is ~12.9e12 "bytes" and would reject a
         // perfectly valid frame (and overflow on 32-bit).
         let frame = Frame::new_video(1920, 1080, PixelFormat::Rgb24);
-        let scaler =
-            Scaler::new(ScalerConfig::new(1920, 1080, PixelFormat::Rgb24, 1920, 1080, PixelFormat::Rgb24))
-                .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            1920,
+            1080,
+            PixelFormat::Rgb24,
+            1920,
+            1080,
+            PixelFormat::Rgb24,
+        ))
+        .unwrap();
         let out = scaler.scale(&frame).expect("valid identity copy");
         assert_eq!(out.data[0].len(), 1920 * 1080 * 3);
     }
@@ -2932,28 +3023,72 @@ mod tests {
         // second review found unchecked.
         let huge = u32::MAX;
         let nv12 = make_nv12_frame(4, 4, 16, 128, 128);
-        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Nv12, huge, huge, PixelFormat::Rgba))
-            .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Nv12,
+            huge,
+            huge,
+            PixelFormat::Rgba,
+        ))
+        .unwrap();
         assert!(matches!(scaler.scale(&nv12), Err(RsError::InvalidData(_))));
 
         let rgb = make_nv12_frame(4, 4, 16, 128, 128);
-        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Nv12, huge, huge, PixelFormat::Rgb24))
-            .unwrap();
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Nv12,
+            huge,
+            huge,
+            PixelFormat::Rgb24,
+        ))
+        .unwrap();
         assert!(matches!(scaler.scale(&rgb), Err(RsError::InvalidData(_))));
 
         let yuv422 = make_yuv422p_frame(4, 4, 16, 128, 128);
-        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv422P, huge, huge, PixelFormat::Rgba))
-            .unwrap();
-        assert!(matches!(scaler.scale(&yuv422), Err(RsError::InvalidData(_))));
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Yuv422P,
+            huge,
+            huge,
+            PixelFormat::Rgba,
+        ))
+        .unwrap();
+        assert!(matches!(
+            scaler.scale(&yuv422),
+            Err(RsError::InvalidData(_))
+        ));
 
         let yuv420 = make_yuv420p_frame(4, 4, 16, 128, 128);
-        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv420P, huge, huge, PixelFormat::Bgr24))
-            .unwrap();
-        assert!(matches!(scaler.scale(&yuv420), Err(RsError::InvalidData(_))));
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Yuv420P,
+            huge,
+            huge,
+            PixelFormat::Bgr24,
+        ))
+        .unwrap();
+        assert!(matches!(
+            scaler.scale(&yuv420),
+            Err(RsError::InvalidData(_))
+        ));
 
-        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv420P, huge, huge, PixelFormat::Yuv420P))
-            .unwrap();
-        assert!(matches!(scaler.scale(&yuv420), Err(RsError::InvalidData(_))));
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Yuv420P,
+            huge,
+            huge,
+            PixelFormat::Yuv420P,
+        ))
+        .unwrap();
+        assert!(matches!(
+            scaler.scale(&yuv420),
+            Err(RsError::InvalidData(_))
+        ));
     }
 
     #[test]
@@ -2975,7 +3110,6 @@ mod tests {
             .expect_err("an unallocatable output size must be rejected");
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
     }
-
 
     #[test]
     fn yuv420p_to_rgb24_rejects_truncated_planes() {
@@ -3139,11 +3273,7 @@ mod review_sixth {
         // Nearest output must stay byte-identical to the historical integer
         // lookup, including non-integer upscales and downscales, so this fix
         // cannot shift anyone's default pipeline.
-        for (sw, sh, dw, dh) in [
-            (2usize, 2usize, 4usize, 2usize),
-            (5, 3, 7, 4),
-            (6, 4, 3, 2),
-        ] {
+        for (sw, sh, dw, dh) in [(2usize, 2usize, 4usize, 2usize), (5, 3, 7, 4), (6, 4, 3, 2)] {
             let mut frame = Frame::new_video(sw, sh, PixelFormat::Rgb24);
             frame.linesize = vec![sw * 3];
             frame.data = vec![(0..sw * sh * 3).map(|i| (i * 37 % 256) as u8).collect()];

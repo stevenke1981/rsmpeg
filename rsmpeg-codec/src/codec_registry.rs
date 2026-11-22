@@ -169,9 +169,7 @@ mod tests {
         // `register_builtin_codecs()` at any time (the registry is
         // process-global), so taking two guards and comparing could observe
         // two different states.
-        let guard = global_codec_registry()
-            .read()
-            .expect("codec registry lock");
+        let guard = global_codec_registry().read().expect("codec registry lock");
         // Both views must agree inside one guard snapshot.
         let listed = guard.list().len();
         assert_eq!(listed, guard.len(), "list() and len() must agree");

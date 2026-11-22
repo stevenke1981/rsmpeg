@@ -155,11 +155,7 @@ fn best_approximation(num: Wide, den: Wide) -> Option<Rational> {
     // fell back to the plain convergent `100003/99999` even though
     // `2147389420/2147303527` is representable and closer.
     let k_den = (max - q0) / q1.max(1);
-    let k_num = if p1 > 0 {
-        (max - p0) / p1
-    } else {
-        k_den
-    };
+    let k_num = if p1 > 0 { (max - p0) / p1 } else { k_den };
     let k = k_den.min(k_num);
     if k > 0 {
         let (p, q) = (p0 + k * p1, q0 + k * q1);
@@ -211,8 +207,6 @@ fn round_div(a: Wide, b: Wide) -> Wide {
     }
 }
 
-
-
 /// Like [`approximate_wide`] but for the infallible arithmetic operators: a
 /// zero denominator (from e.g. division by `0/1`) collapses to the canonical
 /// zero rather than panicking.
@@ -252,8 +246,6 @@ fn checked_wide(num: Wide, den: Wide) -> Option<Rational> {
         None
     }
 }
-
-
 
 impl Rational {
     /// Create a new rational number.
@@ -432,7 +424,11 @@ impl Rational {
         let num = self.num.unsigned_abs() as Wide;
         let den = self.den.unsigned_abs() as Wide;
         let g = gcd_wide(num as u128, den as u128) as Wide;
-        let (num, den) = if g > 1 { (num / g, den / g) } else { (num, den) };
+        let (num, den) = if g > 1 {
+            (num / g, den / g)
+        } else {
+            (num, den)
+        };
         let num = if negative { -num } else { num };
         from_wide(num, den)
     }
@@ -962,7 +958,10 @@ mod tests {
             Rational::new(-1, 2),
             "negative denominator must be flipped to positive"
         );
-        assert_eq!(Rational::new(30, 1001).normalized(), Rational::new(30, 1001));
+        assert_eq!(
+            Rational::new(30, 1001).normalized(),
+            Rational::new(30, 1001)
+        );
         assert_eq!(
             Rational::new(5, 0).normalized(),
             Rational::new(0, 1),
@@ -982,7 +981,9 @@ mod tests {
 
     #[test]
     fn timestamp_to_seconds_matches_manual_conversion() {
-        assert!((Rational::timestamp_to_seconds(90_000, Rational::new(1, 90_000)) - 1.0).abs() < 1e-9);
+        assert!(
+            (Rational::timestamp_to_seconds(90_000, Rational::new(1, 90_000)) - 1.0).abs() < 1e-9
+        );
         assert_eq!(Rational::timestamp_to_seconds(5, Rational::new(1, 0)), 0.0);
         assert_eq!(Rational::timestamp_to_seconds(0, Rational::new(1, 25)), 0.0);
     }
@@ -1148,11 +1149,22 @@ mod review_sixth {
             qs.extend([base - 2, base - 1, base, base + 1, max - 1, max]);
             qs.extend((base.saturating_sub(64)..=base + 64).filter(|q| *q >= 1));
             for q in qs {
-                for p in [round_div(num * q, den) - 1, round_div(num * q, den), round_div(num * q, den) + 1] {
+                for p in [
+                    round_div(num * q, den) - 1,
+                    round_div(num * q, den),
+                    round_div(num * q, den) + 1,
+                ] {
                     if p < 0 || p > max || q < 1 || q > max {
                         continue;
                     }
-                    let rival_error = scaled_error(num, den, Rational { num: p as i32, den: q as i32 });
+                    let rival_error = scaled_error(
+                        num,
+                        den,
+                        Rational {
+                            num: p as i32,
+                            den: q as i32,
+                        },
+                    );
                     assert!(
                         rival_error * (got.den as Wide) >= got_error * q,
                         "{num}/{den}: {p}/{q} (err {rival_error}) is closer than the \
