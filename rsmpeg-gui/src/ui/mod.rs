@@ -1,0 +1,502 @@
+//! Main GPUI view hosting the `rsmpeg-player` session, polling loop, and UI composition.
+
+pub mod stage;
+pub mod theme;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui::{
+    div, prelude::*, px, Context, ExternalPaths, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, RenderImage, Styled, Task, Window,
+};
+use rsmpeg_player::{Player, PlayerEvent};
+
+use crate::i18n::{strings, Locale, UiStrings};
+use crate::media_info::probe_file;
+use crate::playlist::{is_supported_media_extension, MEDIA_EXTENSIONS};
+use crate::state::{EventOutcome, PlaybackStatus, PlaybackUiState};
+use crate::video::build_render_image;
+
+const POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Root GPUI view for `rsmpeg-gui`.
+pub struct PlayerView {
+    pub(crate) state: PlaybackUiState,
+    locale: Locale,
+    focus_handle: FocusHandle,
+    player: Option<Player>,
+    current_frame: Option<Arc<RenderImage>>,
+    /// Incremented on each file load so stale background probes are ignored.
+    load_nonce: u64,
+    _poll_task: Task<()>,
+    probe_task: Option<Task<()>>,
+    dialog_task: Option<Task<()>>,
+}
+
+impl Focusable for PlayerView {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Drop for PlayerView {
+    fn drop(&mut self) {
+        if let Some(mut p) = self.player.take() {
+            let _ = p.shutdown();
+        }
+    }
+}
+
+impl PlayerView {
+    pub fn new(initial_files: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
+
+        let poll_task = cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(POLL_INTERVAL).await;
+            let res = this.update_in(cx, |view, window, cx| {
+                view.poll_player(window, cx);
+            });
+            if res.is_err() {
+                break;
+            }
+        });
+
+        let mut view = Self {
+            state: PlaybackUiState::new(),
+            locale: Locale::ZhTw,
+            focus_handle,
+            player: None,
+            current_frame: None,
+            load_nonce: 0,
+            _poll_task: poll_task,
+            probe_task: None,
+            dialog_task: None,
+        };
+
+        if !initial_files.is_empty() {
+            view.enqueue_and_play(initial_files, true, window, cx);
+        }
+
+        view
+    }
+
+    pub(crate) fn strings(&self) -> &'static UiStrings {
+        strings(self.locale)
+    }
+
+    pub(crate) fn focus_root(&self, window: &mut Window) {
+        self.focus_handle.focus(window);
+    }
+
+    pub(crate) fn dismiss_banner(&mut self, is_error: bool, cx: &mut Context<Self>) {
+        if is_error {
+            self.state.error_message = None;
+        } else {
+            self.state.warning_message = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.toggle_fullscreen();
+        self.state.is_fullscreen = window.is_fullscreen();
+        cx.notify();
+    }
+
+    /// Open a native multi-file picker off the UI thread and load/enqueue selected files.
+    pub fn open_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_dialog_inner(true, window, cx);
+    }
+
+    pub(crate) fn open_file_dialog_inner(
+        &mut self,
+        play_immediately: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let filter_label = self.strings().media_filter_label;
+        let dialog_title = self.strings().open_files_dialog_title;
+
+        self.dialog_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_title(dialog_title)
+                        .add_filter(filter_label, MEDIA_EXTENSIONS)
+                        .pick_files()
+                })
+                .await;
+
+            if let Some(paths) = picked {
+                if !paths.is_empty() {
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        view.enqueue_and_play(paths, play_immediately, window, cx);
+                    });
+                }
+            }
+        }));
+    }
+
+    /// Handle OS drag-and-drop onto the window.
+    pub(crate) fn handle_external_drop(
+        &mut self,
+        external: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut paths: Vec<PathBuf> = external
+            .paths()
+            .iter()
+            .filter(|p| p.is_file())
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        // Place recognized media files ahead of unrecognized dropped files.
+        paths.sort_by_key(|p| !is_supported_media_extension(p));
+        self.enqueue_and_play(paths, true, window, cx);
+    }
+
+    /// Add one or more paths to the playlist; optionally start playing the first added track.
+    pub(crate) fn enqueue_and_play(
+        &mut self,
+        paths: Vec<PathBuf>,
+        play_immediately: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_idle = self.state.playlist.current_item().is_none();
+        if let Some(first_idx) = self.state.playlist.add_paths(paths) {
+            if play_immediately || was_idle {
+                self.play_index(first_idx, window, cx);
+            } else {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Select a playlist index and start playback.
+    pub(crate) fn play_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.state.playlist.select(index).cloned() else {
+            return;
+        };
+        self.load_path(item.path, true, None, window, cx);
+    }
+
+    /// Open a media path through `rsmpeg-player` and probe metadata in the background.
+    pub(crate) fn load_path(
+        &mut self,
+        path: PathBuf,
+        autoplay: bool,
+        initial_seek: Option<Duration>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut prev) = self.player.take() {
+            let _ = prev.shutdown();
+        }
+        if let Some(old_img) = self.current_frame.take() {
+            let _ = window.drop_image(old_img);
+        }
+
+        self.load_nonce = self.load_nonce.wrapping_add(1);
+        let nonce = self.load_nonce;
+
+        self.state.begin_loading();
+
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| format!("{name} — {}", self.strings().app_title))
+            .unwrap_or_else(|| self.strings().app_title.to_string());
+        window.set_window_title(&title);
+
+        let probe_path = path.clone();
+        self.probe_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { probe_file(&probe_path) })
+                .await;
+
+            let _ = this.update_in(cx, |view, _window, cx| {
+                if view.load_nonce != nonce {
+                    return;
+                }
+                view.state.is_probing = false;
+                match result {
+                    Ok(mut info) => {
+                        if view.state.duration.is_zero() && !info.duration.is_zero() {
+                            view.state.duration = info.duration;
+                        } else {
+                            info.update_duration_if_missing(view.state.duration);
+                        }
+                        view.state.media_info = Some(info);
+                    }
+                    Err(err) => {
+                        if view.state.error_message.is_none() {
+                            view.state.warning_message = Some(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
+
+        match Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(true)
+            .volume(self.state.effective_volume())
+            .playback_rate(self.state.playback_rate)
+            .autoplay(autoplay)
+            .build()
+        {
+            Ok(mut player) => {
+                if let Some(target) = initial_seek {
+                    let _ = player.seek(target);
+                }
+                self.state.status = if autoplay {
+                    PlaybackStatus::Opening
+                } else {
+                    PlaybackStatus::Paused
+                };
+                self.player = Some(player);
+            }
+            Err(err) => {
+                self.state.status = PlaybackStatus::Error;
+                self.state.error_message =
+                    Some(format!("{}：{err}", self.strings().error_open_failed));
+            }
+        }
+
+        cx.notify();
+    }
+
+    /// Poll `rsmpeg-player` without blocking the UI thread and upload the newest RGBA frame.
+    fn poll_player(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let mut should_clear_player = false;
+        let mut auto_advance = false;
+
+        let fullscreen_now = window.is_fullscreen();
+        if fullscreen_now != self.state.is_fullscreen {
+            self.state.is_fullscreen = fullscreen_now;
+            changed = true;
+        }
+
+        if let Some(player) = self.player.as_mut() {
+            let (events, latest_frame) = player.poll_all();
+
+            for ev in &events {
+                changed = true;
+                match self.state.apply_player_event(ev) {
+                    EventOutcome::AutoAdvanceNext => {
+                        auto_advance = true;
+                        should_clear_player = true;
+                    }
+                    EventOutcome::None => {}
+                }
+                if matches!(ev, PlayerEvent::Ended { .. } | PlayerEvent::Error { .. }) {
+                    should_clear_player = true;
+                }
+            }
+
+            if let Some(frame_ev) = latest_frame {
+                changed = true;
+                self.state.apply_player_event(&frame_ev);
+                if let PlayerEvent::VideoFrame {
+                    width,
+                    height,
+                    rgba,
+                    ..
+                } = frame_ev
+                {
+                    if let Some(next_img) = build_render_image(width, height, &rgba) {
+                        if let Some(old_img) = self.current_frame.replace(next_img) {
+                            let _ = window.drop_image(old_img);
+                        }
+                    }
+                }
+            }
+        }
+
+        if should_clear_player {
+            if let Some(mut p) = self.player.take() {
+                let _ = p.shutdown();
+            }
+        }
+
+        if auto_advance {
+            if let Some(next_idx) = self.state.playlist.current_index().map(|i| i + 1) {
+                self.play_index(next_idx, window, cx);
+                return;
+            }
+        }
+
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn status_badge(&self) -> (&'static str, gpui::Rgba) {
+        let s = self.strings();
+        match self.state.status {
+            PlaybackStatus::Idle => (s.status_idle, theme::text_muted()),
+            PlaybackStatus::Opening => (s.status_opening, theme::accent()),
+            PlaybackStatus::Playing => (s.status_playing, theme::status_playing()),
+            PlaybackStatus::Paused => (s.status_paused, theme::status_paused()),
+            PlaybackStatus::Seeking => (s.status_seeking, theme::accent()),
+            PlaybackStatus::Stopped => (s.status_stopped, theme::text_muted()),
+            PlaybackStatus::Ended => (s.status_ended, theme::text_secondary()),
+            PlaybackStatus::Error => (s.status_error, theme::error_border()),
+        }
+    }
+
+    fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = self.strings();
+        let (status_label, status_color) = self.status_badge();
+        let track_title = self
+            .state
+            .playlist
+            .current_item()
+            .map(|it| it.display_name.clone())
+            .unwrap_or_else(|| s.no_file_loaded.to_string());
+
+        let resolution_chip = self.state.video_resolution.map(|(w, h)| format!("{w}×{h}"));
+
+        div()
+            .flex()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(44.0))
+            .px_4()
+            .gap_3()
+            .bg(theme::bg_surface())
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2p5()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(theme::accent_soft())
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::accent())
+                            .child("rsmpeg"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme::text_primary())
+                            .truncate()
+                            .child(track_title),
+                    )
+                    .when_some(resolution_chip, |el, res| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(theme::bg_elevated())
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(res),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(theme::bg_elevated())
+                            .child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(status_color))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_secondary())
+                                    .child(status_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("topbar-open-btn")
+                            .px_2p5()
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme::bg_elevated())
+                            .hover(|st| st.bg(theme::bg_hover()))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .text_xs()
+                            .text_color(theme::text_primary())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_file_dialog(window, cx);
+                            }))
+                            .child(s.open_short_btn),
+                    ),
+            )
+    }
+}
+
+impl Render for PlayerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = self.strings();
+        let stage_el = stage::render_stage(&self.state, self.current_frame.as_ref(), s, cx);
+
+        div()
+            .id("rsmpeg-root")
+            .track_focus(&self.focus_handle)
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme::bg_window())
+            .text_color(theme::text_primary())
+            .font_family(theme::UI_FONT_FAMILY)
+            .drag_over::<ExternalPaths>(|style, _, _, _| {
+                style.border_2().border_color(theme::accent())
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.handle_external_drop(paths, window, cx);
+            }))
+            .child(self.render_top_bar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(stage_el),
+            )
+    }
+}
