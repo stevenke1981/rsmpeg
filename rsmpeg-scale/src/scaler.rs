@@ -192,14 +192,19 @@ impl Scaler {
                 // labelled `Bgr24` — the caller then feeds blue where red is
                 // expected, and nothing downstream can notice.
                 Self::require_source_format(frame, src)?;
+                // The fast path only applies to a frame whose geometry already
+                // matches the configured source. A 1×1 frame handed to a 2×2
+                // scaler used to come back as 1×1 while the caller believes it
+                // asked for 2×2.
+                Self::validate_source_geometry(frame, &self.config)?;
                 // Validate the planes too: an identity copy of an overlapping
                 // or truncated plane set hands the corruption straight on.
                 Self::validate_source_planes(frame, src)?;
-                Self::validate_output_size(
-                    self.config.dst_width as usize,
-                    self.config.dst_height as usize,
-                    frame.data.first().map(|p| p.len()).unwrap_or(0).max(1),
-                )?;
+                // The output *is* the input, so its size is bounded by the actual
+                // plane lengths. Estimating as "first plane length × pixel count"
+                // was nonsense (1920×1080 RGB24 → 12.9e12 "bytes") and rejected
+                // valid frames on 32-bit targets.
+                Self::validate_identity_capacity(frame)?;
                 Ok(clone_frame_metadata(
                     frame,
                     frame.data.clone(),
@@ -286,6 +291,48 @@ impl Scaler {
         Ok(())
     }
 
+    /// Check that `frame`'s own dimensions equal the configured source size.
+    ///
+    /// The identity path returns the frame untouched, so a mismatched geometry
+    /// would silently hand back the wrong resolution.
+    fn validate_source_geometry(frame: &Frame, config: &ScalerConfig) -> RsResult<()> {
+        let (want_w, want_h) = (config.src_width as usize, config.src_height as usize);
+        if frame.width != want_w || frame.height != want_h {
+            return Err(RsError::InvalidData(
+                format!(
+                    "scale: source frame is {}x{} but the scaler is configured for {want_w}x{want_h}",
+                    frame.width, frame.height
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate that the planes an identity copy would move are addressable.
+    ///
+    /// Checks each plane's real length (and the total against `isize::MAX`)
+    /// instead of multiplying a plane length by a pixel count.
+    fn validate_identity_capacity(frame: &Frame) -> RsResult<()> {
+        let mut total: usize = 0;
+        for (i, plane) in frame.data.iter().enumerate() {
+            if plane.len() > isize::MAX as usize {
+                return Err(RsError::InvalidData(
+                    format!("scale: plane {i} is larger than an addressable buffer").into(),
+                ));
+            }
+            total = total
+                .checked_add(plane.len())
+                .filter(|t| *t <= isize::MAX as usize)
+                .ok_or_else(|| {
+                    RsError::InvalidData(
+                        "scale: identity copy would exceed the maximum addressable buffer".into(),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     /// Check that the destination frame of `width × height × bytes_per_sample` can be
     /// allocated without overflowing `usize`.
     fn validate_output_size(width: usize, height: usize, bytes_per_pixel: usize) -> RsResult<()> {
@@ -330,11 +377,27 @@ impl Scaler {
                 "scale: source frame has zero width or height".into(),
             ));
         }
+        // Bytes per sample: 10/12-bit and 16-bit formats store one sample in a
+        // 16-bit word, so their strides are twice the pixel count. Treating them
+        // as 8-bit accepted a half-width plane and copied it verbatim.
+        let bps = |format: PixelFormat| -> usize {
+            match format {
+                PixelFormat::Gray16
+                | PixelFormat::Yuv420P10
+                | PixelFormat::Yuv420P12 => 2,
+                _ => 1,
+            }
+        };
         let layouts: Vec<(usize, usize, usize, &'static str)> = match format {
             PixelFormat::Yuv420P => vec![
                 (w, h, 1, "Y"),
                 (w.div_ceil(2), h.div_ceil(2), 1, "U"),
                 (w.div_ceil(2), h.div_ceil(2), 1, "V"),
+            ],
+            PixelFormat::Yuv420P10 | PixelFormat::Yuv420P12 => vec![
+                (w, h, 2, "Y"),
+                (w.div_ceil(2), h.div_ceil(2), 2, "U"),
+                (w.div_ceil(2), h.div_ceil(2), 2, "V"),
             ],
             PixelFormat::Yuv422P => vec![
                 (w, h, 1, "Y"),
@@ -347,7 +410,11 @@ impl Scaler {
             }
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => vec![(w, h, 3, "packed")],
             PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => vec![(w, h, 4, "packed")],
-            _ => vec![(w, h, 1, "plane")],
+            PixelFormat::Gray8 => vec![(w, h, 1, "Y")],
+            PixelFormat::Gray16 => vec![(w, h, 2, "Y")],
+            // Unknown layout: require at least one 8-bit plane of the full size
+            // rather than silently accepting anything.
+            PixelFormat::None => vec![(w, h, bps(format), "plane")],
         };
         if frame.data.len() < layouts.len() || frame.linesize.len() < layouts.len() {
             return Err(RsError::InvalidData(
@@ -359,18 +426,19 @@ impl Scaler {
                 .into(),
             ));
         }
-        for (i, (pw, ph, bps, name)) in layouts.into_iter().enumerate() {
+        for (i, (pw, ph, bpp, name)) in layouts.into_iter().enumerate() {
             Self::validate_plane(
                 &frame.data[i],
                 frame.linesize[i],
                 pw,
                 ph,
-                bps,
+                bpp,
                 &format!("{format:?} {name}"),
             )?;
         }
         Ok(())
     }
+
 
     fn validate_yuv420p_planes<'a>(
         &self,
@@ -2212,6 +2280,84 @@ mod tests {
         // Correct frame still passes through.
         let ok = Frame::new_video(2, 2, PixelFormat::Rgb24);
         assert!(scaler.scale(&ok).is_ok());
+    }
+
+    #[test]
+    fn review_identity_rejects_mismatched_geometry() {
+        // Third review round: a 1x1 frame handed to a 2x2 scaler came back as
+        // 1x1, silently violating the requested destination size.
+        let rgb = Frame::new_video(1, 1, PixelFormat::Rgb24);
+        let scaler =
+            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgb24))
+                .unwrap();
+        let err = scaler.scale(&rgb).expect_err("geometry must match the config");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+
+        // A frame that does match still round-trips.
+        let ok = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        let out = scaler.scale(&ok).unwrap();
+        assert_eq!((out.width, out.height), (2, 2));
+    }
+
+    #[test]
+    fn review_gray16_identity_rejects_an_eight_bit_stride() {
+        // 16-bit formats need a 2-bytes-per-pixel stride; an 8-bit stride was
+        // accepted and copied verbatim.
+        let mut gray = Frame::new_video(2, 2, PixelFormat::Gray16);
+        assert_eq!(gray.linesize[0], 4, "Frame::new_video gives a 16-bit stride");
+        gray.linesize[0] = 2;
+        gray.data[0].truncate(4);
+        let scaler =
+            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Gray16, 2, 2, PixelFormat::Gray16))
+                .unwrap();
+        let err = scaler.scale(&gray).expect_err("8-bit stride must be rejected");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+
+        // The correctly sized frame is accepted.
+        let good = Frame::new_video(2, 2, PixelFormat::Gray16);
+        assert!(scaler.scale(&good).is_ok());
+    }
+
+    #[test]
+    fn review_high_depth_yuv_identity_requires_chroma_planes() {
+        // 10/12-bit YUV is planar: a frame carrying only luma must be rejected
+        // instead of being passed through as a "valid" 1-plane image.
+        let mut frame = Frame::new_video(4, 2, PixelFormat::Yuv420P10);
+        assert_eq!(frame.data.len(), 3);
+        frame.data.truncate(1);
+        frame.linesize.truncate(1);
+        let scaler = Scaler::new(ScalerConfig::new(
+            4,
+            2,
+            PixelFormat::Yuv420P10,
+            4,
+            2,
+            PixelFormat::Yuv420P10,
+        ))
+        .unwrap();
+        let err = scaler.scale(&frame).expect_err("chroma planes are required");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+
+        // 16-bit sample widths are enforced per plane, too.
+        let mut narrow = Frame::new_video(4, 2, PixelFormat::Yuv420P10);
+        narrow.linesize[0] = 4; // needs 8 bytes for 4 16-bit samples
+        assert!(scaler.scale(&narrow).is_err());
+
+        let good = Frame::new_video(4, 2, PixelFormat::Yuv420P10);
+        assert!(scaler.scale(&good).is_ok());
+    }
+
+    #[test]
+    fn identity_capacity_uses_real_plane_lengths() {
+        // The old estimate multiplied the first plane's length by the pixel
+        // count; for 1920x1080 RGB24 that is ~12.9e12 "bytes" and would reject a
+        // perfectly valid frame (and overflow on 32-bit).
+        let frame = Frame::new_video(1920, 1080, PixelFormat::Rgb24);
+        let scaler =
+            Scaler::new(ScalerConfig::new(1920, 1080, PixelFormat::Rgb24, 1920, 1080, PixelFormat::Rgb24))
+                .unwrap();
+        let out = scaler.scale(&frame).expect("valid identity copy");
+        assert_eq!(out.data[0].len(), 1920 * 1080 * 3);
     }
 
     #[test]
