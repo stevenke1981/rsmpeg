@@ -6,9 +6,9 @@ use gpui::{
 };
 
 use crate::format_time::{
-    format_bitrate, format_channels, format_duration, format_file_size, format_sample_rate,
+    format_bitrate, format_channels_for, format_duration, format_file_size, format_sample_rate,
 };
-use crate::i18n::UiStrings;
+use crate::i18n::{Locale, UiStrings};
 use crate::media_info::{MediaInfo, StreamMediaKind, StreamSummary};
 use crate::state::{PlaybackUiState, SidePanel};
 use crate::ui::{theme, PlayerView};
@@ -158,7 +158,7 @@ fn render_media_info_content(
     let stream_cards: Vec<AnyElement> = info
         .streams
         .iter()
-        .map(|st| render_stream_card(st, state.video_resolution, strings))
+        .map(|st| render_stream_card(st, state.video_resolution, state.locale, strings))
         .collect();
 
     div()
@@ -233,6 +233,7 @@ fn render_media_info_content(
 fn render_stream_card(
     stream: &StreamSummary,
     decoded_video_res: Option<(usize, usize)>,
+    locale: Locale,
     strings: &UiStrings,
 ) -> AnyElement {
     let kind_label = match stream.kind {
@@ -318,7 +319,10 @@ fn render_stream_card(
         card = card.child(info_row(strings.info_sample_rate, format_sample_rate(sr)));
     }
     if let Some(ch) = stream.channels {
-        card = card.child(info_row(strings.info_channels, format_channels(ch)));
+        card = card.child(info_row(
+            strings.info_channels,
+            format_channels_for(locale, ch),
+        ));
     }
     if let Some(ref sf) = stream.sample_format {
         card = card.child(info_row(strings.info_sample_format, sf.clone()));

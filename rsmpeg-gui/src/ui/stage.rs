@@ -7,7 +7,7 @@ use gpui::{
     ObjectFit, ParentElement, RenderImage, Styled,
 };
 
-use crate::format_time::{format_channels, format_sample_rate};
+use crate::format_time::{format_channels_for, format_sample_rate};
 use crate::i18n::UiStrings;
 use crate::state::{PlaybackStatus, PlaybackUiState};
 use crate::ui::{theme, PlayerView};
@@ -328,7 +328,7 @@ fn build_audio_detail_line(state: &PlaybackUiState, strings: &UiStrings) -> Stri
             parts.push(format_sample_rate(sr));
         }
         if let Some(ch) = audio.channels {
-            parts.push(format_channels(ch));
+            parts.push(format_channels_for(state.locale, ch));
         }
     }
     if parts.is_empty() {

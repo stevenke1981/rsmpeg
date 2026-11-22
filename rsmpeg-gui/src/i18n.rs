@@ -1,13 +1,33 @@
 //! Centralized UI strings for `rsmpeg-gui`.
 //!
-//! All user-visible copy lives here so adding another language (e.g. `en-US`)
-//! only requires adding a new `UiStrings` constant without touching view code.
+//! All user-visible copy lives here with both Traditional Chinese (`zh-TW`)
+//! and English (`en-US`) tables so switching locales updates the entire UI
+//! without touching view layout code.
 
 /// Supported UI locales.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Locale {
     #[default]
     ZhTw,
+    EnUs,
+}
+
+impl Locale {
+    /// Toggle between Traditional Chinese and English.
+    pub const fn toggle(self) -> Self {
+        match self {
+            Self::ZhTw => Self::EnUs,
+            Self::EnUs => Self::ZhTw,
+        }
+    }
+
+    /// Compact badge text displayed on the top-bar language toggle button.
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::ZhTw => "繁中",
+            Self::EnUs => "EN",
+        }
+    }
 }
 
 /// Complete table of UI labels, tooltips, and status messages.
@@ -195,10 +215,99 @@ pub const ZH_TW: UiStrings = UiStrings {
     shortcuts_hint: "空白鍵 播放/暫停 · ←/→ 5秒 · ↑/↓ 音量 · F 全螢幕 · M 靜音 · O 開檔",
 };
 
+/// English (United States) localization table.
+pub const EN_US: UiStrings = UiStrings {
+    app_title: "rsmpeg Player",
+    app_subtitle: "Pure Rust Multimedia Player & Inspector",
+
+    welcome_title: "Open a Media File",
+    welcome_hint: "Drag & drop video or audio files here, or click below to browse (Key: O)",
+    open_file_btn: "Open Media File",
+    open_files_dialog_title: "Select Media Files",
+    media_filter_label: "Media Files",
+    drop_overlay_title: "Drop to Add & Play",
+    drop_overlay_hint: "Supports MP4, MKV, AVI, MOV, WAV, FLAC, MP3, OGG, M4A",
+
+    play: "Play",
+    pause: "Pause",
+    stop: "Stop",
+    prev_track: "Prev",
+    next_track: "Next",
+    mute: "Mute",
+    unmute: "Unmute",
+    volume: "Volume",
+    speed: "Speed",
+    fullscreen_enter: "Fullscreen",
+    fullscreen_exit: "Exit Fullscreen",
+    track_video_btn: "Video",
+    track_audio_btn: "Audio",
+    track_menu_video_title: "Select Video Track",
+    track_menu_audio_title: "Select Audio Track",
+    track_none: "No tracks available",
+    track_unsupported: "Unsupported",
+    info_panel_btn: "Media Info",
+    playlist_panel_btn: "Playlist",
+    open_short_btn: "Open",
+
+    status_idle: "Idle",
+    status_opening: "Opening…",
+    status_playing: "Playing",
+    status_paused: "Paused",
+    status_seeking: "Seeking…",
+    status_stopped: "Stopped",
+    status_ended: "Ended",
+    status_error: "Error",
+
+    audio_only_badge: "Audio Only",
+    loading_video: "Decoding video…",
+    no_file_loaded: "No file loaded",
+
+    info_panel_title: "Media Info",
+    info_empty: "Open a media file to inspect container and stream details.",
+    info_probing: "Probing container…",
+    info_section_container: "Container Overview",
+    info_section_streams: "Streams",
+    info_file_name: "File Name",
+    info_container: "Container",
+    info_file_size: "File Size",
+    info_duration: "Duration",
+    info_bitrate: "Bitrate",
+    info_stream_count: "Streams",
+    info_codec: "Codec",
+    info_resolution: "Resolution",
+    info_frame_rate: "Frame Rate",
+    info_pixel_format: "Pixel Format",
+    info_sample_rate: "Sample Rate",
+    info_channels: "Channels",
+    info_sample_format: "Sample Format",
+    info_unknown: "Unknown",
+    stream_video: "Video",
+    stream_audio: "Audio",
+    stream_subtitle: "Subtitle",
+    stream_data: "Data",
+    stream_other: "Other",
+
+    playlist_title: "Playlist",
+    playlist_empty: "Playlist is empty. Open or drop multiple files to queue them.",
+    playlist_add: "Add Files",
+    playlist_clear: "Clear",
+    playlist_remove: "Remove",
+    playlist_now_playing: "Now Playing",
+
+    error_title: "Unable to Play File",
+    warning_title: "Playback Notice",
+    dismiss: "Dismiss",
+    error_open_failed: "Failed to open file",
+    error_unsupported_or_corrupt: "Unsupported format or corrupted file",
+
+    shortcuts_hint: "Space Play/Pause · ←/→ ±5s · ↑/↓ Volume · F Fullscreen · M Mute · O Open",
+};
+
 /// Retrieve the active locale's string table.
 pub const fn strings(locale: Locale) -> &'static UiStrings {
     match locale {
         Locale::ZhTw => &ZH_TW,
+        Locale::EnUs => &EN_US,
     }
 }
 
@@ -207,13 +316,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zh_tw_strings_are_non_empty() {
-        let s = strings(Locale::ZhTw);
-        assert!(!s.app_title.is_empty());
-        assert!(!s.open_file_btn.is_empty());
-        assert!(!s.info_panel_title.is_empty());
-        assert!(!s.playlist_title.is_empty());
-        assert!(!s.error_title.is_empty());
-        assert!(!s.shortcuts_hint.is_empty());
+    fn both_locales_have_non_empty_strings_and_toggle_cleanly() {
+        for locale in [Locale::ZhTw, Locale::EnUs] {
+            let s = strings(locale);
+            assert!(!s.app_title.is_empty());
+            assert!(!s.open_file_btn.is_empty());
+            assert!(!s.track_video_btn.is_empty());
+            assert!(!s.track_audio_btn.is_empty());
+            assert!(!s.info_panel_title.is_empty());
+            assert!(!s.playlist_title.is_empty());
+            assert!(!s.error_title.is_empty());
+            assert!(!s.shortcuts_hint.is_empty());
+        }
+
+        assert_ne!(
+            strings(Locale::ZhTw).app_title,
+            strings(Locale::EnUs).app_title
+        );
+        assert_eq!(Locale::ZhTw.toggle(), Locale::EnUs);
+        assert_eq!(Locale::EnUs.toggle(), Locale::ZhTw);
+        assert_eq!(Locale::ZhTw.short_label(), "繁中");
+        assert_eq!(Locale::EnUs.short_label(), "EN");
     }
 }

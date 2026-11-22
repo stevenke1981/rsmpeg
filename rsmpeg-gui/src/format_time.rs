@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::i18n::Locale;
+
 /// Format a [`Duration`] as `MM:SS` (or `HH:MM:SS` when >= 1 hour).
 pub fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
@@ -51,13 +53,28 @@ pub fn format_sample_rate(hz: u32) -> String {
 
 /// Format channel count in Traditional Chinese.
 pub fn format_channels(channels: u16) -> String {
-    match channels {
-        0 => "-".to_string(),
-        1 => "單聲道 (1)".to_string(),
-        2 => "立體聲 (2)".to_string(),
-        6 => "5.1 環繞 (6)".to_string(),
-        8 => "7.1 環繞 (8)".to_string(),
-        n => format!("{n} 聲道"),
+    format_channels_for(Locale::ZhTw, channels)
+}
+
+/// Format channel count localized for the active [`Locale`].
+pub fn format_channels_for(locale: Locale, channels: u16) -> String {
+    match locale {
+        Locale::ZhTw => match channels {
+            0 => "-".to_string(),
+            1 => "單聲道 (1)".to_string(),
+            2 => "立體聲 (2)".to_string(),
+            6 => "5.1 環繞 (6)".to_string(),
+            8 => "7.1 環繞 (8)".to_string(),
+            n => format!("{n} 聲道"),
+        },
+        Locale::EnUs => match channels {
+            0 => "-".to_string(),
+            1 => "Mono (1)".to_string(),
+            2 => "Stereo (2)".to_string(),
+            6 => "5.1 Surround (6)".to_string(),
+            8 => "7.1 Surround (8)".to_string(),
+            n => format!("{n} ch"),
+        },
     }
 }
 
@@ -138,6 +155,10 @@ mod tests {
         assert_eq!(format_channels(2), "立體聲 (2)");
         assert_eq!(format_channels(6), "5.1 環繞 (6)");
         assert_eq!(format_channels(4), "4 聲道");
+        assert_eq!(format_channels_for(Locale::EnUs, 1), "Mono (1)");
+        assert_eq!(format_channels_for(Locale::EnUs, 2), "Stereo (2)");
+        assert_eq!(format_channels_for(Locale::EnUs, 6), "5.1 Surround (6)");
+        assert_eq!(format_channels_for(Locale::EnUs, 4), "4 ch");
 
         assert_eq!(format_file_size(512), "512 B");
         assert_eq!(format_file_size(2048), "2.0 KB");

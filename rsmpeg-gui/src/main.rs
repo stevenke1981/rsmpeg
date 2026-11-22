@@ -13,8 +13,19 @@ use rsmpeg_gui::ui::PlayerView;
 #[derive(Debug, Parser)]
 #[command(name = "rsmpeg-gui", version, about = "rsmpeg GPUI 桌面影音播放器")]
 struct Cli {
+    /// 介面語言（zh 或 en）
+    #[arg(long, default_value = "zh")]
+    lang: String,
     /// 啟動時載入並加入播放清單的媒體檔案
     files: Vec<PathBuf>,
+}
+
+fn parse_locale(lang: &str) -> Locale {
+    if lang.to_ascii_lowercase().starts_with("en") {
+        Locale::EnUs
+    } else {
+        Locale::ZhTw
+    }
 }
 
 fn main() {
@@ -30,7 +41,8 @@ fn main() {
     rsmpeg::codec::codec_registry::register_builtin_codecs();
 
     let cli = Cli::parse();
-    let app_title = strings(Locale::ZhTw).app_title;
+    let initial_locale = parse_locale(&cli.lang);
+    let app_title = strings(initial_locale).app_title;
 
     Application::new().run(move |cx: &mut App| {
         cx.on_window_closed(|cx| {
@@ -55,7 +67,9 @@ fn main() {
                 show: true,
                 ..Default::default()
             },
-            move |window, cx| cx.new(|cx| PlayerView::new(initial_files, window, cx)),
+            move |window, cx| {
+                cx.new(|cx| PlayerView::new(initial_files, initial_locale, window, cx))
+            },
         )
         .expect("failed to open rsmpeg-gui window");
 

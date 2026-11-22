@@ -10,7 +10,7 @@ use gpui::{
 
 use crate::format_time::{format_duration, format_rate, format_volume_percent};
 use crate::i18n::UiStrings;
-use crate::state::{format_track_label, PlaybackStatus, PlaybackUiState, TrackMenu};
+use crate::state::{format_track_label_for, PlaybackStatus, PlaybackUiState, TrackMenu};
 use crate::ui::{theme, PlayerView};
 
 /// Render the full bottom playback control deck.
@@ -548,7 +548,7 @@ pub fn render_track_menu_popover(
             .iter()
             .map(|track| {
                 let is_active = active_idx == Some(track.index);
-                let label = format_track_label(track, strings.track_unsupported);
+                let label = format_track_label_for(state.locale, track, strings.track_unsupported);
                 let lang_chip = track.language.as_deref().map(str::to_ascii_uppercase);
                 let track_index = track.index;
                 let supported = track.supported;

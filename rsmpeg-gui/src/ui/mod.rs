@@ -33,7 +33,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// Root GPUI view for `rsmpeg-gui`.
 pub struct PlayerView {
     pub(crate) state: PlaybackUiState,
-    locale: Locale,
     focus_handle: FocusHandle,
     player: Option<Player>,
     current_frame: Option<Arc<RenderImage>>,
@@ -62,7 +61,12 @@ impl Drop for PlayerView {
 }
 
 impl PlayerView {
-    pub fn new(initial_files: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        initial_files: Vec<PathBuf>,
+        initial_locale: Locale,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
 
@@ -76,9 +80,11 @@ impl PlayerView {
             }
         });
 
+        let mut state = PlaybackUiState::new();
+        state.set_locale(initial_locale);
+
         let mut view = Self {
-            state: PlaybackUiState::new(),
-            locale: Locale::ZhTw,
+            state,
             focus_handle,
             player: None,
             current_frame: None,
@@ -99,7 +105,23 @@ impl PlayerView {
     }
 
     pub(crate) fn strings(&self) -> &'static UiStrings {
-        strings(self.locale)
+        strings(self.state.locale)
+    }
+
+    pub(crate) fn toggle_locale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.toggle_locale();
+        self.sync_window_title(window);
+        cx.notify();
+    }
+
+    fn sync_window_title(&self, window: &mut Window) {
+        let title = self
+            .state
+            .playlist
+            .current_item()
+            .map(|it| format!("{} — {}", it.display_name, self.strings().app_title))
+            .unwrap_or_else(|| self.strings().app_title.to_string());
+        window.set_window_title(&title);
     }
 
     pub(crate) fn focus_root(&self, window: &mut Window) {
@@ -108,9 +130,9 @@ impl PlayerView {
 
     pub(crate) fn dismiss_banner(&mut self, is_error: bool, cx: &mut Context<Self>) {
         if is_error {
-            self.state.error_message = None;
+            self.state.clear_error();
         } else {
-            self.state.warning_message = None;
+            self.state.clear_warning();
         }
         cx.notify();
     }
@@ -407,8 +429,8 @@ impl PlayerView {
         self.state.audio_tracks.clear();
         self.state.active_video_track = None;
         self.state.active_audio_track = None;
-        self.state.error_message = None;
-        self.state.warning_message = None;
+        self.state.clear_error();
+        self.state.clear_warning();
         self.state.is_probing = false;
         self.state.reset_waveform();
         window.set_window_title(self.strings().app_title);
@@ -470,6 +492,7 @@ impl PlayerView {
                     cx.notify();
                 }
             }
+            ShortcutAction::ToggleLocale => self.toggle_locale(window, cx),
             ShortcutAction::SpeedDown => self.step_playback_rate(false, cx),
             ShortcutAction::SpeedUp => self.step_playback_rate(true, cx),
         }
@@ -905,6 +928,26 @@ impl PlayerView {
                                 s.playlist_panel_btn,
                                 self.state.playlist.len()
                             )),
+                    )
+                    .child(
+                        div()
+                            .id("topbar-locale-btn")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(theme::bg_elevated())
+                            .hover(|st| st.bg(theme::bg_hover()))
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .font_family(theme::MONO_FONT_FAMILY)
+                            .text_xs()
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.focus_root(window);
+                                this.toggle_locale(window, cx);
+                            }))
+                            .child(self.state.locale.short_label()),
                     )
                     .child(
                         div()

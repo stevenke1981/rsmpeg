@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use rsmpeg_player::{PlayerEvent, PlayerTrackInfo, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 
-use crate::format_time::{format_channels, format_sample_rate};
+use crate::format_time::{format_channels_for, format_sample_rate};
+use crate::i18n::Locale;
 use crate::media_info::MediaInfo;
 use crate::playlist::Playlist;
 
@@ -61,6 +62,7 @@ pub enum EventOutcome {
 /// Complete headless UI state for the media player.
 #[derive(Debug, Clone)]
 pub struct PlaybackUiState {
+    pub locale: Locale,
     pub status: PlaybackStatus,
     pub position: Duration,
     pub duration: Duration,
@@ -79,6 +81,8 @@ pub struct PlaybackUiState {
     pub video_resolution: Option<(usize, usize)>,
     pub error_message: Option<String>,
     pub warning_message: Option<String>,
+    raw_error_message: Option<String>,
+    raw_warning_message: Option<String>,
     pub active_panel: SidePanel,
     pub open_track_menu: TrackMenu,
     pub video_tracks: Vec<PlayerTrackInfo>,
@@ -100,6 +104,7 @@ impl Default for PlaybackUiState {
 impl PlaybackUiState {
     pub fn new() -> Self {
         Self {
+            locale: Locale::ZhTw,
             status: PlaybackStatus::Idle,
             position: Duration::ZERO,
             duration: Duration::ZERO,
@@ -117,6 +122,8 @@ impl PlaybackUiState {
             video_resolution: None,
             error_message: None,
             warning_message: None,
+            raw_error_message: None,
+            raw_warning_message: None,
             active_panel: SidePanel::None,
             open_track_menu: TrackMenu::None,
             video_tracks: Vec::new(),
@@ -142,6 +149,8 @@ impl PlaybackUiState {
         self.video_resolution = None;
         self.error_message = None;
         self.warning_message = None;
+        self.raw_error_message = None;
+        self.raw_warning_message = None;
         self.media_info = None;
         self.open_track_menu = TrackMenu::None;
         self.video_tracks.clear();
@@ -313,6 +322,33 @@ impl PlaybackUiState {
         }
     }
 
+    /// Toggle active UI locale and re-localize any active error/warning banners.
+    pub fn toggle_locale(&mut self) -> Locale {
+        self.set_locale(self.locale.toggle());
+        self.locale
+    }
+
+    /// Switch UI locale explicitly and refresh localized banners.
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
+        if let Some(ref raw) = self.raw_error_message {
+            self.error_message = Some(localize_player_error_for(locale, raw));
+        }
+        if let Some(ref raw) = self.raw_warning_message {
+            self.warning_message = Some(localize_player_warning_for(locale, raw));
+        }
+    }
+
+    pub fn clear_error(&mut self) {
+        self.error_message = None;
+        self.raw_error_message = None;
+    }
+
+    pub fn clear_warning(&mut self) {
+        self.warning_message = None;
+        self.raw_warning_message = None;
+    }
+
     /// Whether the stage should show the audio-only visualizer instead of video.
     pub fn is_audio_only_stage(&self) -> bool {
         if self.has_video_frame {
@@ -390,7 +426,8 @@ impl PlaybackUiState {
             }
             PlayerEvent::Error { message, .. } => {
                 self.status = PlaybackStatus::Error;
-                self.error_message = Some(localize_player_error(message));
+                self.raw_error_message = Some(message.clone());
+                self.error_message = Some(localize_player_error_for(self.locale, message));
                 EventOutcome::None
             }
             PlayerEvent::Warning { message, .. } => {
@@ -403,7 +440,8 @@ impl PlaybackUiState {
                 if !message.starts_with("using native demux")
                     && !message.starts_with("native pipeline unavailable")
                 {
-                    self.warning_message = Some(localize_player_warning(message));
+                    self.raw_warning_message = Some(message.clone());
+                    self.warning_message = Some(localize_player_warning_for(self.locale, message));
                 }
                 EventOutcome::None
             }
@@ -459,45 +497,95 @@ pub fn compute_aspect_fit(src_w: f32, src_h: f32, dst_w: f32, dst_h: f32) -> (f3
 
 /// Convert raw engine errors into clear Traditional Chinese messages while preserving technical detail.
 pub fn localize_player_error(raw: &str) -> String {
+    localize_player_error_for(Locale::ZhTw, raw)
+}
+
+/// Convert raw engine errors into localized messages for the given [`Locale`].
+pub fn localize_player_error_for(locale: Locale, raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("no such file")
+    let is_not_found = lower.contains("no such file")
         || lower.contains("cannot find the file")
         || lower.contains("not found")
-        || lower.contains("os error 2")
-    {
-        format!("找不到指定的媒體檔案（{raw}）")
-    } else if lower.contains("unsupported")
+        || lower.contains("os error 2");
+    let is_unsupported = lower.contains("unsupported")
         || lower.contains("no playable")
-        || lower.contains("no tracks")
-    {
-        format!("不支援此媒體格式或無可播放串流（{raw}）")
-    } else if lower.contains("eof")
+        || lower.contains("no tracks");
+    let is_corrupt = lower.contains("eof")
         || lower.contains("end of stream")
         || lower.contains("corrupt")
         || lower.contains("invalid")
-        || lower.contains("malformed")
-    {
-        format!("檔案格式無效或已損毀（{raw}）")
-    } else {
-        format!("播放失敗：{raw}")
+        || lower.contains("malformed");
+
+    match locale {
+        Locale::ZhTw => {
+            if is_not_found {
+                format!("找不到指定的媒體檔案（{raw}）")
+            } else if is_unsupported {
+                format!("不支援此媒體格式或無可播放串流（{raw}）")
+            } else if is_corrupt {
+                format!("檔案格式無效或已損毀（{raw}）")
+            } else {
+                format!("播放失敗：{raw}")
+            }
+        }
+        Locale::EnUs => {
+            if is_not_found {
+                format!("Media file not found ({raw})")
+            } else if is_unsupported {
+                format!("Unsupported media format or no playable streams ({raw})")
+            } else if is_corrupt {
+                format!("Invalid or corrupted media file ({raw})")
+            } else {
+                format!("Playback failed: {raw}")
+            }
+        }
     }
 }
 
 /// Format non-fatal engine warnings into user-friendly Traditional Chinese text.
 pub fn localize_player_warning(raw: &str) -> String {
-    if raw.contains("Unsupported video codec") {
-        format!("視訊編碼不受支援，已改以純音訊模式播放（{raw}）")
-    } else if raw.contains("failed to open Symphonia audio decoder") {
-        format!("音訊解碼初始化失敗，目前僅播放視訊（{raw}）")
-    } else if raw.contains("audio muted") {
-        format!("音訊解碼器不可用，將以靜音模式播放（{raw}）")
-    } else {
-        raw.to_string()
+    localize_player_warning_for(Locale::ZhTw, raw)
+}
+
+/// Format non-fatal engine warnings for the given [`Locale`].
+pub fn localize_player_warning_for(locale: Locale, raw: &str) -> String {
+    match locale {
+        Locale::ZhTw => {
+            if raw.contains("Unsupported video codec") {
+                format!("視訊編碼不受支援，已改以純音訊模式播放（{raw}）")
+            } else if raw.contains("failed to open Symphonia audio decoder") {
+                format!("音訊解碼初始化失敗，目前僅播放視訊（{raw}）")
+            } else if raw.contains("audio muted") {
+                format!("音訊解碼器不可用，將以靜音模式播放（{raw}）")
+            } else {
+                raw.to_string()
+            }
+        }
+        Locale::EnUs => {
+            if raw.contains("Unsupported video codec") {
+                format!("Unsupported video codec; continuing in audio-only mode ({raw})")
+            } else if raw.contains("failed to open Symphonia audio decoder") {
+                format!("Audio decoder failed to initialize; playing video only ({raw})")
+            } else if raw.contains("audio muted") {
+                format!("No audio decoder available; playing muted ({raw})")
+            } else {
+                raw.to_string()
+            }
+        }
     }
 }
 
-/// Format a human-readable track label for dropdown menus.
+/// Format a human-readable track label for dropdown menus (defaults to `zh-TW`).
 pub fn format_track_label(track: &PlayerTrackInfo, unsupported_label: &str) -> String {
+    format_track_label_for(Locale::ZhTw, track, unsupported_label)
+}
+
+/// Format a human-readable track label localized for `locale`.
+pub fn format_track_label_for(
+    locale: Locale,
+    track: &PlayerTrackInfo,
+    unsupported_label: &str,
+) -> String {
     let mut parts = vec![
         format!("#{}", track.index),
         track.codec.to_ascii_uppercase(),
@@ -511,7 +599,7 @@ pub fn format_track_label(track: &PlayerTrackInfo, unsupported_label: &str) -> S
             parts.push(format_sample_rate(sr));
         }
         if let Some(ch) = track.channels {
-            parts.push(format_channels(ch));
+            parts.push(format_channels_for(locale, ch));
         }
     }
     if !track.supported {
@@ -823,5 +911,20 @@ mod tests {
         assert_eq!(st.open_track_menu, TrackMenu::Video);
         st.toggle_track_menu(TrackMenu::Video);
         assert_eq!(st.open_track_menu, TrackMenu::None);
+
+        // Verify EN_US track formatting and live error re-localization on toggle_locale.
+        assert_eq!(
+            format_track_label_for(Locale::EnUs, &audio, "Unsupported"),
+            "#2 · AAC · 48.0 kHz · Stereo (2)"
+        );
+        st.apply_player_event(&PlayerEvent::Error {
+            message: "end of stream".into(),
+            generation: 1,
+        });
+        assert!(st.error_message.as_deref().unwrap().contains("損毀"));
+        assert_eq!(st.toggle_locale(), Locale::EnUs);
+        assert!(st.error_message.as_deref().unwrap().contains("corrupted"));
+        assert_eq!(st.toggle_locale(), Locale::ZhTw);
+        assert!(st.error_message.as_deref().unwrap().contains("損毀"));
     }
 }
