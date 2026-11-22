@@ -869,7 +869,15 @@ impl Scaler {
         )
     }
 
-    /// `Rgb24` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
+    /// `Rgb24` → `Rgba`, rescaling with the configured interpolation kernel.
+    ///
+    /// The three colour channels are split into 8-bit planes, resampled with the
+    /// same [`resample_plane`] code that drives every other path, and
+    /// interleaved back into RGBA. Previously this path hard-coded the
+    /// nearest-neighbour `floor(d*s/t)` lookup, so a `Bilinear`/`Bicubic`/
+    /// `Lanczos` configuration changed nothing: a 2×2 black/white RGB24 frame
+    /// widened to 4×2 came back as `[0,0,255,255]` for every kernel. Nearest
+    /// still maps `floor(d*s/t)`, so its output remains byte-identical.
     fn scale_rgb24_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
         // Rejecting the mismatch matters: a `Bgr24` frame fed to an `Rgb24`
         // scaler produced a perfectly plausible RGBA image with red and blue
@@ -904,17 +912,33 @@ impl Scaler {
 
         let out_stride = dst_w * 4;
         let mut out = vec![0u8; out_stride * dst_h];
+
+        // Split the interleaved RGB into three 8-bit planes so the shared kernel
+        // code can resample each channel independently, then interleave RGBA.
+        let method = self.config.interpolation;
+        let mut planes: [Vec<u8>; 3] = [vec![0u8; use_w * use_h], vec![0u8; use_w * use_h], vec![0u8; use_w * use_h]];
+        for sy in 0..use_h {
+            let row = sy * src_stride;
+            for sx in 0..use_w {
+                let s = row + sx * 3;
+                let i = sy * use_w + sx;
+                planes[0][i] = src[s];
+                planes[1][i] = src[s + 1];
+                planes[2][i] = src[s + 2];
+            }
+        }
+        let mut resampled = Vec::with_capacity(3);
+        for plane in &planes {
+            resampled.push(resample_plane(plane, use_w, use_w, use_h, dst_w, dst_h, method));
+        }
+
         for dy in 0..dst_h {
-            let sy = (dy as u64 * use_h as u64 / dst_h as u64) as usize;
-            let sy = sy.min(use_h - 1);
             for dx in 0..dst_w {
-                let sx = (dx as u64 * use_w as u64 / dst_w as u64) as usize;
-                let sx = sx.min(use_w - 1);
-                let s = sy * src_stride + sx * 3;
+                let i = dy * dst_w + dx;
                 let d = dy * out_stride + dx * 4;
-                out[d] = src[s];
-                out[d + 1] = src[s + 1];
-                out[d + 2] = src[s + 2];
+                out[d] = resampled[0][i];
+                out[d + 1] = resampled[1][i];
+                out[d + 2] = resampled[2][i];
                 out[d + 3] = 255;
             }
         }
@@ -2962,5 +2986,171 @@ mod tests {
         // Left output column comes from a black source pixel, right from white.
         assert!(out.data[0][0] < 16, "left R={}", out.data[0][0]);
         assert!(out.data[0][4] > 240, "right R={}", out.data[0][4]);
+    }
+}
+
+/// Sixth review round: the neighbouring cases the reviewer added around the
+/// fifth-round fixes, kept as regression tests.
+#[cfg(test)]
+mod review_sixth {
+    use super::*;
+
+    /// The reviewer's RGBA helper: scale `frame` to `width × frame.height`.
+    fn scaled_rgba(frame: &Frame, method: InterpolationMethod, width: u32) -> Frame {
+        let cfg = ScalerConfig::new(
+            frame.width as u32,
+            frame.height as u32,
+            frame.pixel_format,
+            width,
+            frame.height as u32,
+            PixelFormat::Rgba,
+        )
+        .with_interpolation(method);
+        Scaler::new(cfg).unwrap().scale(frame).unwrap()
+    }
+
+    fn red_row(frame: &Frame) -> Vec<u8> {
+        frame.data[0][..frame.width * 4]
+            .chunks_exact(4)
+            .map(|p| p[0])
+            .collect()
+    }
+
+    fn black_white_rgb24() -> Frame {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        frame.data = vec![vec![0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]];
+        frame.linesize = vec![6];
+        frame
+    }
+
+    #[test]
+    fn rgb24_to_rgba_bilinear_has_intermediate_pixels() {
+        // Sixth review P1-1: a 2×2 black/white RGB24 frame widened to 4×2 came
+        // back as [0,0,255,255] for *every* kernel, because this path was a
+        // hard-coded integer nearest neighbour. Bilinear must interpolate.
+        let frame = black_white_rgb24();
+        let near = red_row(&scaled_rgba(
+            &frame,
+            InterpolationMethod::NearestNeighbor,
+            4,
+        ));
+        let bilinear = red_row(&scaled_rgba(&frame, InterpolationMethod::Bilinear, 4));
+        assert_eq!(
+            near,
+            vec![0, 0, 255, 255],
+            "nearest must keep the floor(d*s/t) mapping"
+        );
+        assert_ne!(near, bilinear, "RGB24 output must not ignore the kernel");
+        assert!(
+            bilinear[1] > 0 && bilinear[2] < 255,
+            "bilinear must produce intermediate pixels, got {bilinear:?}"
+        );
+    }
+
+    #[test]
+    fn every_supported_kernel_reaches_rgb24_output() {
+        // The same defect one kernel wider: nearest/bilinear/bicubic/lanczos
+        // must all be distinct on an RGB24 source, so no kernel can silently
+        // alias the integer path again.
+        let frame = black_white_rgb24();
+        let cfg = ScalerConfig::new(2, 2, PixelFormat::Rgb24, 8, 2, PixelFormat::Rgba);
+        let row = |method| {
+            Scaler::new(cfg.clone().with_interpolation(method))
+                .unwrap()
+                .scale(&frame)
+                .map(|f| red_row(&f))
+                .unwrap()
+        };
+        let nearest = row(InterpolationMethod::NearestNeighbor);
+        let bilinear = row(InterpolationMethod::Bilinear);
+        let bicubic = row(InterpolationMethod::Bicubic);
+        let lanczos = row(InterpolationMethod::Lanczos);
+        assert_ne!(nearest, bilinear);
+        assert_ne!(nearest, bicubic);
+        assert_ne!(nearest, lanczos);
+        assert_ne!(bilinear, lanczos, "bilinear and lanczos must differ");
+        assert_eq!(
+            nearest,
+            vec![0u8, 0, 0, 0, 255, 255, 255, 255],
+            "nearest keeps four source pixels per column pair"
+        );
+        for row in [&bilinear, &bicubic, &lanczos] {
+            assert!(row[0] <= 2, "left edge must stay black: {row:?}");
+            assert!(row[7] >= 253, "right edge must stay white: {row:?}");
+            assert!(
+                row.windows(2).all(|w| w[1] >= w[0]),
+                "a black→white ramp must stay monotonic: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rgb24_to_rgba_nearest_keeps_the_legacy_pixels() {
+        // Nearest output must stay byte-identical to the historical integer
+        // lookup, including non-integer upscales and downscales, so this fix
+        // cannot shift anyone's default pipeline.
+        for (sw, sh, dw, dh) in [
+            (2usize, 2usize, 4usize, 2usize),
+            (5, 3, 7, 4),
+            (6, 4, 3, 2),
+        ] {
+            let mut frame = Frame::new_video(sw, sh, PixelFormat::Rgb24);
+            frame.linesize = vec![sw * 3];
+            frame.data = vec![(0..sw * sh * 3).map(|i| (i * 37 % 256) as u8).collect()];
+            let cfg = ScalerConfig::new(
+                sw as u32,
+                sh as u32,
+                PixelFormat::Rgb24,
+                dw as u32,
+                dh as u32,
+                PixelFormat::Rgba,
+            )
+            .with_interpolation(InterpolationMethod::NearestNeighbor);
+            let out = Scaler::new(cfg).unwrap().scale(&frame).unwrap();
+            for dy in 0..dh {
+                let sy = (dy * sh / dh).min(sh - 1);
+                for dx in 0..dw {
+                    let sx = (dx * sw / dw).min(sw - 1);
+                    let s = (sy * sw + sx) * 3;
+                    let d = (dy * dw + dx) * 4;
+                    assert_eq!(
+                        &out.data[0][d..d + 4],
+                        &[
+                            frame.data[0][s],
+                            frame.data[0][s + 1],
+                            frame.data[0][s + 2],
+                            255
+                        ],
+                        "{sw}x{sh}->{dw}x{dh} at ({dx},{dy})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nv12_packed_bilinear_has_intermediate_pixels() {
+        // Sixth review neighbour (already passing, kept as a guard).
+        let mut nv12 = Frame::new_video(2, 2, PixelFormat::Nv12);
+        nv12.data = vec![vec![16, 235, 16, 235], vec![128, 128]];
+        nv12.linesize = vec![2, 2];
+        let near = red_row(&scaled_rgba(&nv12, InterpolationMethod::NearestNeighbor, 4));
+        let bilinear = red_row(&scaled_rgba(&nv12, InterpolationMethod::Bilinear, 4));
+        assert_eq!(near, vec![0, 0, 255, 255]);
+        assert_ne!(near, bilinear);
+        assert!(bilinear[1] > 0 && bilinear[2] < 255, "got {bilinear:?}");
+    }
+
+    #[test]
+    fn yuv422p_packed_lanczos_has_intermediate_pixels() {
+        // Sixth review neighbour (already passing, kept as a guard).
+        let mut y422 = Frame::new_video(2, 2, PixelFormat::Yuv422P);
+        y422.data = vec![vec![16, 235, 16, 235], vec![128, 128], vec![128, 128]];
+        y422.linesize = vec![2, 1, 1];
+        let near = red_row(&scaled_rgba(&y422, InterpolationMethod::NearestNeighbor, 4));
+        let lanczos = red_row(&scaled_rgba(&y422, InterpolationMethod::Lanczos, 4));
+        assert_eq!(near, vec![0, 0, 255, 255]);
+        assert_ne!(near, lanczos);
+        assert!(lanczos[1] > 0 && lanczos[2] < 255, "got {lanczos:?}");
     }
 }
