@@ -174,9 +174,10 @@ impl Scaler {
     ///
     /// Dimension changes are performed with the kernel named by
     /// [`ScalerConfig::interpolation`] — `nearest`, `bilinear`, `bicubic` or
-    /// `lanczos` (see [`InterpolationMethod::is_supported`]). The
-    /// `Yuv420P → Yuv420P` path resamples all three planes with that kernel;
-    /// the packed-output paths use it for the luma sampling as well.
+    /// `lanczos` (see [`InterpolationMethod::is_supported`]). Every resize path
+    /// honours it: `Yuv420P → Yuv420P` resamples all three planes, and each
+    /// packed-output path (`Yuv420P`/`Nv12`/`Yuv422P` → `Rgba`/`Rgb24`/`Bgr24`)
+    /// resamples its planes before the colour conversion.
     /// Returns a new frame with correctly sized packed planes.
     pub fn scale(&self, frame: &Frame) -> RsResult<Frame> {
         tracing::debug!(
@@ -531,57 +532,101 @@ impl Scaler {
 
     fn scale_yuv420p_to_packed(&self, frame: &Frame, bpp: usize) -> RsResult<Frame> {
         Self::require_source_format(frame, PixelFormat::Yuv420P)?;
-        let src_w = self.source_width();
-        let src_h = self.source_height();
-        let dst_w = self.config.dst_width as usize;
-        let dst_h = self.config.dst_height as usize;
-
-        // Prefer configured size; fall back to frame metadata when they match.
-        let (use_w, use_h) = if frame.width == src_w && frame.height == src_h {
-            (src_w, src_h)
-        } else if frame.width > 0 && frame.height > 0 {
-            // Allow slight mismatch if the frame carries the true size.
-            (frame.width, frame.height)
-        } else {
-            (src_w, src_h)
-        };
+        let (use_w, use_h) = self.source_geometry(frame);
+        let use_w = use_w.max(1);
+        let use_h = use_h.max(1);
 
         let (y_plane, u_plane, v_plane, y_stride, u_stride, v_stride) =
             self.validate_yuv420p_planes(frame, use_w, use_h)?;
 
-        let limited = self.color.src_range == ColorRange::Limited;
         // `bpp == 0` selects packed BGR24, which has the same 3-byte stride as RGB24
         // but a different byte order.
         let bgr = bpp == 0;
         let bytes_per_pixel = if bgr { 3 } else { bpp };
+        self.yuv_planes_to_packed(
+            frame,
+            y_plane,
+            y_stride,
+            u_plane,
+            u_stride,
+            v_plane,
+            v_stride,
+            use_w,
+            use_h,
+            2,
+            bytes_per_pixel,
+            bgr,
+        )
+    }
+
+    /// Convert planar 8-bit YUV planes into packed RGB(A), honouring the
+    /// configured interpolation kernel.
+    ///
+    /// `chroma_step` is 2 for 4:2:0 (NV12, YUV420P) and 1 for 4:2:2 (YUV422P),
+    /// i.e. the vertical subsampling factor. Chroma is always half-width.
+    ///
+    /// Each of the three planes is resampled with
+    /// [`ScalerConfig::interpolation`] before conversion, which is what makes a
+    /// `Bilinear`/`Bicubic`/`Lanczos` configuration actually change the packed
+    /// output. Previously this path was a hard-coded nearest-neighbour lookup:
+    /// the kernel setting was silently ignored for every packed destination, so
+    /// a caller asking for bilinear got blocky nearest-neighbour edges with no
+    /// way to tell. Nearest-neighbour still maps `floor(d*s/t)`, so existing
+    /// nearest output is byte-identical.
+    #[allow(clippy::too_many_arguments)]
+    fn yuv_planes_to_packed(
+        &self,
+        frame: &Frame,
+        y_plane: &[u8],
+        y_stride: usize,
+        u_plane: &[u8],
+        u_stride: usize,
+        v_plane: &[u8],
+        v_stride: usize,
+        src_w: usize,
+        src_h: usize,
+        chroma_step: usize,
+        bytes_per_pixel: usize,
+        bgr: bool,
+    ) -> RsResult<Frame> {
+        let dst_w = self.config.dst_width as usize;
+        let dst_h = self.config.dst_height as usize;
         Self::validate_output_size(dst_w, dst_h, bytes_per_pixel)?;
-        let mut out = vec![0u8; dst_w * dst_h * bytes_per_pixel];
+
+        let method = self.config.interpolation;
+        let src_cw = src_w.div_ceil(2);
+        let src_ch = if chroma_step > 1 {
+            src_h.div_ceil(2)
+        } else {
+            src_h
+        };
+        let dst_cw = dst_w.div_ceil(2);
+        let dst_ch = if chroma_step > 1 {
+            dst_h.div_ceil(2)
+        } else {
+            dst_h
+        };
+
+        // Resample first, convert second: the planes stay 8-bit so the same
+        // kernel code that drives the planar paths is reused verbatim.
+        let y_out = resample_plane(y_plane, y_stride, src_w, src_h, dst_w, dst_h, method);
+        let u_out = resample_plane(u_plane, u_stride, src_cw, src_ch, dst_cw, dst_ch, method);
+        let v_out = resample_plane(v_plane, v_stride, src_cw, src_ch, dst_cw, dst_ch, method);
+
+        let limited = self.color.src_range == ColorRange::Limited;
         let out_stride = dst_w * bytes_per_pixel;
-        let src_w_safe = use_w.max(1);
-        let src_h_safe = use_h.max(1);
+        let mut out = vec![0u8; out_stride * dst_h];
+        let last_cx = dst_cw.saturating_sub(1);
+        let last_cy = dst_ch.saturating_sub(1);
 
-        // Nearest-neighbor map destination → source.
         for dy in 0..dst_h {
-            let sy = if dst_h == src_h_safe {
-                dy
-            } else {
-                (dy as u64 * src_h_safe as u64 / dst_h as u64) as usize
-            };
-            let sy = sy.min(src_h_safe - 1);
-            let cy = sy / 2;
-
+            // One chroma sample covers `chroma_step` luma rows and 2 columns.
+            let cy = if chroma_step > 1 { dy / 2 } else { dy }.min(last_cy);
             for dx in 0..dst_w {
-                let sx = if dst_w == src_w_safe {
-                    dx
-                } else {
-                    (dx as u64 * src_w_safe as u64 / dst_w as u64) as usize
-                };
-                let sx = sx.min(src_w_safe - 1);
-                let cx = sx / 2;
-
-                let y = y_plane[sy * y_stride + sx];
-                let u = u_plane[cy * u_stride + cx];
-                let v = v_plane[cy * v_stride + cx];
+                let cx = (dx / 2).min(last_cx);
+                let y = y_out[dy * dst_w + dx];
+                let u = u_out[cy * dst_cw + cx];
+                let v = v_out[cy * dst_cw + cx];
 
                 let (r, g, b) = yuv_to_rgb_bt601(y, u, v, limited);
                 let off = dy * out_stride + dx * bytes_per_pixel;
@@ -657,17 +702,17 @@ impl Scaler {
         result
     }
 
-    /// `Nv12` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
+    /// `Nv12` → `Rgba`, rescaling with the configured interpolation kernel.
     fn scale_nv12_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
         self.scale_semi_planar_to_packed(frame, PixelFormat::Nv12, 2, true, true)
     }
 
-    /// `Nv12` → `Rgb24`, optionally rescaling with nearest-neighbor sampling.
+    /// `Nv12` → `Rgb24`, rescaling with the configured interpolation kernel.
     fn scale_nv12_to_rgb24(&self, frame: &Frame) -> RsResult<Frame> {
         self.scale_semi_planar_to_packed(frame, PixelFormat::Nv12, 2, false, true)
     }
 
-    /// `Yuv422P` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
+    /// `Yuv422P` → `Rgba`, rescaling with the configured interpolation kernel.
     fn scale_yuv422p_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
         self.scale_semi_planar_to_packed(frame, PixelFormat::Yuv422P, 3, true, false)
     }
@@ -692,8 +737,6 @@ impl Scaler {
         }
 
         let (use_w, use_h) = self.source_geometry(frame);
-        let dst_w = self.config.dst_width as usize;
-        let dst_h = self.config.dst_height as usize;
         let use_w = use_w.max(1);
         let use_h = use_h.max(1);
 
@@ -779,46 +822,51 @@ impl Scaler {
             frame.linesize[2]
         };
 
-        // BT.601 limited range, matching the Yuv420P paths.
-        let limited = self.color.src_range == ColorRange::Limited;
         let bpp = if alpha { 4 } else { 3 };
-        // Same destination check as the other output paths: `dst_w * bpp` can
-        // overflow `usize` for a caller-supplied destination size.
-        Self::validate_output_size(dst_w, dst_h, bpp)?;
-        let out_stride = dst_w * bpp;
-        let mut out = vec![0u8; out_stride * dst_h];
 
-        for dy in 0..dst_h {
-            let sy = (dy as u64 * use_h as u64 / dst_h as u64) as usize;
-            let sy = sy.min(use_h - 1);
-            let cy = if interleaved_uv { sy / 2 } else { sy };
-            for dx in 0..dst_w {
-                let sx = (dx as u64 * use_w as u64 / dst_w as u64) as usize;
-                let sx = sx.min(use_w - 1);
-                let cx = sx / 2;
-
-                let yv = y_plane[sy * y_stride + sx];
-                let (u, v) = if interleaved_uv {
-                    (
-                        uv_plane[cy * uv_stride + cx * 2],
-                        uv_plane[cy * uv_stride + cx * 2 + 1],
-                    )
-                } else {
-                    (uv_plane[cy * uv_stride + cx], v_plane[cy * v_stride + cx])
-                };
-
-                let (r, g, b) = yuv_to_rgb_bt601(yv, u, v, limited);
-                let off = dy * out_stride + dx * bpp;
-                out[off] = r;
-                out[off + 1] = g;
-                out[off + 2] = b;
-                if alpha {
-                    out[off + 3] = 255;
+        // NV12 interleaves U and V in one plane, so it cannot go straight to the
+        // planar converter: split it first, then share the kernel-driven path.
+        // (`Yuv422P` is already planar and needs no copy.)
+        if interleaved_uv {
+            let mut u_dense = Vec::with_capacity(chroma_w * chroma_h);
+            let mut v_dense = Vec::with_capacity(chroma_w * chroma_h);
+            for row in 0..chroma_h {
+                let base = row * uv_stride;
+                for col in 0..chroma_w {
+                    u_dense.push(uv_plane[base + col * 2]);
+                    v_dense.push(uv_plane[base + col * 2 + 1]);
                 }
             }
+            return self.yuv_planes_to_packed(
+                frame,
+                &frame.data[0],
+                y_stride,
+                &u_dense,
+                chroma_w,
+                &v_dense,
+                chroma_w,
+                use_w,
+                use_h,
+                2,
+                bpp,
+                false,
+            );
         }
 
-        Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h))
+        self.yuv_planes_to_packed(
+            frame,
+            &frame.data[0],
+            y_stride,
+            uv_plane,
+            uv_stride,
+            v_plane,
+            v_stride,
+            use_w,
+            use_h,
+            1,
+            bpp,
+            false,
+        )
     }
 
     /// `Rgb24` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
@@ -2247,6 +2295,170 @@ mod tests {
         let frame = make_yuv420p_frame(4, 4, 16, 128, 128);
         let err = scaler.scale(&frame).unwrap_err();
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+    }
+
+    // ── Packed output must honour the configured kernel ──────────────────
+    //
+    // Fifth review P1: every packed destination used a hard-coded
+    // nearest-neighbour lookup, so a `Bilinear` configuration produced identical
+    // (blocky) output. `Scaler::scale`'s documentation promised the selected
+    // kernel for the luma sampling, so the setting was silently ignored.
+
+    /// A 2×2 Yuv420P frame whose luma alternates black and white per column,
+    /// the reviewer's fixture for exposing interpolation.
+    fn black_white_columns() -> Frame {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        frame.data = vec![vec![16, 235, 16, 235], vec![128], vec![128]];
+        frame.linesize = vec![2, 1, 1];
+        frame
+    }
+
+    /// Sample the red channel of the first `dst_w` pixels of a packed frame.
+    fn red_row(frame: &Frame, dst_w: usize, bpp: usize) -> Vec<u8> {
+        frame.data[0][..dst_w * bpp]
+            .chunks_exact(bpp)
+            .map(|px| px[0])
+            .collect()
+    }
+
+    #[test]
+    fn review_packed_yuv420p_bilinear_interpolates_luma() {
+        // The reviewer's exact reproduction: 2×2 Yuv420P → 4×2 Rgba. Nearest
+        // returns the two source columns duplicated (`[0,0,255,255]`); bilinear
+        // must produce genuinely interpolated pixels in between.
+        let frame = black_white_columns();
+        let cfg = ScalerConfig::new(2, 2, PixelFormat::Yuv420P, 4, 2, PixelFormat::Rgba);
+        let scale = |method| {
+            Scaler::new(cfg.clone().with_interpolation(method))
+                .unwrap()
+                .scale(&frame)
+                .unwrap()
+        };
+        let nearest = red_row(&scale(InterpolationMethod::NearestNeighbor), 4, 4);
+        let bilinear = red_row(&scale(InterpolationMethod::Bilinear), 4, 4);
+
+        assert_eq!(
+            nearest,
+            vec![0, 0, 255, 255],
+            "nearest must keep the historical floor(d*s/t) mapping"
+        );
+        assert_ne!(
+            nearest, bilinear,
+            "packed output must not ignore the configured kernel"
+        );
+        assert!(
+            bilinear[1] > 0 && bilinear[2] < 255,
+            "bilinear must interpolate between the source columns, got {bilinear:?}"
+        );
+    }
+
+    #[test]
+    fn review_packed_rgb24_and_bgr24_bilinear_interpolate_luma() {
+        // Rgb24/Bgr24 share the same 3-byte packed path through a different
+        // channel order; both must resample with the selected kernel.
+        let frame = black_white_columns();
+        for (format, red_at, blue_at) in [
+            (PixelFormat::Rgb24, 0usize, 2usize),
+            (PixelFormat::Bgr24, 2, 0),
+        ] {
+            let cfg = ScalerConfig::new(2, 2, PixelFormat::Yuv420P, 4, 2, format);
+            let scale = |method| {
+                Scaler::new(cfg.clone().with_interpolation(method))
+                    .unwrap()
+                    .scale(&frame)
+                    .unwrap()
+            };
+            let nearest = scale(InterpolationMethod::NearestNeighbor);
+            let bilinear = scale(InterpolationMethod::Bilinear);
+            let pick = |f: &Frame, at: usize| -> Vec<u8> {
+                f.data[0][..12].chunks_exact(3).map(|px| px[at]).collect()
+            };
+            assert_eq!(pick(&nearest, red_at), vec![0, 0, 255, 255], "{format:?}");
+            let interpolated = pick(&bilinear, red_at);
+            assert!(
+                interpolated[1] > 0 && interpolated[2] < 255,
+                "{format:?} bilinear must interpolate luma, got {interpolated:?}"
+            );
+            // The opposite channel slot carries the same ramp (a black→white
+            // luma ramp has equal R and B), so the two formats stay
+            // distinguishable by *which* slot holds it.
+            assert_eq!(
+                pick(&bilinear, blue_at),
+                interpolated,
+                "{format:?} must keep its channel order"
+            );
+        }
+    }
+
+    #[test]
+    fn review_packed_nv12_and_yuv422p_bilinear_interpolate_luma() {
+        // The semi-planar/4:2:2 packed paths had the same hard-coded nearest
+        // lookup. NV12 is de-interleaved into planar chroma first, Yuv422P is
+        // already planar, and both then share the kernel-driven converter.
+        let nv12 = {
+            let mut f = Frame::new_video(2, 2, PixelFormat::Nv12);
+            f.data = vec![vec![16, 235, 16, 235], vec![128, 128]];
+            f.linesize = vec![2, 2];
+            f
+        };
+        let yuv422p = {
+            let mut f = Frame::new_video(2, 2, PixelFormat::Yuv422P);
+            f.data = vec![vec![16, 235, 16, 235], vec![128, 128], vec![128, 128]];
+            f.linesize = vec![2, 1, 1];
+            f
+        };
+
+        for (frame, format) in [
+            (nv12, PixelFormat::Nv12),
+            (yuv422p, PixelFormat::Yuv422P),
+        ] {
+            let cfg = ScalerConfig::new(2, 2, format, 4, 2, PixelFormat::Rgba);
+            let scale = |method| {
+                Scaler::new(cfg.clone().with_interpolation(method))
+                    .unwrap()
+                    .scale(&frame)
+                    .unwrap()
+            };
+            let nearest = red_row(&scale(InterpolationMethod::NearestNeighbor), 4, 4);
+            let bilinear = red_row(&scale(InterpolationMethod::Bilinear), 4, 4);
+            assert_eq!(nearest, vec![0, 0, 255, 255], "{format:?} nearest");
+            assert!(
+                bilinear[1] > 0 && bilinear[2] < 255,
+                "{format:?} bilinear must interpolate luma, got {bilinear:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_packed_lanczos_differs_from_bilinear_and_nearest() {
+        // Each supported kernel must actually select a different filter; a
+        // switch that fell through to one implementation would make these equal.
+        let frame = black_white_columns();
+        let cfg = ScalerConfig::new(2, 2, PixelFormat::Yuv420P, 8, 2, PixelFormat::Rgba);
+        let row = |method| {
+            Scaler::new(cfg.clone().with_interpolation(method))
+                .unwrap()
+                .scale(&frame)
+                .map(|f| red_row(&f, 8, 4))
+                .unwrap()
+        };
+        let nearest = row(InterpolationMethod::NearestNeighbor);
+        let bilinear = row(InterpolationMethod::Bilinear);
+        let bicubic = row(InterpolationMethod::Bicubic);
+        let lanczos = row(InterpolationMethod::Lanczos);
+        assert_ne!(nearest, bilinear);
+        assert_ne!(nearest, bicubic);
+        assert_ne!(nearest, lanczos);
+        assert_ne!(bilinear, lanczos, "bilinear and lanczos must differ");
+        // Every kernel must stay inside the 8-bit range and keep the endpoints.
+        for row in [&bilinear, &bicubic, &lanczos] {
+            assert!(row[0] <= 2, "left edge must stay black: {row:?}");
+            assert!(row[7] >= 253, "right edge must stay white: {row:?}");
+            assert!(
+                row.windows(2).all(|w| w[1] >= w[0]),
+                "a black→white ramp must stay monotonic: {row:?}"
+            );
+        }
     }
 
     #[test]
