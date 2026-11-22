@@ -394,8 +394,19 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
                 .get(ei + 1)
                 .map(|e| e.0.max(1) as usize - 1)
                 .unwrap_or(chunk_count);
+            // `first_chunk` is attacker-controlled: clamp both ends and bail out
+            // when the range is inverted instead of panicking on a slice index.
             let end = next_first.min(chunk_count);
-            for slot in &mut samples_per_chunk[first..end] {
+            let Some(range) = samples_per_chunk.get_mut(first..end) else {
+                tracing::warn!(
+                    "MP4: stsc entry {} has out-of-range first_chunk {} (chunks={})",
+                    ei,
+                    entry.0,
+                    chunk_count
+                );
+                continue;
+            };
+            for slot in range {
                 *slot = entry.1;
             }
         }
@@ -439,12 +450,14 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
         let dts_i = *dts_list.get(i).unwrap_or(&0);
         let pts_i = dts_i.saturating_add(*ctts_offsets.get(i).unwrap_or(&0) as i64);
         samples.push(SampleEntry {
-            offset: offsets[i],
+            // Every table above is padded to `sample_count`, but stay defensive:
+            // a mismatch must not panic on index.
+            offset: offsets.get(i).copied().unwrap_or(0),
             size: sizes.get(i).copied().unwrap_or(0),
             dts: dts_i,
             pts: pts_i,
             duration: d,
-            is_key: is_key[i],
+            is_key: is_key.get(i).copied().unwrap_or(false),
         });
     }
     samples
@@ -1280,5 +1293,83 @@ mod tests {
         assert_eq!(&btype, b"free");
         assert_eq!(header_len, 16);
         assert_eq!(size, 24);
+    }
+
+    #[test]
+    fn stsc_first_chunk_past_table_does_not_panic() {
+        // Malformed `stsc`: `first_chunk` far beyond the real chunk count.
+        // Regression guard — this used to slice out of range and panic.
+        let tables = TrackTables {
+            timescale: 1000,
+            stts: vec![(2, 40)],
+            stsc: vec![(999, 1, 1)],
+            stsz: vec![1, 1],
+            stco: vec![0],
+            ..Default::default()
+        };
+        let samples = build_sample_index(&tables);
+        // Samples are still enumerated; they just carry offset 0 because no
+        // chunk claim matched.
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().all(|s| s.offset == 0));
+    }
+
+    #[test]
+    fn stsc_inverted_range_does_not_panic() {
+        // Second entry claims an *earlier* chunk than the first, producing an
+        // inverted range (start > end).
+        let tables = TrackTables {
+            timescale: 1000,
+            stts: vec![(3, 10)],
+            stsc: vec![(3, 1, 1), (1, 1, 1)],
+            stsz: vec![1, 1, 1],
+            stco: vec![0, 4],
+            ..Default::default()
+        };
+        let samples = build_sample_index(&tables);
+        assert_eq!(samples.len(), 3);
+    }
+
+    #[test]
+    fn build_sample_index_pads_mismatched_tables() {
+        // stsz is authoritative for the sample count (2) while stts claims 4:
+        // the index must follow stsz, ignore the out-of-range stss entry, and
+        // never panic on a table mismatch.
+        let tables = TrackTables {
+            timescale: 1000,
+            stts: vec![(4, 10)],
+            stsc: vec![(1, 4, 1)],
+            stsz: vec![3, 3],
+            stco: vec![0],
+            stss: vec![99],
+            ..Default::default()
+        };
+        let samples = build_sample_index(&tables);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[1].size, 3);
+        // Out-of-range stss index is ignored rather than panicking.
+        assert!(samples.iter().all(|s| !s.is_key));
+    }
+
+    #[test]
+    fn truncated_mp4_header_returns_error_not_panic() {
+        // Truncate a valid file inside the moov box.
+        let mut data = build_minimal_mp4();
+        let keep = data.len() / 2;
+        data.truncate(keep);
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+        let mut demuxer = MP4Demuxer::default();
+        // Either a clean error or an empty track list is fine — never a panic.
+        let _ = demuxer.read_header(&mut ctx);
     }
 }
