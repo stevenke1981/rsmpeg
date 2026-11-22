@@ -36,43 +36,134 @@ fn normalize_wide(num: Wide, den: Wide) -> (Wide, Wide) {
     (num, den)
 }
 
-/// Convert an already-normalized wide pair back into a [`Rational`], rounding
-/// toward zero when the reduced result does not fit.
+/// Largest magnitude a single component of a [`Rational`] can hold.
+const MAX_COMPONENT: u128 = i32::MAX as u128;
+
+/// Nearest `i32`-pair approximation of a reduced wide pair, or `None` when
+/// `den == 0` (an undefined value).
 ///
-/// A `1e-9`-precise result is preserved whenever it is representable; only a
-/// genuinely unrepresentable value is approximated.
-fn from_wide(num: Wide, den: Wide) -> Rational {
+/// # Contract
+///
+/// * If the exact, already-reduced pair fits in `i32`, it is returned verbatim —
+///   no rounding happens at all.
+/// * Otherwise the *value* is approximated: the returned `to_f64()` is within
+///   one part in `i32::MAX` of the true value, clamped to `±i32::MAX`. Scaling
+///   both components by the same factor is what preserves the ratio; the
+///   previous implementation clamped the numerator and kept `den = 1`, which
+///   turned `(50000/50001)² ≈ 0.99996` into `2147483647` and multiplied the
+///   error by ~2·10⁹.
+///
+/// Callers that cannot tolerate any approximation must use the `try_*` forms
+/// ([`Rational::try_normalized`]), which report unrepresentability instead.
+fn approximate_wide(num: Wide, den: Wide) -> Option<Rational> {
     let (num, den) = normalize_wide(num, den);
-    let fits_num = num >= i32::MIN as Wide && num <= i32::MAX as Wide;
-    let fits_den = den >= i32::MIN as Wide && den <= i32::MAX as Wide;
-    if fits_num && fits_den {
-        return Rational {
-            num: num as i32,
-            den: den as i32,
-        };
+    if den == 0 {
+        return None;
+    }
+    if let Some(exact) = checked_wide(num, den) {
+        return Some(exact);
     }
 
-    // Genuinely unrepresentable: re-express with the clamped component on the
-    // *other* side of the fraction so the value keeps its magnitude. `|num|`
-    // always dominates here (the pair is reduced and `num > i32::MAX`), so
-    // moving the clamped numerator under a large denominator is exact enough
-    // to keep `to_f64()` in the right ballpark and the sign intact.
-    if num.unsigned_abs() > i32::MAX as u128 {
-        // num/den == sign / (den * MAX / (num - MAX)) — keep it simple: the
-        // reduced pair means `den` is small, so a reciprocal-style scaling
-        // cannot lose the numerator to zero.
-        let magnitude = num.unsigned_abs().min(i32::MAX as u128) as i32;
-        Rational {
-            num: if num < 0 { -magnitude } else { magnitude },
+    // No exact `i32` fraction exists. Reference must stay in `i32::MAX/1`, which
+    // admits denominators up to `i32::MAX`. Two documented regimes:
+    //
+    // * `|v| < 1`: quantize onto the `1/i32::MAX` lattice, i.e. the nearest
+    //   representable value; the error is at most `1/(2·i32::MAX)` (~2.3e-10).
+    //   Values below half a step collapse to `0/1`.
+    // * `|v| >= 1` (this is where the old code returned `i32::MAX/1` for
+    //   `v = 1.00004`): scale `v` into `[0, 1]` with `k = ceil(|v|)` and write
+    //   `sign * (n·k + m) / den` where `n/den` is the integer part and `m/den`
+    //   the fractional lattice point. The relative error is at most
+    //   `1/(k·i32::MAX)` and saturation only happens past `i32::MAX`.
+    let negative = num < 0;
+    let value = num as f64 / den as f64;
+    let magnitude = value.abs();
+
+    if magnitude < 1.0 {
+        let steps = (magnitude * i32::MAX as f64).round() as i128;
+        // Quantize, then re-apply the sign. Applying the sign to a zero
+        // numerator before normalizing would keep `-0` around as a positive
+        // value once the denominator is positive.
+        let num_out = if steps == 0 {
+            0
+        } else if negative {
+            -steps
+        } else {
+            steps
+        };
+        return Some(
+            Rational {
+                num: num_out as i32,
+                den: i32::MAX,
+            }
+            .normalized(),
+        );
+    }
+    let sign: i128 = if negative { -1 } else { 1 };
+
+    // `|v| >= 1`: split into integer and fractional parts on the same lattice.
+    let integer = magnitude.floor();
+    if integer > i32::MAX as f64 {
+        return Some(Rational {
+            num: (sign * i32::MAX as i128) as i32,
             den: 1,
-        }
-    } else {
+        });
+    }
+    let frac = magnitude - integer;
+    // The fractional part must share the denominator: numerator = n*den + m
+    // with m <= den. With den = i32::MAX the numerator would exceed i32::MAX
+    // for any n >= 1, so scale the denominator down to keep the numerator in
+    // range — that is what preserves the fractional precision here, unlike
+    // simply clamping to i32::MAX/1.
+    let k = integer as i128;
+    let den_out = (i32::MAX as i128 / (k + 1)).max(1);
+    let frac_steps = (frac * den_out as f64).round() as i128;
+    let num_out = (k * den_out + frac_steps).min(i32::MAX as i128);
+    Some(
         Rational {
-            num: num as i32,
-            den: den.clamp(1, i32::MAX as Wide) as i32,
+            num: (sign * num_out) as i32,
+            den: den_out as i32,
         }
+        .normalized(),
+    )
+}
+
+
+
+/// Like [`approximate_wide`] but for the infallible arithmetic operators: a
+/// zero denominator (from e.g. division by `0/1`) collapses to the canonical
+/// zero rather than panicking.
+fn from_wide(num: Wide, den: Wide) -> Rational {
+    approximate_wide(num, den).unwrap_or(Rational { num: 0, den: 1 })
+}
+
+/// Exact result of an operation, or `None` when the *normalized* value cannot be
+/// held by an `i32` fraction.
+///
+/// Normalization first is what makes `try_*` usable: an operation may produce a
+/// wide pair whose raw components overflow while its reduced form is perfectly
+/// ordinary (`1/90000 + 1/90000` = `180000/8100000000` → `1/45000`).
+/// A zero denominator (division by zero) is not a value at all and yields
+/// `None`.
+fn checked_wide(num: Wide, den: Wide) -> Option<Rational> {
+    let (num, den) = normalize_wide(num, den);
+    if den == 0 {
+        return None;
+    }
+    // Both components must fit: `as i32` on an out-of-range value wraps into a
+    // negative denominator (8_100_000_000 → -489934592), which silently turns a
+    // fraction into nonsense.
+    if num >= i32::MIN as Wide && num <= i32::MAX as Wide && den <= MAX_COMPONENT as Wide {
+        Some(Rational {
+            num: num as i32,
+            den: den as i32,
+        })
+    } else {
+        None
     }
 }
+
+
 
 impl Rational {
     /// Create a new rational number.
@@ -147,16 +238,39 @@ impl Rational {
 
     /// Multiply by another rational.
     ///
+    /// # Precision
+    ///
     /// Computed exactly in `i128` and reduced *before* being stored back into
-    /// `i32`, so e.g. `50000/1 * 50000/50000` is `50000/1` and not a clamped
-    /// approximation. Values that are genuinely unrepresentable are scaled
-    /// down; nothing panics.
+    /// `i32`, so e.g. `50000/1 * 50000/50000` is exactly `50000/1`.
+    ///
+    /// When the reduced result does not fit an `i32` pair, the returned value is
+    /// the **nearest representable approximation**: both components are scaled
+    /// by the same factor, so `to_f64()` stays within one part in `i32::MAX` of
+    /// the exact value (clamped to `±i32::MAX`) instead of collapsing to
+    /// `i32::MAX/1`. Use [`try_mul`](Self::try_mul) when an exact answer is
+    /// required. Nothing panics.
     #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: Rational) -> Self {
         from_wide(
             self.num as Wide * other.num as Wide,
             self.den as Wide * other.den as Wide,
         )
+    }
+
+    /// Checked [`mul`](Self::mul): `None` when the exact product is not
+    /// representable as an `i32` fraction (or its denominator is zero).
+    pub fn try_mul(self, other: Rational) -> Option<Self> {
+        let num = self.num as Wide * other.num as Wide;
+        let den = self.den as Wide * other.den as Wide;
+        checked_wide(num, den)
+    }
+
+    /// Checked [`add`](Self::add): `None` when the exact sum is not
+    /// representable as an `i32` fraction.
+    pub fn try_add(self, other: Rational) -> Option<Self> {
+        let num = self.num as Wide * other.den as Wide + other.num as Wide * self.den as Wide;
+        let den = self.den as Wide * other.den as Wide;
+        checked_wide(num, den)
     }
 
     /// Divide by another rational.
@@ -211,7 +325,19 @@ impl Rational {
     /// `-1/1073741824` — the exact value — instead of an approximation.
     /// A zero denominator (unknown time base) collapses to `0/1`.
     pub fn normalized(self) -> Self {
-        from_wide(self.num as Wide, self.den as Wide)
+        // Work on the *magnitudes* so `i32::MIN` (±2^31) keeps its exact value
+        // through the reduction: 2/i32::MIN is exactly -1/2^30 and must not be
+        // nudged onto the neighbouring grid point.
+        if self.den == 0 {
+            return Rational { num: 0, den: 1 };
+        }
+        let negative = (self.num < 0) != (self.den < 0);
+        let num = self.num.unsigned_abs() as Wide;
+        let den = self.den.unsigned_abs() as Wide;
+        let g = gcd_wide(num as u128, den as u128) as Wide;
+        let (num, den) = if g > 1 { (num / g, den / g) } else { (num, den) };
+        let num = if negative { -num } else { num };
+        from_wide(num, den)
     }
 
     /// Checked variant of [`normalized`](Self::normalized) that reports when the
@@ -462,6 +588,159 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_product_keeps_the_magnitude() {
+        // Second review round: (50000/50001)² ≈ 0.9999600012 used to come back
+        // as 2147483647/1 — an error of 2·10⁹. The approximation must stay
+        // within one part in i32::MAX of the exact value.
+        let operand = Rational::new(50_000, 50_001);
+        let product = operand.mul(operand);
+        let expected = operand.to_f64() * operand.to_f64();
+        let error = (product.to_f64() - expected).abs();
+        assert!(
+            error < 1e-6,
+            "{product:?} = {} vs expected {expected}",
+            product.to_f64()
+        );
+        assert_ne!(
+            product,
+            Rational::new(i32::MAX, 1),
+            "the result must not collapse to i32::MAX/1"
+        );
+        // Same for a genuinely huge exact value: it approximates i32::MAX, it
+        // does not become something else.
+        let huge = Rational::new(i32::MAX, 1).mul(Rational::new(i32::MAX, 1));
+        assert!(huge.to_f64() >= i32::MAX as f64, "got {huge:?}");
+        assert_eq!(huge.den, 1);
+    }
+
+    #[test]
+    fn approximation_stays_on_the_documented_grid() {
+        // (boundary-probe case) (50000/50001)^2 ≈ 0.9999600012 must stay on the
+        // 1/i32::MAX lattice near that value — never 2147483647/1.
+        let operand = Rational::new(50_000, 50_001);
+        let squared = operand.mul(operand);
+        let exact = operand.to_f64() * operand.to_f64();
+        assert!(
+            (squared.to_f64() - exact).abs() < 1e-6,
+            "got {squared:?} = {} vs {exact}",
+            squared.to_f64()
+        );
+        assert_eq!(squared.den, i32::MAX, "must stay on the fine lattice");
+        assert_ne!(squared, Rational::new(i32::MAX, 1));
+
+        // Values near 1 are limited by the type, not the arithmetic: the grid
+        // around 1 has a step of 1/i32::MAX (~4.7e-10), and the i32 numerator
+        // bound puts the next point below 1 at 2147483646/2147483647.
+        for (num, den) in [(50_000i32, 50_001i32), (50_001, 50_000), (1, 90_000)] {
+            let squared = Rational::new(num, den).mul(Rational::new(num, den));
+            let exact = (num as f64 / den as f64) * (num as f64 / den as f64);
+            let err = (squared.to_f64() - exact).abs();
+            assert!(
+                err <= 0.5 / i32::MAX as f64,
+                "{num}/{den} squared: {squared:?} (err {err}) vs {exact}"
+            );
+            // Never the old `i32::MAX/1` rubbish for values near 1.
+            assert_ne!(squared, Rational::new(i32::MAX, 1), "{squared:?}");
+        }
+        // Just below 1 keeps the closest representable point.
+        let below = Rational::new(50_000, 50_001).mul(Rational::new(50_000, 50_001));
+        assert!(
+            (below.to_f64() - 0.999_960_001_199_968_1).abs() <= 0.5 / i32::MAX as f64,
+            "got {below:?}"
+        );
+    }
+
+    #[test]
+    fn approximation_never_exceeds_half_a_lattice_step_below_one() {
+        // Documented bound for |v| < 1: at most 1/(2*i32::MAX) away.
+        let bound = 0.5 / i32::MAX as f64;
+        for (n, d) in [
+            (1i32, 3i32),
+            (2, 3),
+            (123_456, 999_999),
+            (999_999, 1_000_000),
+            (1, 90_001),
+        ] {
+            let v = Rational::new(n, d).mul(Rational::new(n, d));
+            let exact = (n as f64 / d as f64) * (n as f64 / d as f64);
+            if exact >= 1.0 {
+                continue;
+            }
+            assert!(
+                (v.to_f64() - exact).abs() <= bound,
+                "{n}/{d}² → {v:?} err {}",
+                (v.to_f64() - exact).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn values_above_one_keep_their_fractional_part() {
+        // (50001/50000)² ≈ 1.0000400004 — the old code returned 1/1 (and before
+        // that i32::MAX/1). The result must be closer than 1e-4.
+        let v = Rational::new(50_001, 50_000).mul(Rational::new(50_001, 50_000));
+        let exact = (50_001.0f64 / 50_000.0).powi(2);
+        assert!(
+            (v.to_f64() - exact).abs() < 1e-4,
+            "got {v:?} = {} vs {exact}",
+            v.to_f64()
+        );
+        assert!(v.to_f64() > 1.0, "magnitude must survive: {v:?}");
+    }
+
+    #[test]
+    fn exact_values_are_never_approximated() {
+        // Anything representable must come back bit-exact.
+        for (a, b) in [
+            (Rational::new(1, 90_000), Rational::new(1, 90_000)),
+            (Rational::new(1001, 30_000), Rational::new(30_000, 1001)),
+            (Rational::new(1, 2), Rational::new(2, 3)),
+        ] {
+            let sum = a.add(b);
+            let exact_num = a.num as i128 * b.den as i128 + b.num as i128 * a.den as i128;
+            let exact_den = a.den as i128 * b.den as i128;
+            let g = {
+                let (mut x, mut y) = (exact_num.unsigned_abs(), exact_den.unsigned_abs());
+                while y != 0 {
+                    let t = x % y;
+                    x = y;
+                    y = t;
+                }
+                x as i128
+            };
+            if (exact_num / g).abs() <= i32::MAX as i128 && (exact_den / g) <= i32::MAX as i128 {
+                assert!(
+                    (sum.to_f64() - (exact_num as f64 / exact_den as f64)).abs() < 1e-15,
+                    "{a:?} + {b:?} = {sum:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn try_mul_and_try_add_report_unrepresentability() {
+        // Exact cases succeed and agree with the infallible operators.
+        assert_eq!(
+            Rational::new(50_000, 1).try_mul(Rational::new(50_000, 50_000)),
+            Some(Rational::new(50_000, 1))
+        );
+        assert_eq!(
+            Rational::new(1, 90_000).try_add(Rational::new(1, 90_000)),
+            Some(Rational::new(1, 45_000))
+        );
+        // (50000/50001)² reduces to 2500000000/2500100001 — the numerator does
+        // not fit, so the checked form reports it instead of approximating.
+        let operand = Rational::new(50_000, 50_001);
+        assert_eq!(operand.try_mul(operand), None);
+        // A zero denominator normalizes to the canonical zero, so the checked
+        // form reports the (representable) value 0, not an error.
+        assert_eq!(
+            Rational::new(1, 2).try_mul(Rational::new(1, 0)),
+            Some(Rational::new(0, 1))
+        );
+    }
+
+    #[test]
     fn div_and_sub_reduce_before_fitting_into_i32() {
         assert_eq!(
             Rational::new(100_000, 50_000).div(Rational::new(100_000, 50_000)),
@@ -480,12 +759,23 @@ mod tests {
             Rational::new(2, i32::MIN).normalized(),
             Rational::new(-1, 1_073_741_824)
         );
-        // Multiplication with a negative denominator keeps the exact value.
+        // (-1/90000)·(1/90000) ≈ -1.23e-10 is far below the finest step the
+        // type can express (1/i32::MAX ≈ 4.66e-10), so the nearest value on the
+        // grid is zero. What matters is that the result is *near* the true value
+        // (not e.g. i32::MAX) and exactness is available via try_mul.
+        let tiny = Rational::new(1, 90_000).mul(Rational::new(-1, 90_000));
+        let expected = -1.0 / (90_000.0 * 90_000.0);
+        // Documented bound: at most half a lattice step (1/(2*i32::MAX)).
+        assert!(
+            (tiny.to_f64() - expected).abs() <= 0.5 / i32::MAX as f64,
+            "{tiny:?} = {} vs {expected}",
+            tiny.to_f64()
+        );
+        // The exact value needs a denominator beyond i32, so the checked form
+        // reports it rather than silently rounding.
         assert_eq!(
-            Rational::new(1, 90_000).mul(Rational::new(-1, 90_000)),
-            Rational::new(-1, i32::MAX),
-            "the reduced product (-1/8.1e9) is unrepresentable, so it is \
-             scaled down while keeping the sign and staying nonzero"
+            Rational::new(1, 90_000).try_mul(Rational::new(-1, 90_000)),
+            None
         );
     }
 
@@ -536,11 +826,13 @@ mod tests {
             Rational::new(0, 1),
             "an unknown (zero) denominator must not propagate"
         );
-        // 2^31/1 is not representable; the magnitude is preserved (sign folded,
-        // denominator kept positive) rather than panicking.
+        // 2^31/1 is not representable: it approximates to the largest value the
+        // type can hold, i.e. i32::MAX/1 (relative error ~5e-10), with the sign
+        // preserved and a positive denominator.
         let huge = Rational::new(i32::MIN, -1).normalized();
         assert!(huge.den > 0, "denominator must stay positive, got {huge:?}");
-        assert!(huge.num > 0 && huge.num == i32::MAX, "got {huge:?}");
+        // 2^31 approximates to 2^31-1 = i32::MAX (the grid has no 2^31).
+        assert_eq!(huge, Rational::new(i32::MAX, 1));
     }
 
     #[test]
