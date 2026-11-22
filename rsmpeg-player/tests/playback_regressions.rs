@@ -1019,3 +1019,83 @@ fn short_file_delivers_opening_and_playing_snapshots_strictly_before_ended() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// P1-05 regression (end-to-end): after saturating the 128-slot streaming channel
+/// during native video playback, pausing and seeking to 7.0 s must still deliver
+/// the single new preview `VideoFrame` at the seeked generation and PTS rather than
+/// leaving the host with only a stale generation-1 frame.
+#[test]
+fn saturated_stream_delivers_paused_seek_preview_frame() {
+    // 240 keyframes × 50 ms = 12.0 s @ 20 fps -> 20 frames + 20 positions/sec = 40 stream events/s;
+    // at 2× speed (>80 stream events/s), sleeping 2.2 s saturates all 128 stream slots while staying well before EOF.
+    let path = unique_temp_path("p1_05_saturated_preview", "mp4");
+    std::fs::write(&path, build_h264_mp4(240, 50)).expect("write 20fps h264 fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(true)
+        .playback_rate(2.0)
+        .volume(0.0)
+        .build()
+        .expect("build native video player");
+
+    assert!(
+        watch(&mut player, Duration::from_secs(3), |ev| {
+            matches!(ev, PlayerEvent::VideoFrame { .. })
+        }),
+        "expected initial video frame"
+    );
+
+    // Stop polling long enough to saturate the 128-slot stream channel with gen-1 frames.
+    thread::sleep(Duration::from_millis(2200));
+
+    player.pause().expect("pause");
+    let target = Duration::from_secs(7);
+    player.seek(target).expect("seek while paused");
+    let seek_gen = player.generation();
+
+    // Give the worker time to process Pause + Seek and decode + emit the paused preview frame.
+    thread::sleep(Duration::from_millis(450));
+
+    let (events, latest_frame) = player.poll_all();
+    let saw_pause = events
+        .iter()
+        .any(|e| matches!(e, PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing));
+    let saw_seek = events.iter().any(|e| {
+        matches!(
+            e,
+            PlayerEvent::SeekCompleted {
+                position,
+                generation,
+            } if *generation == seek_gen && *position == target
+        )
+    });
+    assert!(saw_pause, "expected paused Snapshot under saturation");
+    assert!(saw_seek, "expected SeekCompleted(7s) under saturation");
+
+    match latest_frame.expect("expected paused seek preview VideoFrame under saturation") {
+        PlayerEvent::VideoFrame {
+            pts, generation, ..
+        } => {
+            assert_eq!(
+                generation, seek_gen,
+                "latest frame must be the fresh seek preview (gen={seek_gen}), not stale gen={generation} (pts={pts:?})"
+            );
+            assert!(
+                pts >= Duration::from_millis(6800) && pts <= target,
+                "preview frame pts must match seek target ~7.0s, got {pts:?}"
+            );
+        }
+        other => panic!("expected VideoFrame, got {other:?}"),
+    }
+    assert!(!player.is_playing(), "player must remain paused");
+    assert!(
+        player.position() >= Duration::from_millis(6800) && player.position() <= target,
+        "player position must reflect ~7.0s preview, got {:?}",
+        player.position()
+    );
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}

@@ -25,12 +25,18 @@ enum EventClass {
     /// High-frequency telemetry (`VideoFrame`, `PositionChanged`, `AudioLevel`, `Warning`).
     /// Drops incoming events once `EVT_CAPACITY` (128) stream items are buffered.
     Stream,
+    /// Single-slot latest-wins preview frame emitted after a seek or video track
+    /// switch (`force_one_frame`). Never dropped due to `Stream` saturation; a
+    /// newer preview overwrites any unconsumed older preview so memory stays
+    /// bounded to one preview frame.
+    Preview,
     /// Control acknowledgements (`Snapshot`, `SeekCompleted`, `Tracks`).
     /// Isolated from `Stream` backpressure; bounded at `CONTROL_EVT_CAPACITY` (256),
     /// evicting an older `Snapshot` first if saturated.
     Control,
     /// Terminal lifecycle events (`Ended`, `Error`).
-    /// Never evicted by `Stream` or `Control`; bounded at `TERMINAL_EVT_CAPACITY` (8).
+    /// Never evicted by `Stream`, `Preview`, or `Control`; bounded at
+    /// `TERMINAL_EVT_CAPACITY` (8).
     Terminal,
 }
 
@@ -63,6 +69,16 @@ impl EventQueueInner {
                     return;
                 }
                 self.stream_count += 1;
+                self.entries.push_back(QueuedEvent { class, event });
+            }
+            EventClass::Preview => {
+                if let Some(pos) = self
+                    .entries
+                    .iter()
+                    .position(|q| q.class == EventClass::Preview)
+                {
+                    self.entries.remove(pos);
+                }
                 self.entries.push_back(QueuedEvent { class, event });
             }
             EventClass::Control => {
@@ -101,6 +117,7 @@ impl EventQueueInner {
         let item = self.entries.pop_front()?;
         match item.class {
             EventClass::Stream => self.stream_count -= 1,
+            EventClass::Preview => {}
             EventClass::Control => self.control_count -= 1,
             EventClass::Terminal => self.terminal_count -= 1,
         }
@@ -168,6 +185,18 @@ impl EventSender {
                     | PlayerEvent::Warning { .. } => EventClass::Stream,
                 };
                 queue.push(class, ev);
+            }
+        }
+    }
+
+    /// Emit a single-slot latest-wins preview frame (never dropped by `Stream` saturation).
+    pub(crate) fn send_preview(&self, ev: PlayerEvent) {
+        match self {
+            Self::Single(tx) => {
+                let _ = tx.try_send(ev);
+            }
+            Self::Queued(queue) => {
+                queue.push(EventClass::Preview, ev);
             }
         }
     }
@@ -943,5 +972,64 @@ mod tests {
             );
             assert_eq!(p.state(), PlayerState::Ended);
         }
+    }
+
+    /// P1-05 regression: under `Stream` saturation, a single-slot preview frame
+    /// emitted after a paused seek must NOT be dropped, and a newer preview
+    /// cleanly overwrites any unconsumed older preview while preserving global order.
+    #[test]
+    fn saturated_stream_delivers_latest_preview_frame_in_order() {
+        let (mut p, _rx, evt_tx) = make_channel_player();
+        for i in 0..(EVT_CAPACITY + 40) {
+            evt_tx.send(PlayerEvent::VideoFrame {
+                width: 320,
+                height: 180,
+                rgba: Arc::new(vec![0; 4]),
+                pts: Duration::from_millis(i as u64 * 10),
+                generation: 1,
+            });
+        }
+        // First seek + preview (gen 2, 3s)
+        evt_tx.send(PlayerEvent::SeekCompleted {
+            position: Duration::from_secs(3),
+            generation: 2,
+        });
+        evt_tx.send_preview(PlayerEvent::VideoFrame {
+            width: 320,
+            height: 180,
+            rgba: Arc::new(vec![1; 4]),
+            pts: Duration::from_secs(3),
+            generation: 2,
+        });
+        // Second seek + preview (gen 3, 7s) overwrites unconsumed preview slot
+        evt_tx.send(PlayerEvent::SeekCompleted {
+            position: Duration::from_secs(7),
+            generation: 3,
+        });
+        evt_tx.send_preview(PlayerEvent::VideoFrame {
+            width: 160,
+            height: 90,
+            rgba: Arc::new(vec![2; 4]),
+            pts: Duration::from_secs(7),
+            generation: 3,
+        });
+
+        let (events, latest_frame) = p.poll_all();
+        assert_eq!(events.len(), 2, "both SeekCompleted acks must arrive");
+        match latest_frame.expect("latest preview frame must be delivered") {
+            PlayerEvent::VideoFrame {
+                width,
+                height,
+                pts,
+                generation,
+                ..
+            } => {
+                assert_eq!((width, height), (160, 90));
+                assert_eq!(pts, Duration::from_secs(7));
+                assert_eq!(generation, 3);
+            }
+            other => panic!("expected VideoFrame, got {other:?}"),
+        }
+        assert_eq!(p.position(), Duration::from_secs(7));
     }
 }

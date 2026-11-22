@@ -27,6 +27,10 @@ fn emit(tx: &EventSender, ev: PlayerEvent) {
     tx.send(ev);
 }
 
+fn emit_preview(tx: &EventSender, ev: PlayerEvent) {
+    tx.send_preview(ev);
+}
+
 fn snap(
     playing: bool,
     position: Duration,
@@ -873,16 +877,18 @@ fn run_native_inner(
                                             // event: wrapping it in an `Arc` makes later clones
                                             // (e.g. duplicate-frame repeats) a refcount bump
                                             // instead of a full-frame copy.
-                                            emit(
-                                                event_tx,
-                                                PlayerEvent::VideoFrame {
-                                                    width: w,
-                                                    height: h,
-                                                    rgba: Arc::new(converted),
-                                                    pts: position,
-                                                    generation,
-                                                },
-                                            );
+                                            let frame_ev = PlayerEvent::VideoFrame {
+                                                width: w,
+                                                height: h,
+                                                rgba: Arc::new(converted),
+                                                pts: position,
+                                                generation,
+                                            };
+                                            if force_one_frame {
+                                                emit_preview(event_tx, frame_ev);
+                                            } else {
+                                                emit(event_tx, frame_ev);
+                                            }
                                             force_one_frame = false;
                                             emit(
                                                 event_tx,

@@ -112,6 +112,10 @@ fn emit(tx: &EventSender, ev: PlayerEvent) {
     tx.send(ev);
 }
 
+fn emit_preview(tx: &EventSender, ev: PlayerEvent) {
+    tx.send_preview(ev);
+}
+
 fn snap(
     playing: bool,
     position: Duration,
@@ -1218,12 +1222,12 @@ fn run_worker(
                                     let sync_action =
                                         sync_state.sync_decision(frame_pts_secs, audio_pos_secs);
 
-                                    if sync_action == SyncAction::Drop {
+                                    if !force_one_frame && sync_action == SyncAction::Drop {
                                         // Video is ahead of audio beyond tolerance: skip this
                                         // frame and keep waiting for audio to catch up.
                                         continue;
                                     }
-                                    if sync_action == SyncAction::Duplicate {
+                                    if !force_one_frame && sync_action == SyncAction::Duplicate {
                                         if let Some(ref ev) = last_video_event {
                                             // Video is behind audio: repeat the last displayed
                                             // frame to fill the gap and hold the picture steady.
@@ -1253,7 +1257,11 @@ fn run_worker(
                                                 pts: position,
                                                 generation,
                                             };
-                                            emit(&event_tx, ev.clone());
+                                            if force_one_frame {
+                                                emit_preview(&event_tx, ev.clone());
+                                            } else {
+                                                emit(&event_tx, ev.clone());
+                                            }
                                             last_video_event = Some(ev);
                                             force_one_frame = false;
                                             emit(

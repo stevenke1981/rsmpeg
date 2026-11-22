@@ -546,7 +546,9 @@ impl PlaybackUiState {
                 }
                 self.has_video_frame = true;
                 self.video_resolution = Some((*width, *height));
-                if !self.scrubbing {
+                if !self.scrubbing
+                    && !matches!(self.status, PlaybackStatus::Ended | PlaybackStatus::Error)
+                {
                     self.position = *pts;
                 }
                 if self.status == PlaybackStatus::Opening {
@@ -1181,5 +1183,32 @@ mod tests {
             "stale pre-seek VideoFrame must not revert confirmed seek position"
         );
         assert_eq!(st.status, PlaybackStatus::Paused);
+
+        // Fresh-generation paused preview frame updates resolution and stays Paused.
+        st.apply_player_event(&PlayerEvent::VideoFrame {
+            width: 640,
+            height: 360,
+            rgba: Arc::new(vec![0; 4]),
+            pts: Duration::from_secs(7),
+            generation: 3,
+        });
+        assert_eq!(st.video_resolution, Some((640, 360)));
+        assert_eq!(st.position, Duration::from_secs(7));
+        assert_eq!(st.status, PlaybackStatus::Paused);
+
+        // VideoFrame applied after Ended in the same poll batch must not clobber Ended position.
+        st.duration = Duration::from_secs(10);
+        st.apply_player_event(&PlayerEvent::Ended { generation: 3 });
+        assert_eq!(st.status, PlaybackStatus::Ended);
+        assert_eq!(st.position, Duration::from_secs(10));
+        st.apply_player_event(&PlayerEvent::VideoFrame {
+            width: 640,
+            height: 360,
+            rgba: Arc::new(vec![0; 4]),
+            pts: Duration::from_secs(9),
+            generation: 3,
+        });
+        assert_eq!(st.status, PlaybackStatus::Ended);
+        assert_eq!(st.position, Duration::from_secs(10));
     }
 }
