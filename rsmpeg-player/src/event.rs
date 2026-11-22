@@ -65,3 +65,87 @@ impl PlayerEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(rgba: Vec<u8>, generation: u64) -> PlayerEvent {
+        PlayerEvent::VideoFrame {
+            width: 2,
+            height: 2,
+            rgba: Arc::new(rgba),
+            pts: Duration::from_millis(40),
+            generation,
+        }
+    }
+
+    #[test]
+    fn generation_is_exposed_for_every_variant() {
+        let snapshot = PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: true,
+            position: Duration::ZERO,
+            duration: Duration::from_secs(1),
+            volume: 0.5,
+            generation: 7,
+            status: "playing".into(),
+        });
+        let variants = [
+            snapshot,
+            PlayerEvent::PositionChanged {
+                position: Duration::ZERO,
+                generation: 7,
+            },
+            frame(vec![0; 16], 7),
+            PlayerEvent::SeekCompleted {
+                position: Duration::ZERO,
+                generation: 7,
+            },
+            PlayerEvent::Ended { generation: 7 },
+            PlayerEvent::Error {
+                message: "boom".into(),
+                generation: 7,
+            },
+            PlayerEvent::Warning {
+                message: "meh".into(),
+                generation: 7,
+            },
+        ];
+        for ev in &variants {
+            assert_eq!(ev.generation(), 7, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn cloning_a_video_event_shares_the_pixel_buffer() {
+        let ev = frame(vec![1u8, 2, 3, 4], 1);
+        let dup = ev.clone();
+        let (a, b) = match (&ev, &dup) {
+            (PlayerEvent::VideoFrame { rgba: a, .. }, PlayerEvent::VideoFrame { rgba: b, .. }) => {
+                (a, b)
+            }
+            _ => unreachable!("constructed as VideoFrame"),
+        };
+        // The clone must share the allocation, not copy it — this is what makes
+        // `SyncAction::Duplicate` in the playback loop cheap.
+        assert!(Arc::ptr_eq(a, b));
+        assert_eq!(a.as_slice(), &[1u8, 2, 3, 4]);
+        // Strong count is 2 while both events are alive.
+        assert_eq!(Arc::strong_count(a), 2);
+    }
+
+    #[test]
+    fn dropping_the_clone_keeps_the_original_buffer_alive() {
+        let ev = frame(vec![9u8; 32], 3);
+        {
+            let _dup = ev.clone();
+        }
+        match &ev {
+            PlayerEvent::VideoFrame { rgba, .. } => {
+                assert_eq!(rgba.len(), 32);
+                assert_eq!(Arc::strong_count(rgba), 1);
+            }
+            _ => panic!("expected VideoFrame"),
+        }
+    }
+}

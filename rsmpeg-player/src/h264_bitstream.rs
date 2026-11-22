@@ -410,4 +410,138 @@ mod tests {
 
         assert_eq!(extracted.as_deref(), Some(avcc_payload.as_slice()));
     }
+
+    #[test]
+    fn invalid_nal_length_sizes_are_rejected() {
+        // 0, 3 and 5 are all invalid prefix widths.
+        for n in [0usize, 3, 5, 8] {
+            let err = avcc_packet_to_annex_b(&[0, 0, 0, 1, 0x65], n, None).unwrap_err();
+            assert!(
+                matches!(err, H264BitstreamError::InvalidNalLengthSize(_)),
+                "n={n} gave {err:?}"
+            );
+            assert!(H264BitstreamFormat::avcc(n).is_none(), "n={n} accepted");
+        }
+        for n in [1usize, 2, 4] {
+            assert!(H264BitstreamFormat::avcc(n).is_some(), "n={n} rejected");
+        }
+    }
+
+    #[test]
+    fn avcc_truncated_extradata_errors() {
+        // Fewer than 7 bytes cannot hold the fixed avcC header.
+        for len in 0..7usize {
+            let data = vec![0u8; len];
+            assert!(
+                matches!(
+                    avcc_extradata_to_annex_b(&data),
+                    Err(H264BitstreamError::TruncatedAvcc)
+                ),
+                "len={len} should be truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn avcc_extradata_to_annex_b_roundtrips_sps_and_pps() {
+        // 1 SPS (3 bytes) + 1 PPS (2 bytes).
+        let mut avcc = vec![0x01, 0x42, 0x00, 0x1e, 0xff, 0xe1];
+        avcc.extend_from_slice(&3u16.to_be_bytes());
+        avcc.extend_from_slice(&[0x67, 0x42, 0x00]);
+        avcc.push(1); // num_pps
+        avcc.extend_from_slice(&2u16.to_be_bytes());
+        avcc.extend_from_slice(&[0x68, 0xce]);
+
+        let out = avcc_extradata_to_annex_b(&avcc).unwrap();
+        assert_eq!(
+            out,
+            vec![0, 0, 0, 1, 0x67, 0x42, 0x00, 0, 0, 0, 1, 0x68, 0xce]
+        );
+    }
+
+    #[test]
+    fn avcc_multi_nal_packet_converts_each_unit() {
+        // Two NAL units in one AVCC sample.
+        let pkt = [
+            0, 0, 0, 2, 0x41, 0x9a, // 2-byte NAL
+            0, 0, 0, 1, 0x65, // 1-byte NAL
+        ];
+        let out = avcc_packet_to_annex_b(&pkt, 4, None).unwrap();
+        assert_eq!(out, vec![0, 0, 0, 1, 0x41, 0x9a, 0, 0, 0, 1, 0x65]);
+    }
+
+    #[test]
+    fn prefix_is_only_prepended_once() {
+        let prefix = [0u8, 0, 0, 1, 0x67];
+        let pkt = [0, 0, 0, 1, 0x65];
+
+        // sps_pps_sent = false → prefix added.
+        let first = packet_for_decoder(
+            &pkt,
+            H264BitstreamFormat::Avcc { nal_length_size: 4 },
+            Some(&prefix),
+            false,
+        )
+        .unwrap();
+        assert_eq!(first, vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x65]);
+
+        // sps_pps_sent = true → prefix omitted.
+        let later = packet_for_decoder(
+            &pkt,
+            H264BitstreamFormat::Avcc { nal_length_size: 4 },
+            Some(&prefix),
+            true,
+        )
+        .unwrap();
+        assert_eq!(later, vec![0, 0, 0, 1, 0x65]);
+    }
+
+    #[test]
+    fn annex_b_format_passes_through_with_optional_prefix() {
+        let pkt = [0u8, 0, 0, 1, 0x65];
+        let out = packet_for_decoder(&pkt, H264BitstreamFormat::AnnexB, None, false).unwrap();
+        assert_eq!(out, pkt);
+    }
+
+    #[test]
+    fn is_annex_b_recognises_both_start_code_lengths() {
+        assert!(is_annex_b(&[0, 0, 0, 1]));
+        assert!(is_annex_b(&[0, 0, 1]));
+        assert!(!is_annex_b(&[0, 0]));
+        assert!(!is_annex_b(&[]));
+        assert!(!is_annex_b(&[0, 0, 0, 2]));
+    }
+
+    #[test]
+    fn empty_packet_without_prefix_errors() {
+        assert!(matches!(
+            avcc_packet_to_annex_b(&[], 4, None),
+            Err(H264BitstreamError::EmptyResult)
+        ));
+        // With a prefix the output is the prefix alone, which is valid.
+        assert_eq!(
+            avcc_packet_to_annex_b(&[], 4, Some(&[1, 2])).unwrap(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn streaming_extract_returns_none_for_missing_file() {
+        assert!(extract_avcc_streaming("definitely-missing-file-xyz.mp4").is_none());
+    }
+
+    #[test]
+    fn streaming_extract_returns_none_without_moov() {
+        let mut v = Vec::new();
+        let payload = [0u8; 4];
+        v.extend_from_slice(&(8u32 + payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(b"mdat");
+        v.extend_from_slice(&payload);
+
+        let tmp = std::env::temp_dir().join("test_avcc_no_moov.mp4");
+        std::fs::write(&tmp, &v).unwrap();
+        let got = extract_avcc_streaming(&tmp);
+        std::fs::remove_file(&tmp).ok();
+        assert!(got.is_none());
+    }
 }

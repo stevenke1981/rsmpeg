@@ -140,4 +140,49 @@ mod tests {
         assert_eq!(filter.outputs().len(), 1);
         assert!(filter.as_any().is::<MirrorFilter>());
     }
+
+    #[test]
+    fn mirror_is_its_own_inverse() {
+        // Applying the flip twice must restore the original buffer.
+        let pixels = [
+            (1, 2, 3, 4),
+            (5, 6, 7, 8),
+            (9, 10, 11, 12),
+            (13, 14, 15, 16),
+        ];
+        let mut frame = rgba_frame(2, 2, &pixels);
+        let original = frame.data[0].clone();
+        let filter = MirrorFilter::new();
+        filter.apply(&mut frame);
+        assert_ne!(frame.data[0], original, "one flip must change the pixels");
+        filter.apply(&mut frame);
+        assert_eq!(frame.data[0], original, "two flips must be the identity");
+    }
+
+    #[test]
+    fn mirror_odd_width_keeps_centre_pixel() {
+        // With an odd width the middle column maps onto itself and must not move.
+        let mut frame = rgba_frame(3, 1, &[(10, 0, 0, 255), (20, 0, 0, 255), (30, 0, 0, 255)]);
+        MirrorFilter::new().apply(&mut frame);
+        let p = &frame.data[0];
+        assert_eq!(p[0], 30);
+        assert_eq!(p[4], 20);
+        assert_eq!(p[8], 10);
+    }
+
+    #[test]
+    fn mirror_missing_plane_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data.clear();
+        MirrorFilter::new().apply(&mut frame);
+        assert!(frame.data.is_empty());
+    }
+
+    #[test]
+    fn mirror_truncated_plane_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data[0] = vec![5u8; 4];
+        MirrorFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], vec![5u8; 4]);
+    }
 }

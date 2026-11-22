@@ -184,7 +184,8 @@ fn cmd_probe(input: &str, json: bool, verbose: bool) {
                         if let Some(height) = stream.codec_params.height.filter(|h| *h > 0) {
                             println!("     Height:    {}", height);
                         }
-                        if let Some(sample_rate) = stream.codec_params.sample_rate.filter(|s| *s > 0)
+                        if let Some(sample_rate) =
+                            stream.codec_params.sample_rate.filter(|s| *s > 0)
                         {
                             println!("     SampleRate: {} Hz", sample_rate);
                         }

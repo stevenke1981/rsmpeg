@@ -110,4 +110,59 @@ mod tests {
         assert_eq!(q.pop(), Some(1));
         assert_eq!(q.dropped(), 1);
     }
+
+    #[test]
+    fn pop_on_empty_returns_none() {
+        let mut q = BoundedQueue::<u8>::new(2);
+        assert_eq!(q.pop(), None);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn capacity_and_full_boundaries() {
+        let mut q = BoundedQueue::new(3);
+        assert_eq!(q.capacity(), 3);
+        assert!(!q.is_full());
+        for i in 0..3 {
+            assert!(q.push(i));
+        }
+        assert!(q.is_full());
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn clear_empties_without_touching_dropped_counter() {
+        let mut q = BoundedQueue::new(1);
+        q.push(1);
+        q.push(2); // drops 1
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.dropped(), 1);
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn drop_oldest_keeps_newest_order() {
+        let mut q = BoundedQueue::new(2);
+        for i in 0..5 {
+            q.push(i);
+        }
+        assert_eq!(q.pop(), Some(3));
+        assert_eq!(q.pop(), Some(4));
+        assert_eq!(q.pop(), None);
+        assert_eq!(q.dropped(), 3);
+    }
+
+    #[test]
+    fn drop_newest_keeps_existing_entries() {
+        let mut q = BoundedQueue::new(2).with_policy(PushPolicy::DropNewest);
+        assert!(q.push(1));
+        assert!(q.push(2));
+        assert!(!q.push(3));
+        assert!(!q.push(4));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(2));
+        assert_eq!(q.dropped(), 2);
+    }
 }

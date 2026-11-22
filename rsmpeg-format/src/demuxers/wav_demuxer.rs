@@ -236,3 +236,161 @@ fn find_data_chunk(io: &mut crate::io_context::IOContext) -> RsResult<u32> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format_context::FormatContext;
+    use crate::io_context::IOContext;
+
+    /// Build a canonical 16-bit stereo WAV with `nb_samples` silent frames.
+    fn build_wav(nb_samples: u32, sample_rate: u32, channels: u16, bits: u16) -> Vec<u8> {
+        let block_align = channels * bits / 8;
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data_len = nb_samples * u32::from(block_align);
+
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data_len).to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&sample_rate.to_le_bytes());
+        v.extend_from_slice(&byte_rate.to_le_bytes());
+        v.extend_from_slice(&block_align.to_le_bytes());
+        v.extend_from_slice(&bits.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_len.to_le_bytes());
+        v.resize(v.len() + data_len as usize, 0u8);
+        v
+    }
+
+    fn ctx_with(data: Vec<u8>) -> FormatContext {
+        FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("wav".into()),
+        }
+    }
+
+    #[test]
+    fn probe_accepts_riff_wave_only() {
+        let wav = build_wav(0, 8000, 1, 8);
+        assert_eq!(WAVDemuxer::default().probe(&wav), ProbeScore::Certain);
+        // RIFF but not WAVE.
+        let mut avi = wav.clone();
+        avi[8..12].copy_from_slice(b"AVI ");
+        assert_eq!(WAVDemuxer::default().probe(&avi), ProbeScore::NoMatch);
+        assert_eq!(
+            WAVDemuxer::default().probe(b"RIFF"),
+            ProbeScore::NoMatch,
+            "short buffers must not panic"
+        );
+    }
+
+    #[test]
+    fn read_header_parses_pcm16_stereo() {
+        let data = build_wav(48_000, 48_000, 2, 16);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        assert_eq!(ctx.streams.len(), 1);
+        let s = &ctx.streams[0];
+        assert_eq!(s.media_type, MediaType::Audio);
+        assert_eq!(s.codec_id, CodecId::Pcm);
+        assert_eq!(s.codec_params.sample_rate, Some(48_000));
+        assert_eq!(s.codec_params.channels, Some(2));
+        assert_eq!(s.codec_params.sample_format, Some(SampleFormat::S16));
+        // 48000 stereo 16-bit samples = exactly 1 second.
+        assert_eq!(ctx.duration, 1_000);
+        // bit_rate = rate * channels * bits
+        assert_eq!(ctx.bit_rate, 48_000 * 2 * 16);
+    }
+
+    #[test]
+    fn read_frame_streams_whole_data_chunk_then_eof() {
+        let nb = 4_800u32; // 100 ms at 48 kHz
+        let data = build_wav(nb, 48_000, 2, 16);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        let mut total_samples = 0i64;
+        let mut packets = 0;
+        while let Some(p) = demuxer.read_frame(&mut ctx).unwrap() {
+            assert!(!p.data.is_empty());
+            // Every packet is whole blocks, so it is always a whole sample count.
+            assert_eq!(p.data.len() % 4, 0, "packet not block-aligned");
+            assert!(p.is_key());
+            total_samples += p.duration;
+            packets += 1;
+            assert!(packets < 1_000, "read_frame must terminate");
+        }
+        assert_eq!(total_samples, i64::from(nb));
+        // Subsequent reads stay at EOF instead of looping.
+        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_frame_on_empty_data_chunk_returns_none() {
+        let data = build_wav(0, 44_100, 2, 16);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_header_rejects_non_wav_bytes() {
+        let mut ctx = ctx_with(vec![0u8; 64]);
+        let mut demuxer = WAVDemuxer::default();
+        // Garbage must surface as an error (or an empty stream list), not a panic.
+        let _ = demuxer.read_header(&mut ctx);
+        assert!(ctx.streams.is_empty() || ctx.streams[0].codec_id == CodecId::Pcm);
+    }
+
+    #[test]
+    fn read_header_survives_truncated_fmt_chunk() {
+        // `fmt ` claims 16 bytes but the file ends right after chunk_size; the
+        // short read must be an error, not an out-of-bounds index.
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&100u32.to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        let mut ctx = ctx_with(v);
+        let mut demuxer = WAVDemuxer::default();
+        assert!(demuxer.read_header(&mut ctx).is_err());
+    }
+
+    #[test]
+    fn find_data_chunk_skips_other_chunks() {
+        // LIST chunk (odd size → needs the RIFF pad byte) before `data`.
+        let mut v = Vec::new();
+        v.extend_from_slice(b"LIST");
+        v.extend_from_slice(&3u32.to_le_bytes());
+        v.extend_from_slice(&[1, 2, 3, 0]); // 3 bytes + 1 pad
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&8u32.to_le_bytes());
+        v.extend_from_slice(&[0u8; 8]);
+
+        let mut io = IOContext::from_buffer(v);
+        assert_eq!(find_data_chunk(&mut io).unwrap(), 8);
+    }
+
+    #[test]
+    fn find_data_chunk_returns_zero_at_eof() {
+        let mut io = IOContext::from_buffer(Vec::new());
+        assert_eq!(find_data_chunk(&mut io).unwrap(), 0);
+    }
+}

@@ -86,3 +86,75 @@ impl IOContext {
         Ok(buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buf_ctx() -> IOContext {
+        IOContext::from_buffer(vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0])
+    }
+
+    #[test]
+    fn big_endian_reads_decode_correctly() {
+        let mut io = buf_ctx();
+        assert_eq!(io.read_u8().unwrap(), 0x12);
+        assert_eq!(io.read_u16_be().unwrap(), 0x3456);
+        assert_eq!(io.read_u32_be().unwrap(), 0x789a_bcde);
+        assert_eq!(io.read_u8().unwrap(), 0xf0);
+    }
+
+    #[test]
+    fn little_endian_reads_decode_correctly() {
+        let mut io = buf_ctx();
+        io.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(io.read_u16_le().unwrap(), 0x3412);
+        // Next four bytes are 0x56, 0x78, 0x9a, 0xbc → little-endian 0xbc9a7856.
+        assert_eq!(io.read_u32_le().unwrap(), 0xbc9a_7856);
+    }
+
+    #[test]
+    fn read_u64_be_decodes_eight_bytes() {
+        let mut io = IOContext::from_buffer(vec![0, 0, 0, 1, 0, 0, 0, 2]);
+        assert_eq!(io.read_u64_be().unwrap(), 0x0000_0001_0000_0002);
+    }
+
+    #[test]
+    fn read_exact_past_end_is_an_error_not_a_panic() {
+        let mut io = buf_ctx();
+        io.seek(SeekFrom::Start(6)).unwrap();
+        assert!(io.read_u32_be().is_err());
+        // A partial read must also fail (and not silently return a short value).
+        let mut io = buf_ctx();
+        io.seek(SeekFrom::Start(7)).unwrap();
+        assert!(io.read_u16_be().is_err());
+    }
+
+    #[test]
+    fn tell_tracks_position_across_reads() {
+        let mut io = buf_ctx();
+        assert_eq!(io.tell().unwrap(), 0);
+        io.read_u16_be().unwrap();
+        assert_eq!(io.tell().unwrap(), 2);
+        io.seek(SeekFrom::Start(5)).unwrap();
+        assert_eq!(io.tell().unwrap(), 5);
+    }
+
+    #[test]
+    fn peek_does_not_advance_position() {
+        let mut io = buf_ctx();
+        io.seek(SeekFrom::Start(2)).unwrap();
+        let head = io.peek(4).unwrap();
+        assert_eq!(head, vec![0x56, 0x78, 0x9a, 0xbc]);
+        // Position is unchanged, so the next read sees the same bytes.
+        assert_eq!(io.tell().unwrap(), 2);
+        assert_eq!(io.read_u32_be().unwrap(), 0x5678_9abc);
+    }
+
+    #[test]
+    fn read_bytes_zero_length_returns_empty() {
+        let mut io = buf_ctx();
+        assert!(io.read_bytes(0).unwrap().is_empty());
+        assert_eq!(io.tell().unwrap(), 0);
+    }
+}

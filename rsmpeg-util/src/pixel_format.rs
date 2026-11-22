@@ -283,4 +283,78 @@ mod tests {
         assert_eq!(PixelFormat::Gray8.channels(), 1);
         assert_eq!(PixelFormat::None.channels(), 0);
     }
+
+    #[test]
+    fn from_name_roundtrips_every_named_format() {
+        let all = [
+            PixelFormat::Yuv420P,
+            PixelFormat::Yuv422P,
+            PixelFormat::Yuv444P,
+            PixelFormat::Nv12,
+            PixelFormat::Nv21,
+            PixelFormat::Rgb24,
+            PixelFormat::Bgr24,
+            PixelFormat::Rgba,
+            PixelFormat::Bgra,
+            PixelFormat::Argb,
+            PixelFormat::Gray8,
+            PixelFormat::Gray16,
+        ];
+        for f in all {
+            assert_eq!(PixelFormat::from_name(f.name()), Some(f), "{f:?}");
+        }
+        // "none" and the 10/12-bit names are intentionally not parseable yet.
+        assert_eq!(PixelFormat::from_name("none"), None);
+        assert_eq!(PixelFormat::from_name("YUV420P"), None);
+        assert_eq!(PixelFormat::from_name(""), None);
+    }
+
+    #[test]
+    fn plane_sizes_are_consistent_with_plane_count() {
+        for f in [
+            PixelFormat::Yuv420P,
+            PixelFormat::Yuv422P,
+            PixelFormat::Yuv444P,
+            PixelFormat::Nv12,
+            PixelFormat::Nv21,
+            PixelFormat::Rgb24,
+            PixelFormat::Rgba,
+            PixelFormat::Gray8,
+            PixelFormat::Gray16,
+            PixelFormat::Yuv420P10,
+        ] {
+            let sizes = f.plane_sizes(16, 8);
+            assert_eq!(sizes.len(), f.planes(), "{f:?} plane count mismatch");
+            for (size, linesize) in sizes {
+                assert!(linesize > 0, "{f:?} has a zero linesize");
+                // A plane is at least one full row worth of bytes.
+                assert!(size >= linesize, "{f:?}: size {size} < linesize {linesize}");
+            }
+        }
+        assert!(PixelFormat::None.plane_sizes(16, 8).is_empty());
+    }
+
+    #[test]
+    fn odd_dimensions_use_floor_division_for_chroma() {
+        // FFmpeg-compatible: 5x3 YUV420P gives 2x1 chroma planes.
+        let sizes = PixelFormat::Yuv420P.plane_sizes(5, 3);
+        assert_eq!(sizes[0], (15, 5));
+        assert_eq!(sizes[1], (2, 2));
+        assert_eq!(sizes[2], (2, 2));
+    }
+
+    #[test]
+    fn bits_per_pixel_is_zero_only_for_none() {
+        for f in [
+            PixelFormat::Yuv420P,
+            PixelFormat::Nv12,
+            PixelFormat::Rgb24,
+            PixelFormat::Rgba,
+            PixelFormat::Gray8,
+            PixelFormat::Gray16,
+        ] {
+            assert!(f.bits_per_pixel() > 0, "{f:?}");
+        }
+        assert_eq!(PixelFormat::None.bits_per_pixel(), 0);
+    }
 }

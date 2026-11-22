@@ -167,4 +167,39 @@ mod tests {
         apply_gain_i16(&mut samples, 10.0);
         assert_eq!(samples, [i16::MAX]);
     }
+
+    #[test]
+    fn stereo_to_mono_i16_extremes_do_not_overflow() {
+        // i16::MIN + i16::MIN = -65536, which does not fit i16 — the i32
+        // intermediate must absorb it and the result must stay in range.
+        assert_eq!(stereo_to_mono_i16(&[i16::MIN, i16::MIN]), vec![i16::MIN]);
+        assert_eq!(stereo_to_mono_i16(&[i16::MAX, i16::MAX]), vec![i16::MAX]);
+        // Opposite extremes cancel to zero.
+        assert_eq!(stereo_to_mono_i16(&[i16::MIN, i16::MAX]), vec![0]);
+    }
+
+    #[test]
+    fn apply_gain_i16_clamps_negative_side() {
+        let mut samples = [-20000];
+        apply_gain_i16(&mut samples, 10.0);
+        assert_eq!(samples, [i16::MIN]);
+    }
+
+    #[test]
+    fn apply_gain_with_zero_scale_silences() {
+        let mut f = [1.0f32, -1.0, 0.5];
+        apply_gain_f32(&mut f, 0.0);
+        assert_eq!(f, [0.0, 0.0, 0.0]);
+
+        let mut i = [1000i16, -1000, 5];
+        apply_gain_i16(&mut i, 0.0);
+        assert_eq!(i, [0, 0, 0]);
+    }
+
+    #[test]
+    fn gain_is_linear_for_in_range_values() {
+        let mut samples = [0.25f32, -0.5];
+        apply_gain_f32(&mut samples, 0.5);
+        assert_eq!(samples, [0.125, -0.25]);
+    }
 }

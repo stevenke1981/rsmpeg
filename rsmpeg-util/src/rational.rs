@@ -174,4 +174,73 @@ mod tests {
         assert!(Rational::new(5, 0).is_zero());
         assert!(!Rational::new(5, 1).is_zero());
     }
+
+    #[test]
+    fn to_f64_handles_zero_denominator() {
+        // A zero denominator must not produce NaN/inf or panic.
+        assert_eq!(Rational::new(7, 0).to_f64(), 0.0);
+        assert_eq!(Rational::new(0, 0).to_f64(), 0.0);
+    }
+
+    #[test]
+    fn from_f64_handles_non_finite_and_negative() {
+        // NaN/inf collapse to 0/1 instead of producing garbage integers.
+        assert_eq!(Rational::from_f64(f64::NAN), Rational::new(0, 1));
+        assert_eq!(Rational::from_f64(f64::INFINITY), Rational::new(0, 1));
+        assert_eq!(Rational::from_f64(f64::NEG_INFINITY), Rational::new(0, 1));
+
+        let neg = Rational::from_f64(-0.5);
+        assert_eq!(neg.num, -1);
+        assert_eq!(neg.den, 2);
+    }
+
+    #[test]
+    fn from_f64_exact_ntsc_frame_rate() {
+        // 29.97 fps must land on a small-denominator approximation.
+        let r = Rational::from_f64(30_000.0 / 1001.0);
+        assert!((r.to_f64() - 30_000.0 / 1001.0).abs() < 1e-6);
+        assert!(r.den <= 1_000_000, "denominator must stay bounded: {r}");
+    }
+
+    #[test]
+    fn from_f64_denominator_is_bounded() {
+        // A hard-to-approximate value must not blow the denominator past MAX_DEN.
+        for v in [1.0 / 3.0, 0.1, std::f64::consts::PI, 1.234_567_891] {
+            let r = Rational::from_f64(v);
+            assert!(r.den <= 1_000_000, "{v} produced denominator {}", r.den);
+            assert!((r.to_f64() - v).abs() < 1e-4, "{v} -> {r} = {}", r.to_f64());
+        }
+    }
+
+    #[test]
+    fn div_by_zero_numerator_is_safe() {
+        // Dividing by 0/1 yields an infinite rational represented as den == 0.
+        let q = Rational::new(1, 2).div(Rational::new(0, 1));
+        assert!(q.is_zero(), "den==0 must be reported as zero: {q}");
+    }
+
+    #[test]
+    fn reduced_handles_zero_denominator_and_negatives() {
+        // gcd(0, 0) must not divide by zero.
+        assert_eq!(Rational::new(0, 0).reduced(), Rational::new(0, 0));
+        // Negative numerator is reduced by magnitude.
+        let r = Rational::new(-6, 8).reduced();
+        assert_eq!((r.num, r.den), (-3, 4));
+    }
+
+    #[test]
+    fn mul_and_add_match_float_reference() {
+        let a = Rational::new(2, 3);
+        let b = Rational::new(3, 5);
+        assert!((a.mul(b).to_f64() - 0.4).abs() < 1e-9);
+        assert!((a.add(b).to_f64() - (2.0 / 3.0 + 0.6)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_tuple_and_copy_semantics() {
+        let r: Rational = (30000, 1001).into();
+        let copied = r; // Copy, so `r` is still usable below.
+        assert_eq!(copied, r);
+        assert!((copied.to_f64() - 29.970_029_97).abs() < 1e-6);
+    }
 }

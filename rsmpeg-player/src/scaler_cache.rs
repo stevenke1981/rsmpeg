@@ -106,4 +106,40 @@ mod tests {
         frame.pixel_format = PixelFormat::Rgb24;
         assert!(yuv420p_to_rgba_cached(&frame).is_err());
     }
+
+    #[test]
+    fn cached_rejects_zero_dimensions() {
+        let frame = Frame::new_video(0, 0, PixelFormat::Yuv420P);
+        assert!(yuv420p_to_rgba_cached(&frame).is_err());
+        let mut frame = solid_yuv420p(4, 4, 16, 128, 128);
+        frame.width = 0;
+        assert!(yuv420p_to_rgba_cached(&frame).is_err());
+    }
+
+    #[test]
+    fn cached_output_matches_uncached_conversion() {
+        // The cache must never change pixels, only reuse the scaler.
+        let frame = solid_yuv420p(16, 10, 81, 90, 240);
+        let cached = yuv420p_to_rgba_cached(&frame).unwrap();
+        let direct = crate::video_convert::yuv420p_frame_to_rgba(&frame).unwrap();
+        assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn cache_handles_multiple_resolutions_and_switches_back() {
+        let small = solid_yuv420p(8, 8, 16, 128, 128);
+        let large = solid_yuv420p(32, 24, 235, 128, 128);
+
+        let s1 = yuv420p_to_rgba_cached(&small).unwrap();
+        let l1 = yuv420p_to_rgba_cached(&large).unwrap();
+        // Switching back must hit the first cached scaler and still be correct.
+        let s2 = yuv420p_to_rgba_cached(&small).unwrap();
+
+        assert_eq!(s1.len(), 8 * 8 * 4);
+        assert_eq!(l1.len(), 32 * 24 * 4);
+        assert_eq!(s1, s2, "returning to a cached resolution must be stable");
+        // Sanity: the small frame is limited-range black, the large one white.
+        assert!(s1[0] <= 2);
+        assert!(l1[0] >= 250);
+    }
 }

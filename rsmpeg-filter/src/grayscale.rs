@@ -123,4 +123,23 @@ mod tests {
         assert_eq!(filter.outputs().len(), 1);
         assert!(filter.as_any().is::<GrayscaleFilter>());
     }
+
+    #[test]
+    fn grayscale_empty_plane_is_noop() {
+        // A frame with no planes must not panic (previously indexed data[0]).
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data.clear();
+        GrayscaleFilter::new().apply(&mut frame);
+        assert!(frame.data.is_empty());
+    }
+
+    #[test]
+    fn grayscale_endpoints_are_exact() {
+        // Pure black stays black, pure white stays white (rounding edge cases).
+        let mut frame = rgba_frame(&[(0, 0, 0, 255), (255, 255, 255, 255)]);
+        GrayscaleFilter::new().apply(&mut frame);
+        let p = &frame.data[0];
+        assert_eq!(&p[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&p[4..8], &[255, 255, 255, 255]);
+    }
 }

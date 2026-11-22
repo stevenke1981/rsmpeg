@@ -378,4 +378,79 @@ mod tests {
         m.set_audio_samples_played(96_000);
         assert!((m.now().as_secs_f64() - 2.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn duration_helpers_handle_zero_rate() {
+        assert_eq!(
+            PlaybackClock::duration_from_audio_samples(1234, 0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            MasterClock::duration_to_audio_samples(Duration::from_secs(3), 0),
+            0
+        );
+    }
+
+    #[test]
+    fn duration_to_audio_samples_matches_rate() {
+        assert_eq!(
+            MasterClock::duration_to_audio_samples(Duration::from_secs(1), 48_000),
+            48_000
+        );
+        // 0.5 s * 44100 Hz = 22050 samples exactly.
+        assert_eq!(
+            MasterClock::duration_to_audio_samples(Duration::from_millis(500), 44_100),
+            22_050
+        );
+    }
+
+    #[test]
+    fn audio_samples_roundtrip_through_sample_rate() {
+        let rate = 48_000u32;
+        for samples in [0u64, 1, 479, 48_000, 96_001] {
+            let d = PlaybackClock::duration_from_audio_samples(samples, rate);
+            let back = MasterClock::duration_to_audio_samples(d, rate);
+            // Truncation may lose sub-sample precision on the way back.
+            assert!(
+                back == samples || back + 1 == samples,
+                "{samples} -> {d:?} -> {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_rate_rejects_non_positive_values() {
+        let mut c = PlaybackClock::new();
+        c.start();
+        c.set_rate(0.0);
+        // Rate is clamped to a small positive floor so time keeps advancing.
+        assert!(c.rate() > 0.0);
+        assert!(c.rate() <= 0.01);
+        c.set_rate(-5.0);
+        assert!(c.rate() > 0.0);
+        assert!(c.rate() <= 0.01);
+    }
+
+    #[test]
+    fn master_clock_position_never_goes_backwards_on_resume() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        thread::sleep(Duration::from_millis(10));
+        m.pause();
+        let paused = m.now();
+        m.resume();
+        assert!(m.now() >= paused);
+    }
+
+    #[test]
+    fn seek_to_resets_while_paused() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        m.pause();
+        assert!(m.is_paused());
+        m.seek_to(Duration::from_secs(7));
+        // Seeking clears the paused state.
+        assert!(!m.is_paused());
+        assert!(m.now() >= Duration::from_secs(7));
+    }
 }

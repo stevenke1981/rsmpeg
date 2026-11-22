@@ -135,4 +135,48 @@ mod tests {
         rb.push(&[1i16, 2, 3]);
         assert!(rb.is_full());
     }
+
+    #[test]
+    fn zero_capacity_accepts_nothing() {
+        let mut rb = PcmRingBuffer::new(0);
+        assert_eq!(rb.capacity(), 0);
+        assert!(rb.is_full());
+        assert_eq!(rb.push(&[1, 2, 3]), 0);
+        assert_eq!(rb.len(), 0);
+        assert_eq!(rb.stats().overflow, 3);
+    }
+
+    #[test]
+    fn underflow_on_empty_does_not_go_negative() {
+        let mut rb = PcmRingBuffer::new(8);
+        assert_eq!(rb.consume(5), 0);
+        assert_eq!(rb.len(), 0);
+        assert_eq!(rb.stats().underflow, 5);
+        // A second over-consume keeps accumulating in the counter.
+        assert_eq!(rb.consume(2), 0);
+        assert_eq!(rb.stats().underflow, 7);
+    }
+
+    #[test]
+    fn clear_keeps_statistics() {
+        let mut rb = PcmRingBuffer::new(2);
+        rb.push(&[1, 2, 3]);
+        assert_eq!(rb.stats().overflow, 1);
+        rb.clear();
+        assert_eq!(rb.len(), 0);
+        assert_eq!(rb.stats().overflow, 1, "clear must not reset counters");
+    }
+
+    #[test]
+    fn push_and_consume_interleave_correctly() {
+        let mut rb = PcmRingBuffer::new(10);
+        assert_eq!(rb.push(&[0; 6]), 6);
+        assert_eq!(rb.consume(4), 4);
+        assert_eq!(rb.len(), 2);
+        // 8 free slots now, so all 8 extra samples fit.
+        assert_eq!(rb.push(&[0; 8]), 8);
+        assert!(rb.is_full());
+        assert_eq!(rb.stats().overflow, 0);
+        assert_eq!(rb.stats().underflow, 0);
+    }
 }

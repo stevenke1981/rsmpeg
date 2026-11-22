@@ -225,4 +225,78 @@ mod tests {
         let out = frame_to_s16_device(&frame, 48_000, 1).unwrap();
         assert_eq!(out, samples);
     }
+
+    #[test]
+    fn extreme_samples_survive_the_identity_path() {
+        // i16::MIN/MAX must round-trip bit-exactly through the LE byte view.
+        let pcm: Vec<i16> = vec![i16::MIN, i16::MAX, -1, 0, 1, -32767];
+        let frame = s16_stereo_frame(48_000, &pcm);
+        let out = frame_to_s16_device(&frame, 48_000, 2).unwrap();
+        assert_eq!(out, pcm);
+    }
+
+    #[test]
+    fn truncated_s16_plane_is_an_error() {
+        // Declared 4 samples x 2 ch x 2 bytes = 16 bytes, but only 6 present.
+        let mut frame = Frame::new_audio(SampleFormat::S16, 48_000, 2, 4);
+        frame.data[0].truncate(6);
+        assert!(frame_to_s16_device(&frame, 48_000, 2).is_err());
+    }
+
+    #[test]
+    fn unsupported_channel_count_is_rejected() {
+        // 3 channels has no ChannelLayout mapping for the resample path.
+        let mut frame = Frame::new_audio(SampleFormat::S16, 44_100, 3, 8);
+        frame.data[0].fill(1);
+        let err = frame_to_s16_device(&frame, 48_000, 3).unwrap_err();
+        assert!(
+            matches!(err, RsError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mono_to_stereo_upmix_produces_two_channels() {
+        // 100 mono samples at 48 kHz → stereo at 48 kHz keeps 100 frames.
+        let nb = 100usize;
+        let mut data = Vec::new();
+        for i in 0..nb {
+            data.extend_from_slice(&((i as i16) * 10).to_le_bytes());
+        }
+        let frame = Frame {
+            data: vec![data],
+            linesize: vec![nb * 2],
+            width: 0,
+            height: 0,
+            pixel_format: rsmpeg_util::PixelFormat::None,
+            sample_format: SampleFormat::S16,
+            sample_rate: 48_000,
+            channels: 1,
+            samples: nb,
+            pts: Some(0),
+            duration: nb as i64,
+            time_base: Rational::new(1, 48_000),
+            key_frame: true,
+            pict_type: PictureType::I,
+        };
+        let out = frame_to_s16_device(&frame, 48_000, 2).unwrap();
+        assert_eq!(out.len(), nb * 2, "upmix must yield interleaved stereo");
+        assert!(out.iter().any(|&s| s != 0), "upmix must not be silent");
+    }
+
+    #[test]
+    fn resample_downsample_halves_the_sample_count() {
+        // 48 kHz → 24 kHz: 480 input samples become 240 output samples.
+        let nb = 480usize;
+        let mut interleaved = Vec::with_capacity(nb * 2);
+        for i in 0..nb {
+            let v = ((i as i16) % 1000) * 30;
+            interleaved.push(v);
+            interleaved.push(-v);
+        }
+        let frame = s16_stereo_frame(48_000, &interleaved);
+        let out = frame_to_s16_device(&frame, 24_000, 2).unwrap();
+        assert_eq!(out.len(), 240 * 2);
+        assert!(out.iter().any(|&s| s != 0));
+    }
 }

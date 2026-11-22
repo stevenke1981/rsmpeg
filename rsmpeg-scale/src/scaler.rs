@@ -353,11 +353,7 @@ fn yuv_to_rgb_bt601(y: u8, u: u8, v: u8, limited: bool) -> (u8, u8, u8) {
     let r = y_scaled + rv * e;
     let g = y_scaled - gu * d - gv * e;
     let b = y_scaled + bu * d;
-    (
-        clamp_fixed_u8(r),
-        clamp_fixed_u8(g),
-        clamp_fixed_u8(b),
-    )
+    (clamp_fixed_u8(r), clamp_fixed_u8(g), clamp_fixed_u8(b))
 }
 
 fn clone_frame_metadata(frame: &Frame, data: Vec<Vec<u8>>, linesize: Vec<usize>) -> Frame {
@@ -1176,5 +1172,216 @@ mod tests {
         frame.pixel_format = PixelFormat::Yuv420P;
         let res = rgb24_frame_to_rgba(&frame);
         assert!(res.is_err());
+    }
+
+    // ── Fixed-point BT.601 conversion ────────────────────────────────
+
+    /// Reference implementation: the exact float BT.601 inverse matrix that the
+    /// fixed-point path replaced. Used to prove the integer version stays within
+    /// ±1 LSB across the whole 8-bit Y/U/V cube.
+    fn reference_yuv_to_rgb(y: u8, u: u8, v: u8, limited: bool) -> (u8, u8, u8) {
+        let (yf, uf, vf) = if limited {
+            (
+                ((y as f32) - 16.0).max(0.0) * (255.0 / 219.0),
+                ((u as f32) - 128.0) * (255.0 / 224.0),
+                ((v as f32) - 128.0) * (255.0 / 224.0),
+            )
+        } else {
+            (y as f32, (u as f32) - 128.0, (v as f32) - 128.0)
+        };
+        let r = yf + 1.402 * vf;
+        let g = yf - 0.344136 * uf - 0.714136 * vf;
+        let b = yf + 1.772 * uf;
+        let cl = |x: f32| -> u8 {
+            if x <= 0.0 {
+                0
+            } else if x >= 255.0 {
+                255
+            } else {
+                (x + 0.5) as u8
+            }
+        };
+        (cl(r), cl(g), cl(b))
+    }
+
+    #[test]
+    fn fixed_point_matches_float_within_one_lsb() {
+        // Sweep the full cube with a stride that still hits the extremes: 17^3
+        // samples covers 0, 17, …, 255 in every component.
+        for limited in [true, false] {
+            let mut worst = 0i32;
+            for y in (0..=255u16).step_by(17) {
+                for u in (0..=255u16).step_by(17) {
+                    for v in (0..=255u16).step_by(17) {
+                        let got = yuv_to_rgb_bt601(y as u8, u as u8, v as u8, limited);
+                        let want = reference_yuv_to_rgb(y as u8, u as u8, v as u8, limited);
+                        for (g, w) in [(got.0, want.0), (got.1, want.1), (got.2, want.2)] {
+                            worst = worst.max((g as i32 - w as i32).abs());
+                        }
+                    }
+                }
+            }
+            assert!(
+                worst <= 1,
+                "fixed-point conversion drifted by {worst} LSB (limited={limited})"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_point_neutral_chroma_is_grey() {
+        for limited in [true, false] {
+            for y in 0..=255u8 {
+                let (r, g, b) = yuv_to_rgb_bt601(y, 128, 128, limited);
+                assert_eq!(r, g, "Y={y} limited={limited}: R != G");
+                assert_eq!(g, b, "Y={y} limited={limited}: G != B");
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_point_limited_range_endpoints() {
+        // Studio-swing black and white must map to 0 and 255.
+        assert_eq!(yuv_to_rgb_bt601(16, 128, 128, true), (0, 0, 0));
+        assert_eq!(yuv_to_rgb_bt601(235, 128, 128, true), (255, 255, 255));
+    }
+
+    #[test]
+    fn fixed_point_full_range_endpoints() {
+        assert_eq!(yuv_to_rgb_bt601(0, 128, 128, false), (0, 0, 0));
+        assert_eq!(yuv_to_rgb_bt601(255, 128, 128, false), (255, 255, 255));
+    }
+
+    #[test]
+    fn fixed_point_saturates_on_extreme_chroma() {
+        // Studio-swing red (Y=81, U=90, V=240) must stay strongly red and, most
+        // importantly, clamp rather than wrap when a channel overflows.
+        let (r, g, b) = yuv_to_rgb_bt601(81, 90, 240, true);
+        assert!(r > 200 && g < 40 && b < 40, "got ({r}, {g}, {b})");
+
+        // Deliberately out-of-gamut chroma: an i32 overflow would wrap and show
+        // up as a wildly different value, so compare against the float reference
+        // (which clamps) at the corners of the cube.
+        for limited in [true, false] {
+            for (y, u, v) in [
+                (255u8, 0u8, 255u8),
+                (0, 255, 0),
+                (255, 255, 255),
+                (0, 0, 0),
+                (255, 0, 0),
+                (0, 0, 255),
+            ] {
+                let got = yuv_to_rgb_bt601(y, u, v, limited);
+                let want = reference_yuv_to_rgb(y, u, v, limited);
+                for (g, w) in [(got.0, want.0), (got.1, want.1), (got.2, want.2)] {
+                    assert!(
+                        (g as i32 - w as i32).abs() <= 1,
+                        "YUV({y},{u},{v}) limited={limited}: got ({}, {}, {}) want {:?}",
+                        got.0,
+                        got.1,
+                        got.2,
+                        want
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaler_rejects_zero_dimensions() {
+        let ok = ScalerConfig::new(4, 4, PixelFormat::Yuv420P, 4, 4, PixelFormat::Rgba);
+        assert!(Scaler::new(ok).is_ok());
+
+        for (sw, sh, dw, dh) in [(0, 4, 4, 4), (4, 0, 4, 4), (4, 4, 0, 4), (4, 4, 4, 0)] {
+            let cfg = ScalerConfig::new(sw, sh, PixelFormat::Yuv420P, dw, dh, PixelFormat::Rgba);
+            assert!(
+                Scaler::new(cfg).is_err(),
+                "expected error for src={sw}x{sh} dst={dw}x{dh}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_rejects_truncated_planes() {
+        let cfg = ScalerConfig::new(8, 8, PixelFormat::Yuv420P, 8, 8, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        // Declares 8x8 but only provides tiny planes.
+        let frame = Frame {
+            data: vec![vec![0u8; 4], vec![0u8; 1], vec![0u8; 1]],
+            linesize: vec![8, 4, 4],
+            width: 8,
+            height: 8,
+            pixel_format: PixelFormat::Yuv420P,
+            sample_format: rsmpeg_util::SampleFormat::None,
+            sample_rate: 0,
+            channels: 0,
+            samples: 0,
+            pts: None,
+            duration: 0,
+            time_base: Rational::new(1, 1000),
+            key_frame: false,
+            pict_type: rsmpeg_codec::PictureType::None,
+        };
+        assert!(scaler.scale(&frame).is_err());
+    }
+
+    #[test]
+    fn scale_identity_copies_pixels() {
+        let cfg = ScalerConfig::new(4, 4, PixelFormat::Rgba, 4, 4, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut frame = Frame::new_video(4, 4, PixelFormat::Rgba);
+        for (i, b) in frame.data[0].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.data[0], frame.data[0]);
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 4);
+    }
+
+    #[test]
+    fn yuv420p_to_rgb24_rejects_truncated_planes() {
+        let mut frame = make_yuv420p_frame(4, 4, 16, 128, 128);
+        frame.data[0].truncate(2);
+        assert!(yuv420p_frame_to_rgb24(&frame).is_err());
+        assert!(yuv420p_frame_to_bgr24(&frame).is_err());
+    }
+
+    #[test]
+    fn downscale_nearest_neighbor_picks_correct_source_pixels() {
+        // 4x4 luma ramp downscaled to 2x2: nearest mapping (dx*4/2 = 0, 2) means
+        // the output must sample source columns 0 and 2.
+        let w = 4usize;
+        let h = 4usize;
+        let mut y = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                // 16 (black) for cols 0-1, 235 (white) for cols 2-3.
+                y[row * w + col] = if col < 2 { 16 } else { 235 };
+            }
+        }
+        let frame = Frame {
+            data: vec![y, vec![128u8; 4], vec![128u8; 4]],
+            linesize: vec![w, 2, 2],
+            width: w,
+            height: h,
+            pixel_format: PixelFormat::Yuv420P,
+            sample_format: rsmpeg_util::SampleFormat::None,
+            sample_rate: 0,
+            channels: 0,
+            samples: 0,
+            pts: None,
+            duration: 0,
+            time_base: Rational::new(1, 25),
+            key_frame: false,
+            pict_type: rsmpeg_codec::PictureType::None,
+        };
+        let cfg = ScalerConfig::new(4, 4, PixelFormat::Yuv420P, 2, 2, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.data[0].len(), 2 * 2 * 4);
+        // Left output column comes from a black source pixel, right from white.
+        assert!(out.data[0][0] < 16, "left R={}", out.data[0][0]);
+        assert!(out.data[0][4] > 240, "right R={}", out.data[0][4]);
     }
 }
