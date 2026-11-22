@@ -24,7 +24,7 @@ use crate::playlist::{RemoveOutcome, MEDIA_EXTENSIONS};
 use crate::shortcuts::{map_key_to_action, KeyInput, ShortcutAction, SEEK_STEP_SECS, VOLUME_STEP};
 use crate::state::{
     expand_dropped_paths, fraction_from_pointer, EventOutcome, PlaybackStatus, PlaybackUiState,
-    SidePanel,
+    SidePanel, TrackMenu,
 };
 use crate::video::build_render_image;
 
@@ -332,6 +332,37 @@ impl PlayerView {
         cx.notify();
     }
 
+    pub(crate) fn toggle_track_menu(&mut self, menu: TrackMenu, cx: &mut Context<Self>) {
+        self.state.toggle_track_menu(menu);
+        cx.notify();
+    }
+
+    pub(crate) fn close_track_menu(&mut self, cx: &mut Context<Self>) {
+        if self.state.open_track_menu != TrackMenu::None {
+            self.state.open_track_menu = TrackMenu::None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_audio_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.state.open_track_menu = TrackMenu::None;
+        self.state.active_audio_track = Some(index);
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.select_audio_track(index);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn select_video_track(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.state.open_track_menu = TrackMenu::None;
+        self.state.active_video_track = Some(index);
+        self.state.video_unsupported = false;
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.select_video_track(index);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn remove_playlist_item(
         &mut self,
         index: usize,
@@ -371,6 +402,11 @@ impl PlayerView {
         self.state.video_unsupported = false;
         self.state.video_resolution = None;
         self.state.media_info = None;
+        self.state.open_track_menu = TrackMenu::None;
+        self.state.video_tracks.clear();
+        self.state.audio_tracks.clear();
+        self.state.active_video_track = None;
+        self.state.active_audio_track = None;
         self.state.error_message = None;
         self.state.warning_message = None;
         self.state.is_probing = false;
@@ -399,7 +435,10 @@ impl PlayerView {
             ShortcutAction::VolumeDown => self.adjust_volume(-VOLUME_STEP, cx),
             ShortcutAction::ToggleFullscreen => self.toggle_fullscreen(window, cx),
             ShortcutAction::ExitFullscreen => {
-                if window.is_fullscreen() {
+                if self.state.open_track_menu != TrackMenu::None {
+                    self.state.open_track_menu = TrackMenu::None;
+                    cx.notify();
+                } else if window.is_fullscreen() {
                     self.toggle_fullscreen(window, cx);
                 } else if self.state.active_panel != SidePanel::None {
                     self.state.active_panel = SidePanel::None;
@@ -418,6 +457,18 @@ impl PlayerView {
             ShortcutAction::TogglePlaylistPanel => {
                 self.state.toggle_panel(SidePanel::Playlist);
                 cx.notify();
+            }
+            ShortcutAction::ToggleVideoTrackMenu => {
+                if !self.state.video_tracks.is_empty() {
+                    self.state.toggle_track_menu(TrackMenu::Video);
+                    cx.notify();
+                }
+            }
+            ShortcutAction::ToggleAudioTrackMenu => {
+                if !self.state.audio_tracks.is_empty() {
+                    self.state.toggle_track_menu(TrackMenu::Audio);
+                    cx.notify();
+                }
             }
             ShortcutAction::SpeedDown => self.step_playback_rate(false, cx),
             ShortcutAction::SpeedUp => self.step_playback_rate(true, cx),
@@ -882,6 +933,7 @@ impl Render for PlayerView {
         let s = self.strings();
         let stage_el = stage::render_stage(&self.state, self.current_frame.as_ref(), s, cx);
         let side_panel = panels::render_side_panel(&self.state, s, cx);
+        let track_popover = controls::render_track_menu_popover(&self.state, s, cx);
         let controls_el = controls::render_controls(
             &self.state,
             self.seek_track_bounds.clone(),
@@ -892,6 +944,7 @@ impl Render for PlayerView {
 
         div()
             .id("rsmpeg-root")
+            .relative()
             .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
@@ -945,5 +998,6 @@ impl Render for PlayerView {
                     .when_some(side_panel, |el, panel| el.child(panel)),
             )
             .child(controls_el)
+            .when_some(track_popover, |el, popover| el.child(popover))
     }
 }

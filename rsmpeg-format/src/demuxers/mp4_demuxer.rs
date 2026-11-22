@@ -97,6 +97,7 @@ struct TrackTables {
     sample_rate: u32,
     channels: u16,
     bit_rate: u64,
+    language: Option<String>,
     extradata: Option<Vec<u8>>,
     h264_format: H264BitstreamFormat,
     stts: Vec<(u32, u32)>,      // (count, delta)
@@ -121,6 +122,7 @@ impl Default for TrackTables {
             sample_rate: 0,
             channels: 0,
             bit_rate: 0,
+            language: None,
             extradata: None,
             h264_format: H264BitstreamFormat::Unknown,
             stts: Vec::new(),
@@ -322,6 +324,9 @@ impl InputFormat for MP4Demuxer {
             }
             if tables.bit_rate > 0 {
                 stream.codec_params.bit_rate = Some(tables.bit_rate);
+            }
+            if let Some(lang) = tables.language {
+                stream.metadata.insert("language", lang);
             }
             stream.time_base = Rational::new(1, time_base);
             stream.duration = duration_tb;
@@ -958,6 +963,19 @@ fn parse_mdhd(
         let _modification = io.read_u32_be()?;
         tables.timescale = io.read_u32_be()?;
         tables.duration = io.read_u32_be()? as u64;
+    }
+    // Optional 16-bit packed ISO-639-2/T language code (3 x 5-bit letters + 0x60).
+    if end.saturating_sub(io.tell()?) >= 2 {
+        let packed = io.read_u16_be()?;
+        let c1 = ((packed >> 10) & 0x1F) as u8;
+        let c2 = ((packed >> 5) & 0x1F) as u8;
+        let c3 = (packed & 0x1F) as u8;
+        if (1..=26).contains(&c1) && (1..=26).contains(&c2) && (1..=26).contains(&c3) {
+            let lang = String::from_utf8(vec![c1 + 0x60, c2 + 0x60, c3 + 0x60]).ok();
+            if lang.as_deref() != Some("und") {
+                tables.language = lang;
+            }
+        }
     }
     Ok(())
 }

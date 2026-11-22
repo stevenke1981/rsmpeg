@@ -23,6 +23,8 @@ pub enum ShortcutAction {
     PrevTrack,
     ToggleInfoPanel,
     TogglePlaylistPanel,
+    ToggleVideoTrackMenu,
+    ToggleAudioTrackMenu,
     SpeedDown,
     SpeedUp,
 }
@@ -80,6 +82,8 @@ pub fn map_key_to_action(input: KeyInput<'_>) -> Option<ShortcutAction> {
         "p" | "pageup" => Some(ShortcutAction::PrevTrack),
         "i" => Some(ShortcutAction::ToggleInfoPanel),
         "l" => Some(ShortcutAction::TogglePlaylistPanel),
+        "v" => Some(ShortcutAction::ToggleVideoTrackMenu),
+        "a" => Some(ShortcutAction::ToggleAudioTrackMenu),
         "[" => Some(ShortcutAction::SpeedDown),
         "]" => Some(ShortcutAction::SpeedUp),
         _ => None,
@@ -185,6 +189,14 @@ mod tests {
         assert_eq!(
             map_key_to_action(KeyInput::plain("l")),
             Some(ShortcutAction::TogglePlaylistPanel)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("v")),
+            Some(ShortcutAction::ToggleVideoTrackMenu)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("a")),
+            Some(ShortcutAction::ToggleAudioTrackMenu)
         );
         assert_eq!(
             map_key_to_action(KeyInput::plain("[")),

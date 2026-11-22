@@ -30,7 +30,7 @@ pub use codec_detect::{
     find_unsupported_video, DetectedVideoCodec, TrackKind,
 };
 pub use command::{PlayerCommand, SeekMode};
-pub use event::{compute_pcm_level, PlayerEvent, PlayerSnapshot};
+pub use event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
 pub use h264_bitstream::{
     avcc_extradata_to_annex_b, avcc_nal_length_size, avcc_packet_to_annex_b,
     extract_avcc_streaming, is_annex_b, packet_for_decoder, H264BitstreamError,

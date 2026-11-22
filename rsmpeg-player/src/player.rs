@@ -291,6 +291,24 @@ impl Player {
         Ok(())
     }
 
+    /// Switch the active audio stream by track index.
+    pub fn select_audio_track(&mut self, index: usize) -> Result<(), PlayerError> {
+        let g = self.next_generation();
+        self.send_command(PlayerCommand::SelectAudioTrack {
+            index,
+            generation: g,
+        })
+    }
+
+    /// Switch the active video stream by track index.
+    pub fn select_video_track(&mut self, index: usize) -> Result<(), PlayerError> {
+        let g = self.next_generation();
+        self.send_command(PlayerCommand::SelectVideoTrack {
+            index,
+            generation: g,
+        })
+    }
+
     pub fn shutdown(&mut self) -> Result<(), PlayerError> {
         if self.shut_down {
             return Ok(());
@@ -376,7 +394,9 @@ impl Player {
                     self.state = PlayerState::Playing;
                 }
             }
-            PlayerEvent::Warning { .. } | PlayerEvent::AudioLevel { .. } => {}
+            PlayerEvent::Warning { .. }
+            | PlayerEvent::AudioLevel { .. }
+            | PlayerEvent::Tracks { .. } => {}
         }
     }
 
@@ -477,5 +497,20 @@ mod tests {
 
         let _ = p.set_playback_rate(f64::NAN);
         assert!((p.playback_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn select_audio_and_video_track_bump_generation() {
+        let mut p = Player::builder()
+            .input("definitely-missing-file-xyz.mp4")
+            .autoplay(false)
+            .build()
+            .unwrap();
+        let g0 = p.generation();
+        let _ = p.select_audio_track(1);
+        let g1 = p.generation();
+        assert!(g1 > g0);
+        let _ = p.select_video_track(0);
+        assert!(p.generation() > g1);
     }
 }

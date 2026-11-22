@@ -87,6 +87,7 @@ fn render_video_canvas(frame: Arc<RenderImage>, cx: &mut Context<PlayerView>) ->
             MouseButton::Left,
             cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                 this.focus_root(window);
+                this.close_track_menu(cx);
                 if ev.click_count >= 2 {
                     this.toggle_fullscreen(window, cx);
                 }

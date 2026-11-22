@@ -10,10 +10,11 @@ use crate::audio_convert::frame_to_s16_device;
 use crate::audio_ring_buffer::PcmRingBuffer;
 use crate::clock::PlaybackClock;
 use crate::codec_detect::{
-    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video, TrackKind,
+    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video,
+    DetectedVideoCodec, TrackKind,
 };
 use crate::command::PlayerCommand;
-use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot};
+use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
 use crate::h264_bitstream::extract_avcc_streaming;
 use crate::player::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
@@ -230,6 +231,167 @@ fn sym_packet_to_rsmpeg(
     pkt
 }
 
+/// Build selectable video/audio track descriptors for the Symphonia fallback path.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn collect_fallback_tracks(
+    tracks: &[symphonia::core::formats::Track],
+    fallback_video_id: Option<u32>,
+) -> (Vec<PlayerTrackInfo>, Vec<PlayerTrackInfo>) {
+    let mut video_tracks = Vec::new();
+    let mut audio_tracks = Vec::new();
+    for t in tracks {
+        let language = t.language.clone();
+        match classify_track(t) {
+            TrackKind::Audio => {
+                let codec = map_audio_params(t)
+                    .map(|p| p.codec_id.name().to_string())
+                    .unwrap_or_else(|| "audio".to_string());
+                audio_tracks.push(PlayerTrackInfo {
+                    index: t.id as usize,
+                    is_video: false,
+                    codec,
+                    width: None,
+                    height: None,
+                    sample_rate: t.codec_params.sample_rate,
+                    channels: t.codec_params.channels.map(|c| c.count() as u16),
+                    language,
+                    supported: true,
+                });
+            }
+            TrackKind::Video(DetectedVideoCodec::H264) => {
+                video_tracks.push(PlayerTrackInfo {
+                    index: t.id as usize,
+                    is_video: true,
+                    codec: "h264".to_string(),
+                    width: None,
+                    height: None,
+                    sample_rate: None,
+                    channels: None,
+                    language,
+                    supported: true,
+                });
+            }
+            TrackKind::Video(u) => {
+                video_tracks.push(PlayerTrackInfo {
+                    index: t.id as usize,
+                    is_video: true,
+                    codec: u.name().to_string(),
+                    width: None,
+                    height: None,
+                    sample_rate: None,
+                    channels: None,
+                    language,
+                    supported: false,
+                });
+            }
+            TrackKind::Ignore if fallback_video_id == Some(t.id) => {
+                video_tracks.push(PlayerTrackInfo {
+                    index: t.id as usize,
+                    is_video: true,
+                    codec: "h264".to_string(),
+                    width: None,
+                    height: None,
+                    sample_rate: None,
+                    channels: None,
+                    language,
+                    supported: true,
+                });
+            }
+            TrackKind::Ignore => {}
+        }
+    }
+    (video_tracks, audio_tracks)
+}
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+type FallbackAudioBundle = (
+    Option<crate::backend::SymphoniaAudioDecoder>,
+    Option<Box<dyn symphonia::core::codecs::Decoder>>,
+    u16,
+    u32,
+);
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn open_fallback_audio(
+    at: &symphonia::core::formats::Track,
+    generation: u64,
+    event_tx: &SyncSender<PlayerEvent>,
+) -> FallbackAudioBundle {
+    use crate::backend::SymphoniaAudioDecoder;
+    use symphonia::core::codecs::DecoderOptions;
+
+    let ch = at
+        .codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+    let rate = at.codec_params.sample_rate.unwrap_or(44_100);
+    let mut audio_dec: Option<SymphoniaAudioDecoder> = None;
+    let mut audio_decoder_raw: Option<Box<dyn symphonia::core::codecs::Decoder>> = None;
+
+    if let Some(params) = map_audio_params(at) {
+        if SymphoniaAudioDecoder::supported(params.codec_id) {
+            match SymphoniaAudioDecoder::try_new(&params) {
+                Ok(d) => audio_dec = Some(d),
+                Err(e) => {
+                    emit(
+                        event_tx,
+                        PlayerEvent::Warning {
+                            message: format!(
+                                "fallback: SymphoniaAudioDecoder open failed ({e}); trying limited path"
+                            ),
+                            generation,
+                        },
+                    );
+                    audio_decoder_raw = symphonia::default::get_codecs()
+                        .make(&at.codec_params, &DecoderOptions::default())
+                        .ok();
+                }
+            }
+        } else {
+            emit(
+                event_tx,
+                PlayerEvent::Warning {
+                    message: format!(
+                        "fallback audio codec '{}' not wired in backend — limited path",
+                        params.codec_id.name()
+                    ),
+                    generation,
+                },
+            );
+            audio_decoder_raw = symphonia::default::get_codecs()
+                .make(&at.codec_params, &DecoderOptions::default())
+                .ok();
+        }
+    } else {
+        audio_decoder_raw = symphonia::default::get_codecs()
+            .make(&at.codec_params, &DecoderOptions::default())
+            .ok();
+        if audio_decoder_raw.is_none() {
+            emit(
+                event_tx,
+                PlayerEvent::Warning {
+                    message: "fallback: no audio decoder available — audio muted".into(),
+                    generation,
+                },
+            );
+        }
+    }
+    (audio_dec, audio_decoder_raw, ch, rate)
+}
+
 #[cfg(all(
     feature = "backend-symphonia",
     feature = "backend-openh264",
@@ -246,7 +408,6 @@ fn run_worker(
     use rsmpeg_codec::{DecodeStatus, Decoder};
     use rsmpeg_util::Rational;
     use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error;
     use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, Track};
     use symphonia::core::io::MediaSourceStream;
@@ -255,7 +416,6 @@ fn run_worker(
     use symphonia::core::units::Time;
 
     use crate::backend::OpenH264Decoder;
-    use crate::backend::SymphoniaAudioDecoder;
     // Cached converter: reuses one `Scaler` per resolution instead of building
     // a fresh one for every decoded frame (byte-identical output).
     use crate::video_convert::yuv420p_frame_to_rgba_cached;
@@ -309,9 +469,10 @@ fn run_worker(
     let mut format = probed.format;
     let tracks = format.tracks().to_vec();
 
-    let audio_track: Option<Track> = find_audio_track(&tracks).cloned();
+    let mut audio_track: Option<Track> = find_audio_track(&tracks).cloned();
     let mut video_track: Option<Track> = find_h264_video_track(&tracks).cloned();
     let mut stream_avcc = None;
+    let mut fallback_video_id = None;
     if video_track.is_none() {
         if let Some(u) = find_unsupported_video(&tracks) {
             emit(
@@ -326,6 +487,7 @@ fn run_worker(
                 .iter()
                 .find(|t| !matches!(classify_track(t), TrackKind::Audio))
                 .cloned();
+            fallback_video_id = video_track.as_ref().map(|t| t.id);
             stream_avcc = Some(avcc);
         }
     }
@@ -334,6 +496,7 @@ fn run_worker(
     if !has_video && !has_audio {
         return Err("No playable audio or H.264 video tracks found".into());
     }
+    let (video_tracks, audio_tracks) = collect_fallback_tracks(&tracks, fallback_video_id);
 
     let track_duration_sec = |t: &Track| -> f64 {
         let n = t.codec_params.n_frames.unwrap_or(0) as f64;
@@ -364,12 +527,12 @@ fn run_worker(
     };
     let duration = Duration::from_secs_f64(duration_sec.max(0.0));
 
-    let video_time_base = video_track.as_ref().and_then(|t| {
+    let mut video_time_base = video_track.as_ref().and_then(|t| {
         t.codec_params
             .time_base
             .map(|tb| Rational::new(tb.numer as i32, tb.denom.max(1) as i32))
     });
-    let sec_per_tick = video_time_base
+    let mut sec_per_tick = video_time_base
         .map(|tb| tb.num as f64 / tb.den.max(1) as f64)
         .filter(|s| s.is_finite() && *s > 0.0);
     let assumed_frame_dur = 1.0 / 30.0;
@@ -396,7 +559,7 @@ fn run_worker(
     let avcc_blob = video_track
         .as_ref()
         .and_then(|t| t.codec_params.extra_data.as_ref().map(|e| e.to_vec()))
-        .or(stream_avcc);
+        .or_else(|| stream_avcc.clone());
     let mut video_dec: Option<OpenH264Decoder> = if let Some(ref vt) = video_track {
         let params = map_h264_params(vt, avcc_blob);
         match OpenH264Decoder::from_params(&params) {
@@ -417,78 +580,17 @@ fn run_worker(
     };
 
     // ── Audio decoder (Symphonia packet-in backend, limited raw fallback) ──
-    let audio_track_id = audio_track.as_ref().map(|t| t.id);
-    let audio_time_base = audio_track.as_ref().and_then(|t| {
+    let mut audio_track_id = audio_track.as_ref().map(|t| t.id);
+    let mut audio_time_base = audio_track.as_ref().and_then(|t| {
         t.codec_params
             .time_base
             .map(|tb| Rational::new(tb.numer as i32, tb.denom.max(1) as i32))
     });
-    let mut audio_channels = audio_track
-        .as_ref()
-        .and_then(|t| t.codec_params.channels)
-        .map(|c| c.count() as u16)
-        .unwrap_or(2);
-    let mut audio_rate = audio_track
-        .as_ref()
-        .and_then(|t| t.codec_params.sample_rate)
-        .unwrap_or(44_100);
-
-    let mut audio_dec: Option<SymphoniaAudioDecoder> = None;
-    // Limited path: raw Symphonia codec decoder for codecs the backend does not wire.
-    let mut audio_decoder_raw: Option<Box<dyn symphonia::core::codecs::Decoder>> = None;
-
-    if let Some(ref at) = audio_track {
-        if let Some(params) = map_audio_params(at) {
-            if SymphoniaAudioDecoder::supported(params.codec_id) {
-                match SymphoniaAudioDecoder::try_new(&params) {
-                    Ok(d) => audio_dec = Some(d),
-                    Err(e) => {
-                        emit(
-                            &event_tx,
-                            PlayerEvent::Warning {
-                                message: format!(
-                                    "fallback: SymphoniaAudioDecoder open failed ({e}); trying limited path"
-                                ),
-                                generation,
-                            },
-                        );
-                        audio_decoder_raw = symphonia::default::get_codecs()
-                            .make(&at.codec_params, &DecoderOptions::default())
-                            .ok();
-                    }
-                }
-            } else {
-                // e.g. FLAC mapped but not supported by packet-in backend.
-                emit(
-                    &event_tx,
-                    PlayerEvent::Warning {
-                        message: format!(
-                            "fallback audio codec '{}' not wired in backend — limited path",
-                            params.codec_id.name()
-                        ),
-                        generation,
-                    },
-                );
-                audio_decoder_raw = symphonia::default::get_codecs()
-                    .make(&at.codec_params, &DecoderOptions::default())
-                    .ok();
-            }
-        } else {
-            // Unmapped codec: keep previous limited Symphonia decoder path.
-            audio_decoder_raw = symphonia::default::get_codecs()
-                .make(&at.codec_params, &DecoderOptions::default())
-                .ok();
-            if audio_decoder_raw.is_none() {
-                emit(
-                    &event_tx,
-                    PlayerEvent::Warning {
-                        message: "fallback: no audio decoder available — audio muted".into(),
-                        generation,
-                    },
-                );
-            }
-        }
-    }
+    let (mut audio_dec, mut audio_decoder_raw, mut audio_channels, mut audio_rate) =
+        match audio_track.as_ref() {
+            Some(at) => open_fallback_audio(at, generation, &event_tx),
+            None => (None, None, 2, 44_100),
+        };
 
     let _rodio = OutputStream::try_default();
     let sink = _rodio
@@ -499,13 +601,23 @@ fn run_worker(
         s.set_volume(volume);
     }
 
-    let seek_track_id = video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
-    let video_stream_index = video_track.as_ref().map(|t| t.id as usize).unwrap_or(0);
-    let audio_stream_index = audio_track.as_ref().map(|t| t.id as usize).unwrap_or(0);
-    let default_video_tb = video_time_base.unwrap_or_else(|| Rational::new(1, 30_000));
-    let default_audio_tb =
+    let mut seek_track_id = video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
+    let mut video_stream_index = video_track.as_ref().map(|t| t.id as usize).unwrap_or(0);
+    let mut audio_stream_index = audio_track.as_ref().map(|t| t.id as usize).unwrap_or(0);
+    let mut default_video_tb = video_time_base.unwrap_or_else(|| Rational::new(1, 30_000));
+    let mut default_audio_tb =
         audio_time_base.unwrap_or_else(|| Rational::new(1, audio_rate.max(1) as i32));
 
+    emit(
+        &event_tx,
+        PlayerEvent::Tracks {
+            video_tracks: video_tracks.clone(),
+            audio_tracks: audio_tracks.clone(),
+            active_video: video_track.as_ref().map(|t| t.id as usize),
+            active_audio: audio_track.as_ref().map(|t| t.id as usize),
+            generation,
+        },
+    );
     emit(
         &event_tx,
         snap(true, position, duration, volume, generation, "playing"),
@@ -659,17 +771,189 @@ fn run_worker(
                                 snap(playing, position, duration, volume, g, "rate"),
                             );
                         }
-                        other => {
-                            emit(
-                                &event_tx,
-                                PlayerEvent::Warning {
-                                    message: format!(
-                                        "command not implemented: {:?}",
-                                        other.generation()
-                                    ),
-                                    generation: other.generation(),
-                                },
-                            );
+                        PlayerCommand::SelectAudioTrack {
+                            index,
+                            generation: g,
+                        } => {
+                            generation = g;
+                            if let Some(at) = tracks
+                                .iter()
+                                .find(|t| {
+                                    t.id as usize == index
+                                        && matches!(classify_track(t), TrackKind::Audio)
+                                })
+                                .cloned()
+                            {
+                                let (dec, raw, ch, rate) = open_fallback_audio(&at, g, &event_tx);
+                                audio_dec = dec;
+                                audio_decoder_raw = raw;
+                                audio_channels = ch;
+                                audio_rate = rate;
+                                audio_track_id = Some(at.id);
+                                audio_stream_index = at.id as usize;
+                                audio_time_base = at.codec_params.time_base.map(|tb| {
+                                    Rational::new(tb.numer as i32, tb.denom.max(1) as i32)
+                                });
+                                default_audio_tb = audio_time_base
+                                    .unwrap_or_else(|| Rational::new(1, audio_rate.max(1) as i32));
+                                audio_track = Some(at);
+                                seek_track_id =
+                                    video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
+                                audio_ring.clear();
+                                audio_target_samples = 0;
+                                audio_play_start = None;
+                                audio_played_base = 0;
+                                if let Some(ref s) = sink {
+                                    s.clear();
+                                    s.set_volume(volume);
+                                    s.set_speed(playback_rate as f32);
+                                    if playing {
+                                        s.play();
+                                    } else {
+                                        s.pause();
+                                    }
+                                }
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::Tracks {
+                                        video_tracks: video_tracks.clone(),
+                                        audio_tracks: audio_tracks.clone(),
+                                        active_video: video_track.as_ref().map(|t| t.id as usize),
+                                        active_audio: audio_track.as_ref().map(|t| t.id as usize),
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    &event_tx,
+                                    snap(playing, position, duration, volume, g, "audio-track"),
+                                );
+                            } else {
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::Warning {
+                                        message: format!("invalid audio track id {index}"),
+                                        generation: g,
+                                    },
+                                );
+                            }
+                        }
+                        PlayerCommand::SelectVideoTrack {
+                            index,
+                            generation: g,
+                        } => {
+                            generation = g;
+                            if let Some(vt) = tracks
+                                .iter()
+                                .find(|t| {
+                                    t.id as usize == index
+                                        && !matches!(classify_track(t), TrackKind::Audio)
+                                })
+                                .cloned()
+                            {
+                                match classify_track(&vt) {
+                                    TrackKind::Video(u) if u != DetectedVideoCodec::H264 => {
+                                        video_dec = None;
+                                        emit(
+                                            &event_tx,
+                                            PlayerEvent::Warning {
+                                                message: format!(
+                                                    "Unsupported video codec '{}' — audio only",
+                                                    u.name()
+                                                ),
+                                                generation: g,
+                                            },
+                                        );
+                                    }
+                                    _ => {
+                                        let extra = vt
+                                            .codec_params
+                                            .extra_data
+                                            .as_ref()
+                                            .map(|e| e.to_vec())
+                                            .or_else(|| stream_avcc.clone());
+                                        let params = map_h264_params(&vt, extra);
+                                        video_dec = match OpenH264Decoder::from_params(&params) {
+                                            Ok(d) => Some(d),
+                                            Err(e) => {
+                                                emit(
+                                                    &event_tx,
+                                                    PlayerEvent::Warning {
+                                                        message: format!(
+                                                            "fallback: failed to open OpenH264 decoder: {e}"
+                                                        ),
+                                                        generation: g,
+                                                    },
+                                                );
+                                                None
+                                            }
+                                        };
+                                    }
+                                }
+                                video_stream_index = vt.id as usize;
+                                video_time_base = vt.codec_params.time_base.map(|tb| {
+                                    Rational::new(tb.numer as i32, tb.denom.max(1) as i32)
+                                });
+                                sec_per_tick = video_time_base
+                                    .map(|tb| tb.num as f64 / tb.den.max(1) as f64)
+                                    .filter(|s| s.is_finite() && *s > 0.0);
+                                default_video_tb =
+                                    video_time_base.unwrap_or_else(|| Rational::new(1, 30_000));
+                                seek_track_id = Some(vt.id);
+                                video_track = Some(vt);
+                                let cur_secs = position.as_secs_f64().max(0.0);
+                                let _ = format.seek(
+                                    SeekMode::Coarse,
+                                    SeekTo::Time {
+                                        time: Time::from(cur_secs),
+                                        track_id: seek_track_id,
+                                    },
+                                );
+                                if let Some(ref mut d) = audio_dec {
+                                    let _ = d.reset();
+                                }
+                                if let Some(ref mut d) = audio_decoder_raw {
+                                    d.reset();
+                                }
+                                audio_ring.clear();
+                                audio_play_start = None;
+                                audio_played_base = 0;
+                                if let Some(ref s) = sink {
+                                    s.clear();
+                                    s.set_volume(volume);
+                                    s.set_speed(playback_rate as f32);
+                                    if playing {
+                                        s.play();
+                                    } else {
+                                        s.pause();
+                                    }
+                                }
+                                playback_clock.seek(position);
+                                clock_started = true;
+                                video_scheduler.reset_stats();
+                                force_one_frame = true;
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::Tracks {
+                                        video_tracks: video_tracks.clone(),
+                                        audio_tracks: audio_tracks.clone(),
+                                        active_video: video_track.as_ref().map(|t| t.id as usize),
+                                        active_audio: audio_track.as_ref().map(|t| t.id as usize),
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    &event_tx,
+                                    snap(playing, position, duration, volume, g, "video-track"),
+                                );
+                            } else {
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::Warning {
+                                        message: format!("invalid video track id {index}"),
+                                        generation: g,
+                                    },
+                                );
+                            }
                         }
                     }
                 }

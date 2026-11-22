@@ -117,7 +117,9 @@ impl eframe::App for MediaApp {
                     PlayerEvent::Warning { message, .. } => {
                         self.status = message;
                     }
-                    PlayerEvent::VideoFrame { .. } | PlayerEvent::AudioLevel { .. } => {}
+                    PlayerEvent::VideoFrame { .. }
+                    | PlayerEvent::AudioLevel { .. }
+                    | PlayerEvent::Tracks { .. } => {}
                 }
             }
 

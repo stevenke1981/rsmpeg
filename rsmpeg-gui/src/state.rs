@@ -6,8 +6,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use rsmpeg_player::{PlayerEvent, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
+use rsmpeg_player::{PlayerEvent, PlayerTrackInfo, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 
+use crate::format_time::{format_channels, format_sample_rate};
 use crate::media_info::MediaInfo;
 use crate::playlist::Playlist;
 
@@ -40,6 +41,15 @@ pub enum SidePanel {
     Playlist,
 }
 
+/// Active track switcher dropdown menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackMenu {
+    #[default]
+    None,
+    Video,
+    Audio,
+}
+
 /// Side effect returned by [`PlaybackUiState::apply_player_event`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventOutcome {
@@ -70,6 +80,11 @@ pub struct PlaybackUiState {
     pub error_message: Option<String>,
     pub warning_message: Option<String>,
     pub active_panel: SidePanel,
+    pub open_track_menu: TrackMenu,
+    pub video_tracks: Vec<PlayerTrackInfo>,
+    pub audio_tracks: Vec<PlayerTrackInfo>,
+    pub active_video_track: Option<usize>,
+    pub active_audio_track: Option<usize>,
     pub is_fullscreen: bool,
     pub is_probing: bool,
     pub playlist: Playlist,
@@ -103,6 +118,11 @@ impl PlaybackUiState {
             error_message: None,
             warning_message: None,
             active_panel: SidePanel::None,
+            open_track_menu: TrackMenu::None,
+            video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            active_video_track: None,
+            active_audio_track: None,
             is_fullscreen: false,
             is_probing: false,
             playlist: Playlist::new(),
@@ -123,6 +143,11 @@ impl PlaybackUiState {
         self.error_message = None;
         self.warning_message = None;
         self.media_info = None;
+        self.open_track_menu = TrackMenu::None;
+        self.video_tracks.clear();
+        self.audio_tracks.clear();
+        self.active_video_track = None;
+        self.active_audio_track = None;
         self.is_probing = true;
         self.reset_waveform();
     }
@@ -279,6 +304,15 @@ impl PlaybackUiState {
         }
     }
 
+    /// Toggle a track selection dropdown menu.
+    pub fn toggle_track_menu(&mut self, menu: TrackMenu) {
+        if self.open_track_menu == menu {
+            self.open_track_menu = TrackMenu::None;
+        } else {
+            self.open_track_menu = menu;
+        }
+    }
+
     /// Whether the stage should show the audio-only visualizer instead of video.
     pub fn is_audio_only_stage(&self) -> bool {
         if self.has_video_frame {
@@ -377,6 +411,19 @@ impl PlaybackUiState {
                 self.push_audio_level(*rms, *peak);
                 EventOutcome::None
             }
+            PlayerEvent::Tracks {
+                video_tracks,
+                audio_tracks,
+                active_video,
+                active_audio,
+                ..
+            } => {
+                self.video_tracks = video_tracks.clone();
+                self.audio_tracks = audio_tracks.clone();
+                self.active_video_track = *active_video;
+                self.active_audio_track = *active_audio;
+                EventOutcome::None
+            }
         }
     }
 }
@@ -447,6 +494,30 @@ pub fn localize_player_warning(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+/// Format a human-readable track label for dropdown menus.
+pub fn format_track_label(track: &PlayerTrackInfo, unsupported_label: &str) -> String {
+    let mut parts = vec![
+        format!("#{}", track.index),
+        track.codec.to_ascii_uppercase(),
+    ];
+    if track.is_video {
+        if let (Some(w), Some(h)) = (track.width, track.height) {
+            parts.push(format!("{w}×{h}"));
+        }
+    } else {
+        if let Some(sr) = track.sample_rate {
+            parts.push(format_sample_rate(sr));
+        }
+        if let Some(ch) = track.channels {
+            parts.push(format_channels(ch));
+        }
+    }
+    if !track.supported {
+        parts.push(format!("[{unsupported_label}]"));
+    }
+    parts.join(" · ")
 }
 
 /// Expand dropped paths (files + 1-level directories of supported media) off the UI thread.
@@ -701,5 +772,56 @@ mod tests {
         assert_eq!(st.active_panel, SidePanel::Playlist);
         st.toggle_panel(SidePanel::Playlist);
         assert_eq!(st.active_panel, SidePanel::None);
+    }
+
+    #[test]
+    fn tracks_event_and_track_menu_toggle_work() {
+        let mut st = PlaybackUiState::new();
+        let video = PlayerTrackInfo {
+            index: 0,
+            is_video: true,
+            codec: "h264".into(),
+            width: Some(1280),
+            height: Some(720),
+            sample_rate: None,
+            channels: None,
+            language: None,
+            supported: true,
+        };
+        let audio = PlayerTrackInfo {
+            index: 2,
+            is_video: false,
+            codec: "aac".into(),
+            width: None,
+            height: None,
+            sample_rate: Some(48_000),
+            channels: Some(2),
+            language: Some("zho".into()),
+            supported: true,
+        };
+        st.apply_player_event(&PlayerEvent::Tracks {
+            video_tracks: vec![video.clone()],
+            audio_tracks: vec![audio.clone()],
+            active_video: Some(0),
+            active_audio: Some(2),
+            generation: 1,
+        });
+        assert_eq!(st.video_tracks.len(), 1);
+        assert_eq!(st.audio_tracks.len(), 1);
+        assert_eq!(st.active_video_track, Some(0));
+        assert_eq!(st.active_audio_track, Some(2));
+
+        assert_eq!(format_track_label(&video, "不支援"), "#0 · H264 · 1280×720");
+        assert_eq!(
+            format_track_label(&audio, "不支援"),
+            "#2 · AAC · 48.0 kHz · 立體聲 (2)"
+        );
+
+        st.toggle_track_menu(TrackMenu::Audio);
+        assert_eq!(st.open_track_menu, TrackMenu::Audio);
+        st.toggle_track_menu(TrackMenu::Video);
+        assert_eq!(st.open_track_menu, TrackMenu::Video);
+        st.toggle_track_menu(TrackMenu::Video);
+        assert_eq!(st.open_track_menu, TrackMenu::None);
     }
 }

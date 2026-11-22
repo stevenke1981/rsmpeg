@@ -3,6 +3,22 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Summary of one selectable audio or video stream reported by the playback worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerTrackInfo {
+    /// Stream index (native pipeline) or track id (fallback) accepted by
+    /// `SelectAudioTrack` / `SelectVideoTrack`.
+    pub index: usize,
+    pub is_video: bool,
+    pub codec: String,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u16>,
+    pub language: Option<String>,
+    pub supported: bool,
+}
+
 /// Lightweight state snapshot for UI binding (replaces large shared Mutex state).
 #[derive(Debug, Clone)]
 pub struct PlayerSnapshot {
@@ -56,6 +72,14 @@ pub enum PlayerEvent {
         peak: f32,
         generation: u64,
     },
+    /// Available audio/video tracks and currently active selections.
+    Tracks {
+        video_tracks: Vec<PlayerTrackInfo>,
+        audio_tracks: Vec<PlayerTrackInfo>,
+        active_video: Option<usize>,
+        active_audio: Option<usize>,
+        generation: u64,
+    },
 }
 
 /// Compute normalized `(rms, peak)` levels in `0.0..=1.0` from signed 16-bit PCM samples.
@@ -87,7 +111,8 @@ impl PlayerEvent {
             | Self::Ended { generation }
             | Self::Error { generation, .. }
             | Self::Warning { generation, .. }
-            | Self::AudioLevel { generation, .. } => *generation,
+            | Self::AudioLevel { generation, .. }
+            | Self::Tracks { generation, .. } => *generation,
         }
     }
 }
@@ -139,6 +164,13 @@ mod tests {
             PlayerEvent::AudioLevel {
                 rms: 0.25,
                 peak: 0.75,
+                generation: 7,
+            },
+            PlayerEvent::Tracks {
+                video_tracks: Vec::new(),
+                audio_tracks: Vec::new(),
+                active_video: None,
+                active_audio: None,
                 generation: 7,
             },
         ];

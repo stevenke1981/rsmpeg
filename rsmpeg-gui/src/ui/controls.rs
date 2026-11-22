@@ -10,7 +10,7 @@ use gpui::{
 
 use crate::format_time::{format_duration, format_rate, format_volume_percent};
 use crate::i18n::UiStrings;
-use crate::state::{PlaybackStatus, PlaybackUiState};
+use crate::state::{format_track_label, PlaybackStatus, PlaybackUiState, TrackMenu};
 use crate::ui::{theme, PlayerView};
 
 /// Render the full bottom playback control deck.
@@ -278,6 +278,26 @@ fn render_right_controls(
     } else {
         strings.fullscreen_enter
     };
+    let has_video_tracks = !state.video_tracks.is_empty();
+    let has_audio_tracks = !state.audio_tracks.is_empty();
+    let video_btn_label = if state.video_tracks.len() > 1 {
+        format!(
+            "{} ({}) ▾",
+            strings.track_video_btn,
+            state.video_tracks.len()
+        )
+    } else {
+        format!("{} ▾", strings.track_video_btn)
+    };
+    let audio_btn_label = if state.audio_tracks.len() > 1 {
+        format!(
+            "{} ({}) ▾",
+            strings.track_audio_btn,
+            state.audio_tracks.len()
+        )
+    } else {
+        format!("{} ▾", strings.track_audio_btn)
+    };
 
     div()
         .flex()
@@ -373,6 +393,74 @@ fn render_right_controls(
                 .text_color(theme::text_secondary())
                 .child(vol_pct),
         )
+        .when(has_video_tracks, |el| {
+            let open = state.open_track_menu == TrackMenu::Video;
+            el.child(
+                div()
+                    .id("btn-video-tracks")
+                    .px_2p5()
+                    .py_1()
+                    .rounded_md()
+                    .bg(if open {
+                        theme::accent_soft()
+                    } else {
+                        theme::bg_elevated()
+                    })
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .border_1()
+                    .border_color(if open {
+                        theme::accent()
+                    } else {
+                        theme::border_subtle()
+                    })
+                    .text_xs()
+                    .text_color(if open {
+                        theme::accent()
+                    } else {
+                        theme::text_primary()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus_root(window);
+                        this.toggle_track_menu(TrackMenu::Video, cx);
+                    }))
+                    .child(video_btn_label),
+            )
+        })
+        .when(has_audio_tracks, |el| {
+            let open = state.open_track_menu == TrackMenu::Audio;
+            el.child(
+                div()
+                    .id("btn-audio-tracks")
+                    .px_2p5()
+                    .py_1()
+                    .rounded_md()
+                    .bg(if open {
+                        theme::accent_soft()
+                    } else {
+                        theme::bg_elevated()
+                    })
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .border_1()
+                    .border_color(if open {
+                        theme::accent()
+                    } else {
+                        theme::border_subtle()
+                    })
+                    .text_xs()
+                    .text_color(if open {
+                        theme::accent()
+                    } else {
+                        theme::text_primary()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus_root(window);
+                        this.toggle_track_menu(TrackMenu::Audio, cx);
+                    }))
+                    .child(audio_btn_label),
+            )
+        })
         .child(
             // Playback speed selector button
             div()
@@ -423,4 +511,189 @@ fn render_right_controls(
                 .child(fs_label),
         )
         .into_any_element()
+}
+
+/// Render the floating audio/video track switcher dropdown menu when open.
+pub fn render_track_menu_popover(
+    state: &PlaybackUiState,
+    strings: &UiStrings,
+    cx: &mut Context<PlayerView>,
+) -> Option<AnyElement> {
+    let (title, is_video, tracks, active_idx) = match state.open_track_menu {
+        TrackMenu::None => return None,
+        TrackMenu::Video => (
+            strings.track_menu_video_title,
+            true,
+            &state.video_tracks,
+            state.active_video_track,
+        ),
+        TrackMenu::Audio => (
+            strings.track_menu_audio_title,
+            false,
+            &state.audio_tracks,
+            state.active_audio_track,
+        ),
+    };
+
+    let rows: Vec<AnyElement> = if tracks.is_empty() {
+        vec![div()
+            .px_3()
+            .py_2()
+            .text_xs()
+            .text_color(theme::text_muted())
+            .child(strings.track_none)
+            .into_any_element()]
+    } else {
+        tracks
+            .iter()
+            .map(|track| {
+                let is_active = active_idx == Some(track.index);
+                let label = format_track_label(track, strings.track_unsupported);
+                let lang_chip = track.language.as_deref().map(str::to_ascii_uppercase);
+                let track_index = track.index;
+                let supported = track.supported;
+
+                div()
+                    .id((
+                        if is_video {
+                            "video-track-opt"
+                        } else {
+                            "audio-track-opt"
+                        },
+                        track_index,
+                    ))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if is_active {
+                        theme::accent_soft()
+                    } else {
+                        theme::bg_surface()
+                    })
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .border_1()
+                    .border_color(if is_active {
+                        theme::accent()
+                    } else {
+                        theme::border_subtle()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.focus_root(window);
+                        if is_video {
+                            this.select_video_track(track_index, cx);
+                        } else {
+                            this.select_audio_track(track_index, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(14.0))
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(if is_active {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_muted()
+                                    })
+                                    .child(if is_active { "✓" } else { "·" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if supported {
+                                        theme::text_primary()
+                                    } else {
+                                        theme::warn_text()
+                                    })
+                                    .truncate()
+                                    .child(label),
+                            ),
+                    )
+                    .when_some(lang_chip, |el, lang| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(theme::bg_elevated())
+                                .font_family(theme::MONO_FONT_FAMILY)
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .child(lang),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    };
+
+    Some(
+        div()
+            .id("track-menu-popover")
+            .absolute()
+            .bottom(px(86.0))
+            .right(px(16.0))
+            .w(px(340.0))
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .p_2p5()
+            .rounded_lg()
+            .bg(theme::bg_elevated())
+            .border_1()
+            .border_color(theme::border_strong())
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_1()
+                    .pb_1()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::accent())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id("close-track-menu")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .hover(|s| s.bg(theme::bg_hover()))
+                            .text_xs()
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.focus_root(window);
+                                this.close_track_menu(cx);
+                            }))
+                            .child("✕"),
+                    ),
+            )
+            .children(rows)
+            .into_any_element(),
+    )
 }

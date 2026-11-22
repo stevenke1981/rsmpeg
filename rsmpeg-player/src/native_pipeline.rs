@@ -14,7 +14,7 @@ use rsmpeg_util::MediaType;
 
 use crate::clock::{MasterClock, PlaybackClock};
 use crate::command::PlayerCommand;
-use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot};
+use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
 use crate::player::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
@@ -43,6 +43,141 @@ fn snap(
         generation,
         status: status.into(),
     })
+}
+
+/// Build selectable video and audio track lists from a parsed [`FormatContext`].
+pub(crate) fn collect_native_tracks(
+    ctx: &FormatContext,
+) -> (Vec<PlayerTrackInfo>, Vec<PlayerTrackInfo>) {
+    let mut video_tracks = Vec::new();
+    let mut audio_tracks = Vec::new();
+    for s in &ctx.streams {
+        let language = s.metadata.get("language").map(ToOwned::to_owned);
+        match s.media_type {
+            MediaType::Video => {
+                video_tracks.push(PlayerTrackInfo {
+                    index: s.index,
+                    is_video: true,
+                    codec: s.codec_id.name().to_string(),
+                    width: s.codec_params.width.filter(|&w| w > 0),
+                    height: s.codec_params.height.filter(|&h| h > 0),
+                    sample_rate: None,
+                    channels: None,
+                    language,
+                    supported: s.codec_id == CodecId::H264,
+                });
+            }
+            MediaType::Audio => {
+                let supported = matches!(s.codec_id, CodecId::Aac | CodecId::Pcm | CodecId::Mp3);
+                audio_tracks.push(PlayerTrackInfo {
+                    index: s.index,
+                    is_video: false,
+                    codec: s.codec_id.name().to_string(),
+                    width: None,
+                    height: None,
+                    sample_rate: s.codec_params.sample_rate.filter(|&sr| sr > 0),
+                    channels: s.codec_params.channels.filter(|&ch| ch > 0),
+                    language,
+                    supported,
+                });
+            }
+            _ => {}
+        }
+    }
+    (video_tracks, audio_tracks)
+}
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn open_native_video_decoder(
+    ctx: &FormatContext,
+    stream_idx: usize,
+    generation: u64,
+    event_tx: &SyncSender<PlayerEvent>,
+) -> Option<crate::backend::OpenH264Decoder> {
+    let stream = ctx.streams.get(stream_idx)?;
+    if stream.codec_id != CodecId::H264 {
+        emit(
+            event_tx,
+            PlayerEvent::Warning {
+                message: format!(
+                    "Unsupported video codec '{}' — skipping video",
+                    stream.codec_id.name()
+                ),
+                generation,
+            },
+        );
+        return None;
+    }
+    match crate::backend::OpenH264Decoder::from_params(&stream.codec_params) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            emit(
+                event_tx,
+                PlayerEvent::Warning {
+                    message: format!("native path: failed to open OpenH264 decoder: {e}"),
+                    generation,
+                },
+            );
+            None
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn open_native_audio_decoder(
+    ctx: &FormatContext,
+    stream_idx: usize,
+    generation: u64,
+    event_tx: &SyncSender<PlayerEvent>,
+) -> (
+    Option<crate::backend::symphonia_audio::SymphoniaAudioDecoder>,
+    u16,
+    u32,
+) {
+    use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
+
+    let Some(stream) = ctx.streams.get(stream_idx) else {
+        return (None, 2, 44_100);
+    };
+    let rate = stream.codec_params.sample_rate.unwrap_or(48_000);
+    let ch = stream.codec_params.channels.unwrap_or(2);
+    if !SymphoniaAudioDecoder::supported(stream.codec_id) {
+        emit(
+            event_tx,
+            PlayerEvent::Warning {
+                message: format!(
+                    "native audio codec '{}' not wired — audio muted",
+                    stream.codec_id.name()
+                ),
+                generation,
+            },
+        );
+        (None, ch, rate)
+    } else {
+        match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
+            Ok(d) => (Some(d), ch, rate),
+            Err(e) => {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: format!(
+                            "native path: failed to open Symphonia audio decoder: {e}"
+                        ),
+                        generation,
+                    },
+                );
+                (None, ch, rate)
+            }
+        }
+    }
 }
 
 /// Try native demux. Returns `Ok(())` if the session finished on this path.
@@ -88,7 +223,6 @@ fn run_native_inner(
     use rsmpeg_codec::{DecodeStatus, Decoder};
 
     use crate::audio_convert::frame_to_s16_device;
-    use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
     use crate::backend::OpenH264Decoder;
     use crate::video_convert::yuv420p_frame_to_rgba_cached;
 
@@ -122,11 +256,11 @@ fn run_native_inner(
         .ok_or_else(|| "native demux produced no packets (fragmented or empty stbl)".to_string())?;
     let mut pending: Option<rsmpeg_codec::Packet> = Some(first);
 
-    let video_si = ctx
+    let mut video_si = ctx
         .streams
         .iter()
         .position(|s| s.media_type == MediaType::Video && s.codec_id == CodecId::H264);
-    let audio_si = ctx.streams.iter().position(|s| {
+    let mut audio_si = ctx.streams.iter().position(|s| {
         s.media_type == MediaType::Audio
             && matches!(
                 s.codec_id,
@@ -137,6 +271,8 @@ fn run_native_inner(
     if video_si.is_none() && audio_si.is_none() {
         return Err("native demux: no H.264 video or supported audio stream".into());
     }
+
+    let (video_tracks, audio_tracks) = collect_native_tracks(&ctx);
 
     if let Some(u) = ctx.streams.iter().find(|s| {
         s.media_type == MediaType::Video
@@ -178,60 +314,13 @@ fn run_native_inner(
     let mut video_scheduler = VideoScheduler::new();
 
     // ── Video decoder (OpenH264 backend) ──
-    let mut video_dec: Option<OpenH264Decoder> = if let Some(si) = video_si {
-        match OpenH264Decoder::from_params(&ctx.streams[si].codec_params) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                emit(
-                    event_tx,
-                    PlayerEvent::Warning {
-                        message: format!("native path: failed to open OpenH264 decoder: {e}"),
-                        generation: 1,
-                    },
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let mut video_dec: Option<OpenH264Decoder> =
+        video_si.and_then(|si| open_native_video_decoder(&ctx, si, generation, event_tx));
 
     // ── Audio decoder (Symphonia packet-in backend) ──
-    let (mut audio_dec, mut audio_channels, mut audio_rate) = if let Some(si) = audio_si {
-        let stream = &ctx.streams[si];
-        let rate = stream.codec_params.sample_rate.unwrap_or(48_000);
-        let ch = stream.codec_params.channels.unwrap_or(2);
-        if !SymphoniaAudioDecoder::supported(stream.codec_id) {
-            emit(
-                event_tx,
-                PlayerEvent::Warning {
-                    message: format!(
-                        "native audio codec '{}' not wired — audio muted",
-                        stream.codec_id.name()
-                    ),
-                    generation: 1,
-                },
-            );
-            (None, ch, rate)
-        } else {
-            match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
-                Ok(d) => (Some(d), ch, rate),
-                Err(e) => {
-                    emit(
-                        event_tx,
-                        PlayerEvent::Warning {
-                            message: format!(
-                                "native path: failed to open Symphonia audio decoder: {e}"
-                            ),
-                            generation: 1,
-                        },
-                    );
-                    (None, ch, rate)
-                }
-            }
-        }
-    } else {
-        (None, 2u16, 44_100u32)
+    let (mut audio_dec, mut audio_channels, mut audio_rate) = match audio_si {
+        Some(si) => open_native_audio_decoder(&ctx, si, generation, event_tx),
+        None => (None, 2u16, 44_100u32),
     };
 
     let _rodio = OutputStream::try_default();
@@ -243,6 +332,16 @@ fn run_native_inner(
         s.set_volume(volume);
     }
 
+    emit(
+        event_tx,
+        PlayerEvent::Tracks {
+            video_tracks: video_tracks.clone(),
+            audio_tracks: audio_tracks.clone(),
+            active_video: video_si,
+            active_audio: audio_si,
+            generation,
+        },
+    );
     emit(
         event_tx,
         snap(
@@ -262,7 +361,7 @@ fn run_native_inner(
         },
     );
 
-    let video_time_base = video_si.map(|si| {
+    let mut video_time_base = video_si.map(|si| {
         let tb = &ctx.streams[si].time_base;
         tb.num as f64 / tb.den.max(1) as f64
     });
@@ -403,17 +502,118 @@ fn run_native_inner(
                                 snap(playing, position, duration, volume, g, "rate"),
                             );
                         }
-                        other => {
-                            emit(
-                                event_tx,
-                                PlayerEvent::Warning {
-                                    message: format!(
-                                        "command not implemented: gen={}",
-                                        other.generation()
-                                    ),
-                                    generation: other.generation(),
-                                },
-                            );
+                        PlayerCommand::SelectAudioTrack {
+                            index,
+                            generation: g,
+                        } => {
+                            generation = g;
+                            let valid = ctx
+                                .streams
+                                .get(index)
+                                .is_some_and(|s| s.media_type == MediaType::Audio);
+                            if !valid {
+                                emit(
+                                    event_tx,
+                                    PlayerEvent::Warning {
+                                        message: format!("invalid audio track index {index}"),
+                                        generation: g,
+                                    },
+                                );
+                            } else {
+                                audio_si = Some(index);
+                                let (dec, ch, rate) =
+                                    open_native_audio_decoder(&ctx, index, g, event_tx);
+                                audio_dec = dec;
+                                audio_channels = ch;
+                                audio_rate = rate;
+                                audio_master.set_audio_sample_rate(audio_rate);
+                                appended_samples =
+                                    MasterClock::duration_to_audio_samples(position, audio_rate);
+                                if let Some(ref s) = sink {
+                                    s.clear();
+                                    s.set_volume(volume);
+                                    s.set_speed(playback_rate as f32);
+                                    if playing {
+                                        s.play();
+                                    } else {
+                                        s.pause();
+                                    }
+                                }
+                                emit(
+                                    event_tx,
+                                    PlayerEvent::Tracks {
+                                        video_tracks: video_tracks.clone(),
+                                        audio_tracks: audio_tracks.clone(),
+                                        active_video: video_si,
+                                        active_audio: audio_si,
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    event_tx,
+                                    snap(playing, position, duration, volume, g, "audio-track"),
+                                );
+                            }
+                        }
+                        PlayerCommand::SelectVideoTrack {
+                            index,
+                            generation: g,
+                        } => {
+                            generation = g;
+                            let valid = ctx
+                                .streams
+                                .get(index)
+                                .is_some_and(|s| s.media_type == MediaType::Video);
+                            if !valid {
+                                emit(
+                                    event_tx,
+                                    PlayerEvent::Warning {
+                                        message: format!("invalid video track index {index}"),
+                                        generation: g,
+                                    },
+                                );
+                            } else {
+                                video_si = Some(index);
+                                video_dec = open_native_video_decoder(&ctx, index, g, event_tx);
+                                video_time_base = Some({
+                                    let tb = &ctx.streams[index].time_base;
+                                    tb.num as f64 / tb.den.max(1) as f64
+                                });
+                                let ts_ms = (position.as_secs_f64().max(0.0) * 1000.0) as i64;
+                                let _ = ctx.seek(ts_ms);
+                                pending = ctx.read_frame().ok().flatten();
+                                if let Some(ref mut d) = audio_dec {
+                                    let _ = d.reset();
+                                }
+                                if let Some(ref s) = sink {
+                                    s.clear();
+                                    s.set_volume(volume);
+                                    s.set_speed(playback_rate as f32);
+                                    if playing {
+                                        s.play();
+                                    } else {
+                                        s.pause();
+                                    }
+                                }
+                                playback_clock.seek(position);
+                                clock_started = true;
+                                video_scheduler.reset_stats();
+                                force_one_frame = true;
+                                emit(
+                                    event_tx,
+                                    PlayerEvent::Tracks {
+                                        video_tracks: video_tracks.clone(),
+                                        audio_tracks: audio_tracks.clone(),
+                                        active_video: video_si,
+                                        active_audio: audio_si,
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    event_tx,
+                                    snap(playing, position, duration, volume, g, "video-track"),
+                                );
+                            }
                         }
                     }
                 }
@@ -816,4 +1016,62 @@ fn run_native_inner(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsmpeg_format::Stream;
+    use rsmpeg_util::Dict;
+
+    #[test]
+    fn collect_native_tracks_splits_video_and_audio_with_metadata() {
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: None,
+            metadata: Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+
+        let mut v0 = Stream::new(0, CodecId::H264);
+        v0.media_type = MediaType::Video;
+        v0.codec_params.width = Some(1280);
+        v0.codec_params.height = Some(720);
+        ctx.add_stream(v0);
+
+        let mut v1 = Stream::new(1, CodecId::Hevc);
+        v1.media_type = MediaType::Video;
+        v1.codec_params.width = Some(1920);
+        v1.codec_params.height = Some(1080);
+        ctx.add_stream(v1);
+
+        let mut a0 = Stream::new(2, CodecId::Aac);
+        a0.media_type = MediaType::Audio;
+        a0.codec_params.sample_rate = Some(48_000);
+        a0.codec_params.channels = Some(2);
+        a0.metadata.insert("language", "eng");
+        ctx.add_stream(a0);
+
+        let mut a1 = Stream::new(3, CodecId::Aac);
+        a1.media_type = MediaType::Audio;
+        a1.codec_params.sample_rate = Some(44_100);
+        a1.codec_params.channels = Some(2);
+        a1.metadata.insert("language", "zho");
+        ctx.add_stream(a1);
+
+        let (v, a) = collect_native_tracks(&ctx);
+        assert_eq!(v.len(), 2);
+        assert_eq!(a.len(), 2);
+        assert!(v[0].supported);
+        assert_eq!(v[0].width, Some(1280));
+        assert!(!v[1].supported);
+        assert_eq!(a[0].language.as_deref(), Some("eng"));
+        assert_eq!(a[1].language.as_deref(), Some("zho"));
+        assert!(a[0].supported);
+    }
 }
