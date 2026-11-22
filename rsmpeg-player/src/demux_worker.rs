@@ -623,10 +623,16 @@ fn run_worker(
         snap(true, position, duration, volume, generation, "playing"),
     );
 
+    let mut deferred_cmd: Option<PlayerCommand> = None;
+
     loop {
         // ── Drain commands ──
         loop {
-            match cmd_rx.try_recv() {
+            let next_cmd = match deferred_cmd.take() {
+                Some(cmd) => Ok(cmd),
+                None => cmd_rx.try_recv(),
+            };
+            match next_cmd {
                 Ok(cmd) => {
                     let g = cmd.generation();
                     match cmd {
@@ -1055,15 +1061,22 @@ fn run_worker(
                                                 while rem > Duration::ZERO {
                                                     thread::sleep(rem.min(MAX_PACE_SLEEP));
                                                     rem = rem.saturating_sub(MAX_PACE_SLEEP);
-                                                    if matches!(
-                                                        cmd_rx.try_recv(),
-                                                        Ok(PlayerCommand::Stop { .. })
-                                                            | Ok(PlayerCommand::Shutdown { .. })
-                                                            | Err(TryRecvError::Disconnected)
-                                                    ) {
-                                                        stop = true;
-                                                        present = false;
-                                                        break;
+                                                    match cmd_rx.try_recv() {
+                                                        Ok(
+                                                            PlayerCommand::Stop { .. }
+                                                            | PlayerCommand::Shutdown { .. },
+                                                        )
+                                                        | Err(TryRecvError::Disconnected) => {
+                                                            stop = true;
+                                                            present = false;
+                                                            break;
+                                                        }
+                                                        Ok(other) => {
+                                                            deferred_cmd = Some(other);
+                                                            present = false;
+                                                            break;
+                                                        }
+                                                        Err(TryRecvError::Empty) => {}
                                                     }
                                                     if !playing && !force_one_frame {
                                                         present = false;
@@ -1145,7 +1158,7 @@ fn run_worker(
                                         }
                                     }
                                 }
-                                if stop {
+                                if stop || deferred_cmd.is_some() {
                                     break;
                                 }
                             }

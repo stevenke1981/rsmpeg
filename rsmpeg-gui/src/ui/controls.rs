@@ -646,6 +646,7 @@ pub fn render_track_menu_popover(
     Some(
         div()
             .id("track-menu-popover")
+            .occlude()
             .absolute()
             .bottom(px(86.0))
             .right(px(16.0))
@@ -659,6 +660,9 @@ pub fn render_track_menu_popover(
             .border_1()
             .border_color(theme::border_strong())
             .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .child(
                 div()
                     .flex()
