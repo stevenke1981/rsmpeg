@@ -186,7 +186,20 @@ impl Scaler {
                     && self.config.src_width == self.config.dst_width
                     && self.config.src_height == self.config.dst_height =>
             {
-                // Same format / size: shallow-ish copy of planes.
+                // Same format / size: the frame is returned as-is, which is only
+                // safe if it really carries the configured format. Without this
+                // check a `Bgr24` frame passed to an `Rgb24` scaler came back
+                // labelled `Bgr24` — the caller then feeds blue where red is
+                // expected, and nothing downstream can notice.
+                Self::require_source_format(frame, src)?;
+                // Validate the planes too: an identity copy of an overlapping
+                // or truncated plane set hands the corruption straight on.
+                Self::validate_source_planes(frame, src)?;
+                Self::validate_output_size(
+                    self.config.dst_width as usize,
+                    self.config.dst_height as usize,
+                    frame.data.first().map(|p| p.len()).unwrap_or(0).max(1),
+                )?;
                 Ok(clone_frame_metadata(
                     frame,
                     frame.data.clone(),
@@ -287,7 +300,76 @@ impl Scaler {
                     .into(),
                 )
             })
+            // `Vec` cannot describe more than `isize::MAX` bytes, so a size that
+            // merely avoids `usize` overflow can still be unallocatable. Reject
+            // it here rather than aborting inside the allocator.
+            .and_then(|n| {
+                if n > isize::MAX as usize {
+                    Err(RsError::InvalidData(
+                        format!(
+                            "scale: output size {width}x{height}x{bytes_per_pixel} = {n} bytes                              exceeds the maximum allocatable buffer"
+                        )
+                        .into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
             .map(|_| ())
+    }
+
+    /// Validate every plane of a source `frame` for its declared format.
+    ///
+    /// Used by the identity path, which copies planes verbatim: an overlapping
+    /// stride or truncated plane would be copied as-is and the corruption would
+    /// surface far from here.
+    fn validate_source_planes(frame: &Frame, format: PixelFormat) -> RsResult<()> {
+        let (w, h) = (frame.width, frame.height);
+        if w == 0 || h == 0 {
+            return Err(RsError::InvalidData(
+                "scale: source frame has zero width or height".into(),
+            ));
+        }
+        let layouts: Vec<(usize, usize, usize, &'static str)> = match format {
+            PixelFormat::Yuv420P => vec![
+                (w, h, 1, "Y"),
+                (w.div_ceil(2), h.div_ceil(2), 1, "U"),
+                (w.div_ceil(2), h.div_ceil(2), 1, "V"),
+            ],
+            PixelFormat::Yuv422P => vec![
+                (w, h, 1, "Y"),
+                (w.div_ceil(2), h, 1, "U"),
+                (w.div_ceil(2), h, 1, "V"),
+            ],
+            PixelFormat::Yuv444P => vec![(w, h, 1, "Y"), (w, h, 1, "U"), (w, h, 1, "V")],
+            PixelFormat::Nv12 | PixelFormat::Nv21 => {
+                vec![(w, h, 1, "Y"), (w.div_ceil(2), h.div_ceil(2), 2, "UV")]
+            }
+            PixelFormat::Rgb24 | PixelFormat::Bgr24 => vec![(w, h, 3, "packed")],
+            PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Argb => vec![(w, h, 4, "packed")],
+            _ => vec![(w, h, 1, "plane")],
+        };
+        if frame.data.len() < layouts.len() || frame.linesize.len() < layouts.len() {
+            return Err(RsError::InvalidData(
+                format!(
+                    "scale: {format:?} frame has {} plane(s), expected {}",
+                    frame.data.len(),
+                    layouts.len()
+                )
+                .into(),
+            ));
+        }
+        for (i, (pw, ph, bps, name)) in layouts.into_iter().enumerate() {
+            Self::validate_plane(
+                &frame.data[i],
+                frame.linesize[i],
+                pw,
+                ph,
+                bps,
+                &format!("{format:?} {name}"),
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_yuv420p_planes<'a>(
@@ -606,6 +688,9 @@ impl Scaler {
         // BT.601 limited range, matching the Yuv420P paths.
         let limited = self.color.src_range == ColorRange::Limited;
         let bpp = if alpha { 4 } else { 3 };
+        // Same destination check as the other output paths: `dst_w * bpp` can
+        // overflow `usize` for a caller-supplied destination size.
+        Self::validate_output_size(dst_w, dst_h, bpp)?;
         let out_stride = dst_w * bpp;
         let mut out = vec![0u8; out_stride * dst_h];
 
@@ -2078,6 +2163,86 @@ mod tests {
             .scale(&nv12)
             .expect_err("mismatched frame format must be rejected when resizing");
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn identity_path_rejects_a_mismatched_source_format() {
+        // Second review round: same-size Rgb24 -> Rgb24 used to accept a Bgr24
+        // frame and hand it straight back, colours silently swapped.
+        let mut bgr = Frame::new_video(1, 1, PixelFormat::Bgr24);
+        bgr.data = vec![vec![0, 0, 255]];
+        bgr.linesize = vec![3];
+        let scaler =
+            Scaler::new(ScalerConfig::new(1, 1, PixelFormat::Rgb24, 1, 1, PixelFormat::Rgb24))
+                .unwrap();
+        let err = scaler
+            .scale(&bgr)
+            .expect_err("identity path must validate the frame's own format");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+
+        // The correctly labelled frame still round-trips unchanged.
+        let mut rgb = Frame::new_video(1, 1, PixelFormat::Rgb24);
+        rgb.data = vec![vec![255, 0, 0]];
+        rgb.linesize = vec![3];
+        let out = scaler.scale(&rgb).unwrap();
+        assert_eq!(out.pixel_format, PixelFormat::Rgb24);
+        assert_eq!(out.data[0], vec![255, 0, 0]);
+    }
+
+    #[test]
+    fn identity_path_rejects_overlapping_or_truncated_planes() {
+        let scaler =
+            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgb24))
+                .unwrap();
+        // Overlapping rows (linesize 3 for a 6-byte row).
+        let mut overlap = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        overlap.data = vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9]];
+        overlap.linesize = vec![3];
+        assert!(scaler.scale(&overlap).is_err(), "short stride must be rejected");
+
+        // Truncated plane.
+        let mut truncated = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        truncated.data[0].truncate(5);
+        assert!(scaler.scale(&truncated).is_err(), "short plane must be rejected");
+
+        // Zero-sized frame.
+        let empty = Frame::new_video(0, 0, PixelFormat::Rgb24);
+        assert!(scaler.scale(&empty).is_err());
+
+        // Correct frame still passes through.
+        let ok = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        assert!(scaler.scale(&ok).is_ok());
+    }
+
+    #[test]
+    fn every_output_path_checks_the_destination_size() {
+        // A destination that overflows `usize` when multiplied out must be
+        // reported by *all* paths, including Nv12/Yuv422P -> packed which the
+        // second review found unchecked.
+        let huge = u32::MAX;
+        let nv12 = make_nv12_frame(4, 4, 16, 128, 128);
+        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Nv12, huge, huge, PixelFormat::Rgba))
+            .unwrap();
+        assert!(matches!(scaler.scale(&nv12), Err(RsError::InvalidData(_))));
+
+        let rgb = make_nv12_frame(4, 4, 16, 128, 128);
+        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Nv12, huge, huge, PixelFormat::Rgb24))
+            .unwrap();
+        assert!(matches!(scaler.scale(&rgb), Err(RsError::InvalidData(_))));
+
+        let yuv422 = make_yuv422p_frame(4, 4, 16, 128, 128);
+        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv422P, huge, huge, PixelFormat::Rgba))
+            .unwrap();
+        assert!(matches!(scaler.scale(&yuv422), Err(RsError::InvalidData(_))));
+
+        let yuv420 = make_yuv420p_frame(4, 4, 16, 128, 128);
+        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv420P, huge, huge, PixelFormat::Bgr24))
+            .unwrap();
+        assert!(matches!(scaler.scale(&yuv420), Err(RsError::InvalidData(_))));
+
+        let scaler = Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv420P, huge, huge, PixelFormat::Yuv420P))
+            .unwrap();
+        assert!(matches!(scaler.scale(&yuv420), Err(RsError::InvalidData(_))));
     }
 
     #[test]
