@@ -582,4 +582,52 @@ mod tests {
             DecodeStatus::NeedMoreInput
         ));
     }
+
+    #[test]
+    fn submit_annex_b_does_not_leak_pts_entries_on_corrupt_input() {
+        use rsmpeg_codec::H264BitstreamFormat;
+
+        let mut params = CodecParameters::new(CodecId::H264);
+        params.h264_bitstream_format = H264BitstreamFormat::AnnexB;
+        let mut dec = OpenH264Decoder::from_params(&params).unwrap();
+        let garbage = [0u8, 0, 0, 1, 0x88, 0x84, 0x21, 0x00];
+
+        // Every corrupt packet must clean up its queued PTS; otherwise the
+        // FIFO (and its memory) grows without bound during playback of a
+        // stream we cannot decode.
+        for i in 0..32 {
+            dec.submit_annex_b(&garbage, Some(i)).unwrap();
+        }
+        assert!(
+            dec.pts_queue.len() <= dec.pending.len(),
+            "pts_queue ({}) must not outgrow pending frames ({})",
+            dec.pts_queue.len(),
+            dec.pending.len()
+        );
+        // Still usable afterwards.
+        dec.send_packet(None).unwrap();
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn send_packet_after_eof_requires_reset() {
+        // The decoder refuses packets after the flush and says so, instead of
+        // silently accepting data it will never emit.
+        let mut params = CodecParameters::new(CodecId::H264);
+        params.h264_bitstream_format = rsmpeg_codec::H264BitstreamFormat::AnnexB;
+        let mut dec = OpenH264Decoder::from_params(&params).unwrap();
+        dec.send_packet(None).unwrap();
+
+        let mut pkt = Packet::new(vec![0, 0, 0, 1, 0x09, 0x10].into(), 0);
+        pkt.time_base = Rational::new(1, 30);
+        let err = dec.send_packet(Some(&pkt)).unwrap_err();
+        assert!(matches!(err, RsError::Codec(_)), "got {err:?}");
+
+        // reset() makes it usable again.
+        dec.reset().unwrap();
+        assert!(dec.send_packet(Some(&pkt)).is_ok());
+    }
 }

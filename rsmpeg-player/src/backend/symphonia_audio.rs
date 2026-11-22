@@ -305,9 +305,12 @@ fn audio_buffer_to_frame(
         Rational::new(1, sample_rate.max(1) as i32)
     };
 
+    // `data` is moved into the frame — cloning it here doubled the per-packet
+    // audio copy on the hot decode path.
+    let linesize = data.len();
     Frame {
-        data: vec![data.clone()],
-        linesize: vec![data.len()],
+        data: vec![data],
+        linesize: vec![linesize],
         width: 0,
         height: 0,
         pixel_format: PixelFormat::None,
@@ -510,6 +513,50 @@ mod tests {
     fn unsupported_codec_rejected() {
         let p = CodecParameters::new(CodecId::H264);
         assert!(SymphoniaAudioDecoder::try_new(&p).is_err());
+    }
+
+    #[test]
+    fn send_after_eof_is_a_lifecycle_error() {
+        // The decoder moves to a terminal state on flush; sending again must
+        // be a clean error rather than silently dropping the packet (which
+        // would lose audio after a seek that forgot to reset()).
+        let mut dec = SymphoniaAudioDecoder::try_new(&pcm_params()).expect("pcm");
+        dec.send_packet(None).unwrap();
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
+
+        let raw: Vec<u8> = (0i16..8).flat_map(|v| v.to_le_bytes()).collect();
+        let pkt = Packet::new(raw.into(), 0);
+        let err = dec.send_packet(Some(&pkt)).unwrap_err();
+        assert!(matches!(err, RsError::Codec(_)), "got {err:?}");
+
+        // reset() must lift the error state again.
+        dec.reset().unwrap();
+        dec.send_packet(Some(&pkt)).unwrap();
+    }
+
+    #[test]
+    fn decoded_frame_plane_is_owned_not_shared() {
+        // Regression guard for the removed `data.clone()`: the frame's single
+        // plane must be exactly the interleaved S16 bytes of `samples *
+        // channels`, and `linesize` must describe it.
+        let mut dec = SymphoniaAudioDecoder::try_new(&pcm_params()).expect("pcm");
+        let raw: Vec<u8> = (0i16..8).flat_map(|v| v.to_le_bytes()).collect();
+        let mut pkt = Packet::new(raw.into(), 0);
+        pkt.duration = 4;
+        dec.send_packet(Some(&pkt)).unwrap();
+
+        let DecodeStatus::Frame(f) = dec.receive_frame().unwrap() else {
+            panic!("expected a decoded frame");
+        };
+        assert_eq!(f.data.len(), 1);
+        assert_eq!(f.data[0].len(), 4 * 2 * 2);
+        assert_eq!(f.linesize[0], f.data[0].len());
+        // 4 stereo samples → the last value must be preserved verbatim.
+        let tail = &f.data[0][f.data[0].len() - 2..];
+        assert_eq!(i16::from_le_bytes([tail[0], tail[1]]), 7);
     }
 
     #[test]
