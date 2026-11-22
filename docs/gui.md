@@ -24,10 +24,15 @@ cargo run -p rsmpeg-gui
 # 啟動時直接載入單檔或多檔（自動加入播放清單並播放第一首）
 cargo run -p rsmpeg-gui -- path\to\video.mp4 path\to\audio.wav
 
+# 以英文介面啟動（支援 zh / en，執行中亦可按 G 或點擊頂部列按鈕即時切換）
+cargo run -p rsmpeg-gui -- --lang en path\to\video.mp4
+
 # Release 建置
 cargo build --release -p rsmpeg-gui
 .\target\release\rsmpeg-gui.exe path\to\video.mp4
 ```
+
+> **Release 建置實測結果**：於 Windows `stable-x86_64-pc-windows-gnu`（搭配 Windows 10 SDK `fxc.exe` 預先編譯 GPUI HLSL shader）執行 `cargo build --release -p rsmpeg-gui` 建置通過，產出 `target\release\rsmpeg-gui.exe` 大小為 **44,106,389 bytes（約 42.06 MiB）**。
 
 ### 測試與品質檢查
 
@@ -50,11 +55,13 @@ cargo test --workspace
    - **影片舞台**：使用 GPUI GPU 加速 `RenderImage`（RGBA8 轉 BGRA8）搭配 `ObjectFit::Contain` 維持原始長寬比與黑色信箱區，縮放視窗流暢不卡；更換影格時主動呼叫 `window.drop_image` 釋放舊紋理避免 GPU 記憶體累積。
    - **純音訊舞台**：偵測為純音訊檔（或視訊 codec 不支援而回退純音訊播放）時，顯示封面占位圖示、檔名、容器／取樣率／聲道摘要與即時捲動波形視覺化（由 `rsmpeg-player` 節流送出的 `PlayerEvent::AudioLevel` 驅動）。
 
-3. **播放控制列**
+3. **播放控制列與軌道切換**
    - 播放／暫停（停止或播完後按播放自動重播）、停止、上一首／下一首。
    - 可點擊與跨視窗拖曳的進度列（拖曳中即時預覽目標時間，放開後定位）。
    - 等寬字型顯示目前時間與總時長（`MM:SS` 或 `HH:MM:SS`）。
    - 可拖曳音量滑桿、百分比讀數與靜音切換（記住靜音前音量，解除靜音自動還原）。
+   - **視訊軌／音軌下拉選單**：由 `rsmpeg-player` 發出 `PlayerEvent::Tracks`，底部控制列動態顯示 `視訊軌`／`音軌` 下拉按鈕（多軌時附帶軌道數如 `音軌 (2) ▾`）；展開選單列出串流編號、編解碼器、解析度或取樣率／聲道、ISO-639-2 語言標籤（如 `ENG`／`ZHO`）與支援狀態，點擊即可於當前播放位置即時切換軌道。
+   - **原生 MP4 AAC 音訊解碼**：`rsmpeg-format` 原生 MP4 demuxer 完整解析 `esds` 內的 `ES_Descriptor → DecoderConfigDescriptor → DecoderSpecificInfo`，剝除封裝標頭並將純 `AudioSpecificConfig` 交給音訊解碼器，讓 FFmpeg 產生的標準 MP4（H.264 + AAC）可直接有聲播放。
    - 播放速度切換：`0.5x`、`0.75x`、`1.0x`、`1.25x`、`1.5x`、`2.0x`（同時作用於視訊排程時鐘與 `rodio` 音訊速度）。
    - 全螢幕切換（按鈕、雙擊影片舞台或快捷鍵 `F`，按 `Esc` 退出）。
 
@@ -64,10 +71,10 @@ cargo test --workspace
 5. **播放清單**
    - 支援多檔管理、路徑去重、點擊立即切換、上一首／下一首、單筆移除、清空清單與播完自動連播下一首。
 
-6. **錯誤處理與介面設計**
-   - 不支援的格式、損毀或不存在的檔案皆顯示清楚的繁體中文錯誤卡片或可關閉提示橫幅，不會當掉或卡死 UI；清單內有下一首時可直接跳轉繼續播放。
-   - 深色劇院主題、Windows 下預設採用 `Microsoft JhengHei UI` 正常顯示繁體中文與 `Consolas` 顯示等寬時間碼。
-   - 所有使用者可見字串集中管理於 `rsmpeg-gui/src/i18n.rs`，方便日後擴充英文（`en-US`）或其他語系。
+6. **多語系（繁體中文／英文）與錯誤處理**
+   - 內建完整 `ZH_TW`（預設）與 `EN_US` 語系表（集中管理於 `rsmpeg-gui/src/i18n.rs`），可透過頂部列 `繁中`／`EN` 按鈕、快捷鍵 `G` 或啟動參數 `--lang zh|en` 即時切換，並同步更新視窗標題、控制列、媒體資訊、軌道選單與作用中的錯誤／警告訊息。
+   - 不支援的格式、損毀或不存在的檔案皆顯示清楚的在地化錯誤卡片或可關閉提示橫幅，不會當掉或卡死 UI；清單內有下一首時可直接跳轉繼續播放。
+   - 深色劇院主題、Windows 下預設採用 `Microsoft JhengHei UI` 與 `Consolas` 等寬時間碼。
 
 ---
 
@@ -79,13 +86,16 @@ cargo test --workspace
 | `←` / `→` | 倒轉／快轉 5 秒 |
 | `↑` / `↓` | 音量增加／減少 5% |
 | `F` | 切換全螢幕（雙擊影片區亦可） |
-| `Esc` | 退出全螢幕（非全螢幕時關閉側邊面板） |
+| `Esc` | 關閉軌道選單／退出全螢幕／關閉側邊面板 |
 | `M` | 靜音／取消靜音 |
 | `O` 或 `Ctrl+O` | 開啟媒體檔案對話框 |
 | `S` | 停止播放並歸零 |
 | `N` / `PageDown` | 下一首 |
 | `P` / `PageUp` | 上一首 |
 | `[` / `]` | 降低／提高播放速度 |
+| `V` | 開關視訊軌切換選單 |
+| `A` | 開關音軌切換選單 |
+| `G` | 即時切換介面語系（繁體中文／English） |
 | `I` | 開關媒體資訊面板 |
 | `L` | 開關播放清單側欄 |
 
@@ -103,22 +113,23 @@ cargo test --workspace
 
 ## 實測截圖
 
-以下截圖皆由實際啟動 `rsmpeg-gui.exe` 於 Windows Direct3D 11 視窗擷取（1702×1076 物理像素，150% DPI）：
+以下截圖皆由實際啟動 Release 版 `rsmpeg-gui.exe` 於 Windows Direct3D 11 視窗擷取（1702×1076 物理像素，150% DPI）：
 
 | 畫面 | 截圖 |
 | --- | --- |
-| 歡迎畫面與預設深色介面 | ![歡迎畫面](gui/01_welcome.png) |
-| MP4（1280×720 H.264）播放中＋媒體資訊面板 | ![影片播放與媒體資訊](gui/02_video_playing_info.png) |
+| 歡迎畫面與預設深色介面（含頂部列語系切換鈕） | ![歡迎畫面](gui/01_welcome.png) |
+| FFmpeg MP4（1280×720 H.264 + 48 kHz AAC）原生有聲播放中（零解碼警告）＋媒體資訊面板 | ![有聲影片播放與媒體資訊](gui/02_video_playing_info.png) |
 | 快轉定位至 00:07、暫停與播放清單側欄 | ![Seek 暫停與播放清單](gui/03_video_seek_paused_playlist.png) |
 | 純音訊 WAV 舞台、即時波形視覺化與 probe 資訊 | ![純音訊波形與資訊](gui/04_audio_only_waveform.png) |
 | 損毀檔案錯誤處理畫面 | ![錯誤處理畫面](gui/05_error_handling.png) |
+| 多軌 MP4 音軌切換下拉選單（雙 H.264 + 雙 AAC `ENG`/`ZHO`） | ![多軌音軌下拉選單](gui/06_multitrack_audio_menu.png) |
+| EN_US 英文語系＋實測切換至視訊軌 `#1`（`640×360` SMPTE 色條）與視訊軌選單 | ![英文介面與視訊軌切換](gui/07_english_ui_video_tracks.png) |
 
 ---
 
 ## 已知限制
 
 - **視訊／音訊 codec 覆蓋率取決於 `rsmpeg-player`**：目前原生視訊解碼僅支援 H.264（OpenH264）；遇到 HEVC/VP9/AV1 等未支援視訊軌會顯示提示橫幅並嘗試以純音訊模式播放。
-- **原生 MP4 AAC `esds` 限制**：部分 FFmpeg 產生的 MP4 在 `rsmpeg-format` 原生 demux 路徑下 `esds` extradata 尚未完整剝離封裝標頭，可能導致原生路徑音訊解碼初始化失敗而顯示非致命提示並僅播放視訊（此屬既有 `rsmpeg-format`/`rsmpeg-player` 限制，GUI 會清楚回報而不當掉）。
 - **音訊變速音高**：播放速度使用 `rodio::Sink::set_speed`，屬重採樣變速，尚未實作維持原音高（time-stretch）演算法。
 - **拖放資料夾深度**：拖放資料夾時僅掃描第一層的支援媒體檔案，避免深度遞迴掃描造成延遲。
 - **無頭 CI 測試範圍**：GPUI 視窗渲染本身需要圖形介面，單元測試涵蓋非 UI 核心邏輯（狀態機、時間與單位格式化、快捷鍵對應、播放清單、probe 解析、RGBA→BGRA 轉換與長寬比計算）。
