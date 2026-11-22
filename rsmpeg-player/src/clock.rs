@@ -41,12 +41,13 @@ impl PlaybackClock {
         if self.paused_at.is_some() {
             return;
         }
-        if let Some(start) = self.started {
+        if let Some(start) = self.started.take() {
             let elapsed = start.elapsed().mul_f64(self.rate);
             self.base += elapsed;
-            self.started = None;
-            self.paused_at = Some(Instant::now());
         }
+        // Record pause even before first `start()` so a subsequent `seek()`
+        // keeps the clock frozen until `resume()` / `start()` is called.
+        self.paused_at = Some(Instant::now());
     }
 
     pub fn resume(&mut self) {
@@ -452,5 +453,32 @@ mod tests {
         // Seeking clears the paused state.
         assert!(!m.is_paused());
         assert!(m.now() >= Duration::from_secs(7));
+    }
+
+    #[test]
+    fn pause_before_start_keeps_clock_frozen_across_seek_until_resume() {
+        let mut c = PlaybackClock::new();
+        // Pausing before first start (e.g. `autoplay(false)`) must mark the clock paused.
+        c.pause();
+        assert!(c.is_paused());
+
+        let target = Duration::from_millis(400);
+        c.seek(target);
+        assert!(c.is_paused(), "seek while paused must keep clock frozen");
+
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            c.now(),
+            target,
+            "pause duration before resume must not advance clock"
+        );
+
+        c.resume();
+        assert!(!c.is_paused());
+        let immediately_after = c.now();
+        assert!(
+            immediately_after >= target && immediately_after < target + Duration::from_millis(30),
+            "clock must resume from seek target without jump, got {immediately_after:?}"
+        );
     }
 }

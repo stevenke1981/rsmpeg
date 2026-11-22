@@ -757,3 +757,94 @@ fn queue_saturation_and_event_backpressure_preserve_generation_and_ended() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// P1-03 adjacent regression: opening a 3-second WAV with `autoplay(false)`, seeking to
+/// 400 ms while paused, remaining paused for ~1.35 s, and then calling `play()` must resume
+/// near 400 ms rather than counting the 1.35 s pause duration into playback position (~1.76 s).
+#[test]
+fn paused_wav_seek_then_resume_does_not_count_pause_duration() {
+    let path = unique_temp_path("p1_03_paused_resume_wav", "wav");
+    std::fs::write(&path, build_pcm_wav(3)).expect("write 3s wav fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(false)
+            .volume(0.0)
+            .build()
+            .expect("build paused wav player");
+
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                matches!(ev, PlayerEvent::Snapshot(s) if s.status == "paused")
+            }),
+            "native={prefer_native}: expected initial paused snapshot"
+        );
+
+        let target = Duration::from_millis(400);
+        player.seek(target).expect("seek paused wav");
+        let seek_gen = player.generation();
+        assert!(
+            watch(&mut player, Duration::from_secs(2), |ev| {
+                matches!(
+                    ev,
+                    PlayerEvent::SeekCompleted {
+                        position,
+                        generation,
+                    } if generation == seek_gen && position == target
+                )
+            }),
+            "native={prefer_native}: expected SeekCompleted(400ms)"
+        );
+
+        // Remain paused for 1.35 s: must not end and position must stay at 400 ms.
+        let ended_while_paused = watch(&mut player, Duration::from_millis(1350), |ev| {
+            matches!(ev, PlayerEvent::Ended { .. })
+        });
+        assert!(
+            !ended_while_paused,
+            "native={prefer_native}: must not emit Ended while paused"
+        );
+        assert_eq!(
+            player.position(),
+            target,
+            "native={prefer_native}: paused position must remain 400 ms"
+        );
+
+        player.play().expect("resume paused wav");
+        let mut first_pos = None;
+        let mut audio_peak = false;
+        let resumed = watch(&mut player, Duration::from_millis(1400), |ev| {
+            match ev {
+                PlayerEvent::PositionChanged {
+                    position,
+                    generation,
+                } if generation == seek_gen => {
+                    first_pos.get_or_insert(position);
+                }
+                PlayerEvent::AudioLevel {
+                    peak, generation, ..
+                } if generation == seek_gen => {
+                    audio_peak |= peak > 0.0;
+                }
+                _ => {}
+            }
+            first_pos.is_some() && audio_peak
+        });
+
+        assert!(
+            resumed,
+            "native={prefer_native}: expected PositionChanged and non-zero AudioLevel after play"
+        );
+        let pos = first_pos.expect("first PositionChanged");
+        assert!(
+            pos >= Duration::from_millis(300) && pos < Duration::from_millis(750),
+            "native={prefer_native}: resumed position jumped past pause duration: {pos:?}"
+        );
+
+        let _ = player.shutdown();
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

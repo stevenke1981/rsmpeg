@@ -751,6 +751,9 @@ fn run_worker(
                                 }
                             }
                             playback_clock.seek(position);
+                            if !playing {
+                                playback_clock.pause();
+                            }
                             clock_started = true;
                             video_scheduler.reset_stats();
                             video_frame_index = 0;
@@ -968,6 +971,9 @@ fn run_worker(
                                     }
                                 }
                                 playback_clock.seek(position);
+                                if !playing {
+                                    playback_clock.pause();
+                                }
                                 clock_started = true;
                                 video_scheduler.reset_stats();
                                 force_one_frame = video_dec.is_some();

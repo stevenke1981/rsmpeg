@@ -468,6 +468,9 @@ fn run_native_inner(
                                 }
                             }
                             playback_clock.seek(position);
+                            if !playing {
+                                playback_clock.pause();
+                            }
                             clock_started = true;
                             audio_master.seek_to(position);
                             if !playing {
@@ -623,6 +626,9 @@ fn run_native_inner(
                                     }
                                 }
                                 playback_clock.seek(position);
+                                if !playing {
+                                    playback_clock.pause();
+                                }
                                 clock_started = true;
                                 video_scheduler.reset_stats();
                                 force_one_frame = video_dec.is_some();
