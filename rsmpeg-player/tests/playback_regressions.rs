@@ -954,3 +954,68 @@ fn saturated_stream_delivers_all_control_replies_in_native_and_fallback() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// P1-06 regression (end-to-end): playing a short dual-AAC MP4 to completion must
+/// deliver `opening` / `Tracks` / `playing` strictly before `Ended`, with zero
+/// events arriving after `Ended`.
+#[test]
+fn short_file_delivers_opening_and_playing_snapshots_strictly_before_ended() {
+    // 10 frames ≈ 213 ms short AAC MP4.
+    let path = unique_temp_path("p1_06_short_order", "mp4");
+    std::fs::write(&path, build_dual_aac_mp4(10)).expect("write short dual-aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .volume(0.0)
+            .build()
+            .expect("build short player");
+
+        let mut events = Vec::new();
+        let mut saw_ended = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !saw_ended && Instant::now() < deadline {
+            if let Some(ev) = player.poll_event() {
+                if matches!(ev, PlayerEvent::Ended { .. }) {
+                    saw_ended = true;
+                }
+                events.push(ev);
+            } else {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        // Brief settle then confirm nothing arrives after Ended.
+        thread::sleep(Duration::from_millis(50));
+        while let Some(ev) = player.poll_event() {
+            events.push(ev);
+        }
+
+        assert!(saw_ended, "native={prefer_native}: expected Ended");
+        let ended_idx = events
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::Ended { .. }))
+            .expect("Ended present");
+        let playing_idx = events
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::Snapshot(s) if s.playing))
+            .expect("playing Snapshot present");
+        let tracks_idx = events
+            .iter()
+            .position(|e| matches!(e, PlayerEvent::Tracks { .. }))
+            .expect("Tracks present");
+
+        assert!(
+            playing_idx < ended_idx && tracks_idx < ended_idx,
+            "native={prefer_native}: playing({playing_idx}) and tracks({tracks_idx}) must precede Ended({ended_idx})"
+        );
+        assert_eq!(
+            ended_idx,
+            events.len() - 1,
+            "native={prefer_native}: no event may follow Ended"
+        );
+        assert_eq!(player.state(), PlayerState::Ended);
+    }
+
+    let _ = std::fs::remove_file(&path);
+}

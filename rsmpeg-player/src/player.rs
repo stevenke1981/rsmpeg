@@ -19,87 +19,155 @@ const EVT_CAPACITY: usize = 128;
 const CONTROL_EVT_CAPACITY: usize = 256;
 const TERMINAL_EVT_CAPACITY: usize = 8;
 
-/// Multi-lane non-blocking event sender with global sequence ordering.
-///
-/// - `stream` (`EVT_CAPACITY = 128`): high-frequency telemetry (`VideoFrame`,
-///   `PositionChanged`, `AudioLevel`, `Warning`) that drops cleanly under
-///   backpressure.
-/// - `control` (`CONTROL_EVT_CAPACITY = 256`, drop-oldest): control replies
-///   (`Snapshot`, `SeekCompleted`, `Tracks`) isolated from frame floods so
-///   host/GUI state never desynchronizes when polling lags.
-/// - `terminal` (`TERMINAL_EVT_CAPACITY = 8`): terminal lifecycle events
-///   (`Ended`, `Error`) that can never be evicted by frames or control replies.
+/// Reliability tier for events inside the unified ordered [`EventQueue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventClass {
+    /// High-frequency telemetry (`VideoFrame`, `PositionChanged`, `AudioLevel`, `Warning`).
+    /// Drops incoming events once `EVT_CAPACITY` (128) stream items are buffered.
+    Stream,
+    /// Control acknowledgements (`Snapshot`, `SeekCompleted`, `Tracks`).
+    /// Isolated from `Stream` backpressure; bounded at `CONTROL_EVT_CAPACITY` (256),
+    /// evicting an older `Snapshot` first if saturated.
+    Control,
+    /// Terminal lifecycle events (`Ended`, `Error`).
+    /// Never evicted by `Stream` or `Control`; bounded at `TERMINAL_EVT_CAPACITY` (8).
+    Terminal,
+}
+
+struct QueuedEvent {
+    class: EventClass,
+    event: PlayerEvent,
+}
+
+struct EventQueueInner {
+    entries: VecDeque<QueuedEvent>,
+    stream_count: usize,
+    control_count: usize,
+    terminal_count: usize,
+}
+
+impl EventQueueInner {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(EVT_CAPACITY + 32),
+            stream_count: 0,
+            control_count: 0,
+            terminal_count: 0,
+        }
+    }
+
+    fn push(&mut self, class: EventClass, event: PlayerEvent) {
+        match class {
+            EventClass::Stream => {
+                if self.stream_count >= EVT_CAPACITY {
+                    return;
+                }
+                self.stream_count += 1;
+                self.entries.push_back(QueuedEvent { class, event });
+            }
+            EventClass::Control => {
+                if self.control_count >= CONTROL_EVT_CAPACITY {
+                    let evict_idx = self
+                        .entries
+                        .iter()
+                        .position(|q| {
+                            q.class == EventClass::Control
+                                && matches!(q.event, PlayerEvent::Snapshot(_))
+                        })
+                        .or_else(|| {
+                            self.entries
+                                .iter()
+                                .position(|q| q.class == EventClass::Control)
+                        });
+                    if let Some(idx) = evict_idx {
+                        self.entries.remove(idx);
+                        self.control_count -= 1;
+                    }
+                }
+                self.control_count += 1;
+                self.entries.push_back(QueuedEvent { class, event });
+            }
+            EventClass::Terminal => {
+                if self.terminal_count >= TERMINAL_EVT_CAPACITY {
+                    return;
+                }
+                self.terminal_count += 1;
+                self.entries.push_back(QueuedEvent { class, event });
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<PlayerEvent> {
+        let item = self.entries.pop_front()?;
+        match item.class {
+            EventClass::Stream => self.stream_count -= 1,
+            EventClass::Control => self.control_count -= 1,
+            EventClass::Terminal => self.terminal_count -= 1,
+        }
+        Some(item.event)
+    }
+}
+
+/// Shared single-lock ordered event queue guaranteeing linearizable FIFO order
+/// across all reliability tiers.
+#[derive(Clone)]
+pub(crate) struct EventQueue {
+    inner: Arc<Mutex<EventQueueInner>>,
+}
+
+impl EventQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(EventQueueInner::new())),
+        }
+    }
+
+    fn push(&self, class: EventClass, event: PlayerEvent) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.push(class, event);
+    }
+
+    pub(crate) fn pop(&self) -> Option<PlayerEvent> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.pop()
+    }
+}
+
+/// Non-blocking event sender backed by either the unified ordered [`EventQueue`]
+/// or a single `SyncSender` for backwards-compatible public worker entry points.
 #[derive(Clone)]
 pub(crate) enum EventSender {
-    Multi {
-        next_seq: Arc<AtomicU64>,
-        stream: mpsc::SyncSender<(u64, PlayerEvent)>,
-        control: Arc<Mutex<VecDeque<(u64, PlayerEvent)>>>,
-        terminal: mpsc::SyncSender<(u64, PlayerEvent)>,
-    },
+    Queued(EventQueue),
     Single(mpsc::SyncSender<PlayerEvent>),
 }
 
 impl EventSender {
-    pub(crate) fn new(
-        stream: mpsc::SyncSender<(u64, PlayerEvent)>,
-        control: Arc<Mutex<VecDeque<(u64, PlayerEvent)>>>,
-        terminal: mpsc::SyncSender<(u64, PlayerEvent)>,
-    ) -> Self {
-        Self::Multi {
-            next_seq: Arc::new(AtomicU64::new(0)),
-            stream,
-            control,
-            terminal,
-        }
+    pub(crate) fn new(queue: EventQueue) -> Self {
+        Self::Queued(queue)
     }
 
     pub(crate) fn single(normal: mpsc::SyncSender<PlayerEvent>) -> Self {
         Self::Single(normal)
     }
 
-    /// Non-blocking emit preserving chronological order across lanes via `seq`.
+    /// Non-blocking emit preserving strict enqueue order across all event tiers.
     pub(crate) fn send(&self, ev: PlayerEvent) {
         match self {
             Self::Single(tx) => {
                 let _ = tx.try_send(ev);
             }
-            Self::Multi {
-                next_seq,
-                stream,
-                control,
-                terminal,
-            } => {
-                let seq = next_seq.fetch_add(1, Ordering::Relaxed);
-                match ev {
-                    PlayerEvent::Ended { .. } | PlayerEvent::Error { .. } => {
-                        let _ = terminal.try_send((seq, ev));
-                    }
+            Self::Queued(queue) => {
+                let class = match ev {
+                    PlayerEvent::Ended { .. } | PlayerEvent::Error { .. } => EventClass::Terminal,
                     PlayerEvent::Snapshot(_)
                     | PlayerEvent::SeekCompleted { .. }
-                    | PlayerEvent::Tracks { .. } => {
-                        if let Ok(mut q) = control.lock() {
-                            if q.len() >= CONTROL_EVT_CAPACITY {
-                                // Prefer evicting an older Snapshot before Tracks/SeekCompleted.
-                                if let Some(pos) = q
-                                    .iter()
-                                    .position(|(_, e)| matches!(e, PlayerEvent::Snapshot(_)))
-                                {
-                                    q.remove(pos);
-                                } else {
-                                    q.pop_front();
-                                }
-                            }
-                            q.push_back((seq, ev));
-                        }
-                    }
+                    | PlayerEvent::Tracks { .. } => EventClass::Control,
                     PlayerEvent::VideoFrame { .. }
                     | PlayerEvent::PositionChanged { .. }
                     | PlayerEvent::AudioLevel { .. }
-                    | PlayerEvent::Warning { .. } => {
-                        let _ = stream.try_send((seq, ev));
-                    }
-                }
+                    | PlayerEvent::Warning { .. } => EventClass::Stream,
+                };
+                queue.push(class, ev);
             }
         }
     }
@@ -216,12 +284,7 @@ pub struct Player {
     duration: Duration,
     playing: bool,
     cmd_tx: mpsc::SyncSender<PlayerCommand>,
-    event_rx: mpsc::Receiver<(u64, PlayerEvent)>,
-    control_rx: Arc<Mutex<VecDeque<(u64, PlayerEvent)>>>,
-    terminal_rx: mpsc::Receiver<(u64, PlayerEvent)>,
-    peek_stream: Option<(u64, PlayerEvent)>,
-    peek_control: Option<(u64, PlayerEvent)>,
-    peek_terminal: Option<(u64, PlayerEvent)>,
+    event_queue: EventQueue,
     handle: Option<thread::JoinHandle<()>>,
     shut_down: bool,
     last_error: Option<String>,
@@ -236,16 +299,14 @@ impl Player {
         autoplay: bool,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
-        let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
-        let control_queue = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
-        let (terminal_tx, terminal_rx) = mpsc::sync_channel(TERMINAL_EVT_CAPACITY);
+        let event_queue = EventQueue::new();
         let rate = clamp_playback_rate(playback_rate);
         let handle = demux_worker::spawn_worker_with_sender(
             path.clone(),
             volume,
             prefer_native,
             cmd_rx,
-            EventSender::new(event_tx, Arc::clone(&control_queue), terminal_tx),
+            EventSender::new(event_queue.clone()),
         );
 
         let player = Self {
@@ -259,12 +320,7 @@ impl Player {
             duration: Duration::ZERO,
             playing: autoplay,
             cmd_tx,
-            event_rx,
-            control_rx: control_queue,
-            terminal_rx,
-            peek_stream: None,
-            peek_control: None,
-            peek_terminal: None,
+            event_queue,
             handle: Some(handle),
             shut_down: false,
             last_error: None,
@@ -439,36 +495,10 @@ impl Player {
         Ok(())
     }
 
-    /// Poll one outbound event (non-blocking) in global chronological sequence
-    /// order across the streaming, control-reply, and terminal lanes.
+    /// Poll one outbound event (non-blocking) in strict linearizable enqueue order
+    /// across all reliability tiers (stream, control, terminal).
     pub fn poll_event(&mut self) -> Option<PlayerEvent> {
-        if self.peek_stream.is_none() {
-            self.peek_stream = self.event_rx.try_recv().ok();
-        }
-        if self.peek_control.is_none() {
-            if let Ok(mut q) = self.control_rx.lock() {
-                self.peek_control = q.pop_front();
-            }
-        }
-        if self.peek_terminal.is_none() {
-            self.peek_terminal = self.terminal_rx.try_recv().ok();
-        }
-
-        let winner = [
-            (0u8, self.peek_stream.as_ref().map(|(s, _)| *s)),
-            (1u8, self.peek_control.as_ref().map(|(s, _)| *s)),
-            (2u8, self.peek_terminal.as_ref().map(|(s, _)| *s)),
-        ]
-        .into_iter()
-        .filter_map(|(lane, seq)| seq.map(|s| (s, lane)))
-        .min_by_key(|(s, _)| *s)
-        .map(|(_, lane)| lane)?;
-
-        let (_, ev) = match winner {
-            0 => self.peek_stream.take()?,
-            1 => self.peek_control.take()?,
-            _ => self.peek_terminal.take()?,
-        };
+        let ev = self.event_queue.pop()?;
         self.apply_event(&ev);
         Some(ev)
     }
@@ -564,9 +594,7 @@ mod tests {
     /// can be verified deterministically.
     fn make_channel_player() -> (Player, mpsc::Receiver<PlayerCommand>, EventSender) {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
-        let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
-        let control_queue = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
-        let (terminal_tx, terminal_rx) = mpsc::sync_channel(TERMINAL_EVT_CAPACITY);
+        let event_queue = EventQueue::new();
         let player = Player {
             path: PathBuf::from("synthetic.mp4"),
             prefer_native: true,
@@ -578,21 +606,12 @@ mod tests {
             duration: Duration::from_secs(10),
             playing: true,
             cmd_tx,
-            event_rx,
-            control_rx: Arc::clone(&control_queue),
-            terminal_rx,
-            peek_stream: None,
-            peek_control: None,
-            peek_terminal: None,
+            event_queue: event_queue.clone(),
             handle: None,
             shut_down: false,
             last_error: None,
         };
-        (
-            player,
-            cmd_rx,
-            EventSender::new(event_tx, control_queue, terminal_tx),
-        )
+        (player, cmd_rx, EventSender::new(event_queue))
     }
 
     #[test]
@@ -846,5 +865,83 @@ mod tests {
         assert!(!p.is_playing());
         assert_eq!(p.position(), Duration::from_secs(7));
         assert!((p.volume() - 0.25).abs() < 1e-6);
+    }
+
+    /// P1-06 regression: under concurrent producer/consumer polling, a terminal
+    /// `Ended` event must NEVER be dequeued ahead of earlier `Snapshot`, `Tracks`,
+    /// or `Stream` events.
+    #[test]
+    fn concurrent_poll_never_reorders_terminal_ended_before_earlier_snapshots() {
+        for _ in 0..64 {
+            let (mut p, _rx, evt_tx) = make_channel_player();
+            let producer = thread::spawn(move || {
+                evt_tx.send(PlayerEvent::Snapshot(PlayerSnapshot {
+                    playing: true,
+                    position: Duration::ZERO,
+                    duration: Duration::ZERO,
+                    volume: 0.8,
+                    generation: 1,
+                    status: "opening-native".into(),
+                }));
+                evt_tx.send(PlayerEvent::Tracks {
+                    video_tracks: Vec::new(),
+                    audio_tracks: Vec::new(),
+                    active_video: None,
+                    active_audio: Some(0),
+                    generation: 1,
+                });
+                evt_tx.send(PlayerEvent::Snapshot(PlayerSnapshot {
+                    playing: true,
+                    position: Duration::ZERO,
+                    duration: Duration::from_millis(200),
+                    volume: 0.8,
+                    generation: 1,
+                    status: "playing-native".into(),
+                }));
+                for i in 0..32u64 {
+                    evt_tx.send(PlayerEvent::PositionChanged {
+                        position: Duration::from_millis(i * 5),
+                        generation: 1,
+                    });
+                }
+                evt_tx.send(PlayerEvent::Ended { generation: 1 });
+            });
+
+            let mut events = Vec::new();
+            let mut saw_ended = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !saw_ended && std::time::Instant::now() < deadline {
+                if let Some(ev) = p.poll_event() {
+                    if matches!(ev, PlayerEvent::Ended { .. }) {
+                        saw_ended = true;
+                    }
+                    events.push(ev);
+                } else {
+                    thread::yield_now();
+                }
+            }
+            producer.join().expect("producer finished");
+            // Drain any remaining events (must be empty after Ended!).
+            while let Some(ev) = p.poll_event() {
+                events.push(ev);
+            }
+
+            assert!(saw_ended, "expected Ended event");
+            let ended_idx = events
+                .iter()
+                .position(|e| matches!(e, PlayerEvent::Ended { .. }))
+                .expect("Ended present");
+            assert_eq!(
+                ended_idx,
+                events.len() - 1,
+                "Ended must be strictly the final event, never preceding earlier snapshots: {events:?}"
+            );
+            assert!(
+                matches!(&events[0], PlayerEvent::Snapshot(s) if s.status == "opening-native"),
+                "first event must be opening-native snapshot, got {:?}",
+                events[0]
+            );
+            assert_eq!(p.state(), PlayerState::Ended);
+        }
     }
 }
