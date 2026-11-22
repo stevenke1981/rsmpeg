@@ -96,6 +96,7 @@ struct TrackTables {
     height: u16,
     sample_rate: u32,
     channels: u16,
+    bit_rate: u64,
     extradata: Option<Vec<u8>>,
     h264_format: H264BitstreamFormat,
     stts: Vec<(u32, u32)>,      // (count, delta)
@@ -119,6 +120,7 @@ impl Default for TrackTables {
             height: 0,
             sample_rate: 0,
             channels: 0,
+            bit_rate: 0,
             extradata: None,
             h264_format: H264BitstreamFormat::Unknown,
             stts: Vec::new(),
@@ -317,6 +319,9 @@ impl InputFormat for MP4Demuxer {
             }
             if tables.channels > 0 {
                 stream.codec_params.channels = Some(tables.channels);
+            }
+            if tables.bit_rate > 0 {
+                stream.codec_params.bit_rate = Some(tables.bit_rate);
             }
             stream.time_base = Rational::new(1, time_base);
             stream.duration = duration_tb;
@@ -1337,11 +1342,14 @@ fn parse_audio_sample_entry(
     end: u64,
     tables: &mut TrackTables,
 ) -> RsResult<()> {
-    // AudioSampleEntry: 6+2 reserved/data_ref + 8 version fields + channels + size_size + ...
-    // channels at offset 16, sample_rate at offset 24 (u16.u16 fixed)
+    // AudioSampleEntry: 6 reserved + 2 data_ref + 2 version + 6 reserved +
+    // channels (offset 16) + sample_size (18) + pre_defined (20) + reserved (22) +
+    // sample_rate u16.u16 fixed (offset 24).
     if end.saturating_sub(start) < 28 {
         return Ok(());
     }
+    io.seek(SeekFrom::Start(start + 8))?;
+    let entry_version = io.read_u16_be()?;
     io.seek(SeekFrom::Start(start + 16))?;
     tables.channels = io.read_u16_be()?;
     let _sample_size = io.read_u16_be()?;
@@ -1351,8 +1359,13 @@ fn parse_audio_sample_entry(
     let _sr_lo = io.read_u16_be()?;
     tables.sample_rate = sr_hi;
 
-    // Optional esds etc. after 28-byte AudioSampleEntry header (version 0)
-    let child_start = start + 28;
+    // QuickTime AudioSampleEntry v1 adds 16 bytes; v2 adds 36 bytes.
+    let header_size: u64 = match entry_version {
+        1 => 44,
+        2 => 64,
+        _ => 28,
+    };
+    let child_start = start.saturating_add(header_size);
     let mut cursor = child_start;
     while cursor + 8 <= end {
         io.seek(SeekFrom::Start(cursor))?;
@@ -1367,8 +1380,23 @@ fn parse_audio_sample_entry(
             if len > 0 && len < 64 * 1024 {
                 io.seek(SeekFrom::Start(payload_start))?;
                 let data = io.read_bytes(len)?;
-                tables.extradata = Some(data);
-                tables.codec_id = CodecId::Aac;
+                if let Some(esds) = parse_esds(&data) {
+                    tables.codec_id = match esds.object_type_indication {
+                        0x69 | 0x6B => CodecId::Mp3,
+                        _ => CodecId::Aac,
+                    };
+                    if let Some(asc) = esds.audio_specific_config {
+                        tables.extradata = Some(asc);
+                    }
+                    let br = if esds.avg_bitrate > 0 {
+                        esds.avg_bitrate
+                    } else {
+                        esds.max_bitrate
+                    };
+                    if br > 0 {
+                        tables.bit_rate = u64::from(br);
+                    }
+                }
             }
         }
         if box_size == 0 {
@@ -1377,6 +1405,130 @@ fn parse_audio_sample_entry(
         cursor = payload_end;
     }
     Ok(())
+}
+
+/// Parsed fields extracted from an ISO/IEC 14496-1 `esds` FullBox payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedEsds {
+    object_type_indication: u8,
+    max_bitrate: u32,
+    avg_bitrate: u32,
+    audio_specific_config: Option<Vec<u8>>,
+}
+
+/// Read one ISO/IEC 14496-1 BaseDescriptor (`tag` + 1..=4 byte expandable length + payload).
+fn read_mp4_descriptor(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, mut rest) = buf.split_first()?;
+    let mut len = 0usize;
+    let mut terminated = false;
+    for _ in 0..4 {
+        let (&b, next) = rest.split_first()?;
+        rest = next;
+        len = (len << 7) | usize::from(b & 0x7F);
+        if b & 0x80 == 0 {
+            terminated = true;
+            break;
+        }
+    }
+    if !terminated || len > rest.len() {
+        return None;
+    }
+    let (payload, tail) = rest.split_at(len);
+    Some((tag, payload, tail))
+}
+
+/// Parse `DecoderConfigDescriptor` (tag `0x04`) and extract its nested
+/// `DecoderSpecificInfo` (tag `0x05`) payload as raw `AudioSpecificConfig`.
+fn parse_decoder_config_descriptor(payload: &[u8]) -> Option<ParsedEsds> {
+    // Fixed header: objectTypeIndication(1) + streamType(1) + bufferSizeDB(3)
+    // + maxBitrate(4) + avgBitrate(4) = 13 bytes.
+    if payload.len() < 13 {
+        return None;
+    }
+    let object_type_indication = payload[0];
+    let max_bitrate = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
+    let avg_bitrate = u32::from_be_bytes([payload[9], payload[10], payload[11], payload[12]]);
+
+    let mut audio_specific_config = None;
+    let mut rest = &payload[13..];
+    while !rest.is_empty() {
+        let (tag, sub_payload, next) = read_mp4_descriptor(rest)?;
+        if tag == 0x05 {
+            if !sub_payload.is_empty() {
+                audio_specific_config = Some(sub_payload.to_vec());
+            }
+            break;
+        }
+        rest = next;
+    }
+
+    Some(ParsedEsds {
+        object_type_indication,
+        max_bitrate,
+        avg_bitrate,
+        audio_specific_config,
+    })
+}
+
+/// Parse an `esds` FullBox payload (`version(1) + flags(3) + descriptors...`) and
+/// strip all MPEG-4 descriptor wrappers down to raw `AudioSpecificConfig`.
+fn parse_esds(esds_payload: &[u8]) -> Option<ParsedEsds> {
+    // Skip FullBox version (1 byte) + flags (3 bytes).
+    if esds_payload.len() < 4 {
+        return None;
+    }
+    let mut rest = &esds_payload[4..];
+    while !rest.is_empty() {
+        let (tag, payload, next) = read_mp4_descriptor(rest)?;
+        match tag {
+            0x03 => {
+                // ES_Descriptor: ES_ID(2) + flags(1) + optional fields + child descriptors.
+                if payload.len() < 3 {
+                    return None;
+                }
+                let flags = payload[2];
+                let mut inner = &payload[3..];
+                if flags & 0x80 != 0 {
+                    // streamDependenceFlag -> dependsOn_ES_ID (2 bytes)
+                    if inner.len() < 2 {
+                        return None;
+                    }
+                    inner = &inner[2..];
+                }
+                if flags & 0x40 != 0 {
+                    // URL_Flag -> URLlength(1) + URLstring(URLlength)
+                    let (&url_len, after_len) = inner.split_first()?;
+                    let url_len = usize::from(url_len);
+                    if after_len.len() < url_len {
+                        return None;
+                    }
+                    inner = &after_len[url_len..];
+                }
+                if flags & 0x20 != 0 {
+                    // OCRstreamFlag -> OCR_ES_Id (2 bytes)
+                    if inner.len() < 2 {
+                        return None;
+                    }
+                    inner = &inner[2..];
+                }
+                while !inner.is_empty() {
+                    let (child_tag, child_payload, child_next) = read_mp4_descriptor(inner)?;
+                    if child_tag == 0x04 {
+                        return parse_decoder_config_descriptor(child_payload);
+                    }
+                    inner = child_next;
+                }
+                return None;
+            }
+            0x04 => {
+                return parse_decoder_config_descriptor(payload);
+            }
+            _ => {
+                rest = next;
+            }
+        }
+    }
+    None
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────
@@ -2513,5 +2665,230 @@ mod tests {
             Vec::new()
         };
         assert!(packets.is_empty(), "samples past EOF must be dropped");
+    }
+
+    fn encode_mp4_len(len: usize, width: usize) -> Vec<u8> {
+        match width {
+            1 => vec![(len & 0x7F) as u8],
+            2 => vec![0x80 | (((len >> 7) & 0x7F) as u8), (len & 0x7F) as u8],
+            3 => vec![
+                0x80 | (((len >> 14) & 0x7F) as u8),
+                0x80 | (((len >> 7) & 0x7F) as u8),
+                (len & 0x7F) as u8,
+            ],
+            4 => vec![
+                0x80 | (((len >> 21) & 0x7F) as u8),
+                0x80 | (((len >> 14) & 0x7F) as u8),
+                0x80 | (((len >> 7) & 0x7F) as u8),
+                (len & 0x7F) as u8,
+            ],
+            _ => unreachable!("ISO/IEC 14496-1 descriptor length is 1..=4 bytes"),
+        }
+    }
+
+    fn build_esds_payload(len_width: usize, es_flags: u8, object_type: u8, asc: &[u8]) -> Vec<u8> {
+        // DecoderSpecificInfo (0x05)
+        let mut dsi = vec![0x05];
+        dsi.extend_from_slice(&encode_mp4_len(asc.len(), len_width));
+        dsi.extend_from_slice(asc);
+
+        // DecoderConfigDescriptor (0x04)
+        let mut dcd_body = Vec::new();
+        dcd_body.push(object_type);
+        dcd_body.push(0x15); // streamType: audio
+        dcd_body.extend_from_slice(&[0x00, 0x00, 0x00]); // bufferSizeDB
+        dcd_body.extend_from_slice(&128_000u32.to_be_bytes()); // maxBitrate
+        dcd_body.extend_from_slice(&126_595u32.to_be_bytes()); // avgBitrate
+        dcd_body.extend_from_slice(&dsi);
+
+        let mut dcd = vec![0x04];
+        dcd.extend_from_slice(&encode_mp4_len(dcd_body.len(), len_width));
+        dcd.extend_from_slice(&dcd_body);
+
+        // SLConfigDescriptor (0x06) trailing sibling
+        let mut sl = vec![0x06];
+        sl.extend_from_slice(&encode_mp4_len(1, len_width));
+        sl.push(0x02);
+
+        // ES_Descriptor (0x03)
+        let mut es_body = vec![0x00, 0x02, es_flags];
+        if es_flags & 0x80 != 0 {
+            es_body.extend_from_slice(&[0x00, 0x01]); // dependsOn_ES_ID
+        }
+        if es_flags & 0x40 != 0 {
+            es_body.push(3);
+            es_body.extend_from_slice(b"abc"); // URLstring
+        }
+        if es_flags & 0x20 != 0 {
+            es_body.extend_from_slice(&[0x00, 0x03]); // OCR_ES_Id
+        }
+        es_body.extend_from_slice(&dcd);
+        es_body.extend_from_slice(&sl);
+
+        // FullBox header: version(1) + flags(3)
+        let mut out = vec![0u8; 4];
+        out.push(0x03);
+        out.extend_from_slice(&encode_mp4_len(es_body.len(), len_width));
+        out.extend_from_slice(&es_body);
+        out
+    }
+
+    #[test]
+    fn esds_extracts_audio_specific_config_across_all_length_encodings() {
+        let asc = [0x11u8, 0x90, 0x56, 0xE5, 0x00];
+        for width in 1..=4 {
+            let payload = build_esds_payload(width, 0x00, 0x40, &asc);
+            let parsed =
+                parse_esds(&payload).unwrap_or_else(|| panic!("width={width} esds should parse"));
+            assert_eq!(parsed.object_type_indication, 0x40);
+            assert_eq!(parsed.max_bitrate, 128_000);
+            assert_eq!(parsed.avg_bitrate, 126_595);
+            assert_eq!(
+                parsed.audio_specific_config.as_deref(),
+                Some(asc.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn esds_parses_real_ffmpeg_four_byte_padded_box() {
+        // Verbatim `esds` FullBox payload generated by FFmpeg for 48 kHz stereo AAC-LC.
+        let ffmpeg_esds: [u8; 46] = [
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x25, 0x00, 0x02, 0x00, 0x04, 0x80,
+            0x80, 0x80, 0x17, 0x40, 0x15, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x01,
+            0xEE, 0x83, 0x05, 0x80, 0x80, 0x80, 0x05, 0x11, 0x90, 0x56, 0xE5, 0x00, 0x06, 0x80,
+            0x80, 0x80, 0x01, 0x02,
+        ];
+        let parsed = parse_esds(&ffmpeg_esds).expect("FFmpeg esds must parse");
+        assert_eq!(parsed.object_type_indication, 0x40);
+        assert_eq!(parsed.max_bitrate, 128_000);
+        assert_eq!(parsed.avg_bitrate, 126_595);
+        assert_eq!(
+            parsed.audio_specific_config.as_deref(),
+            Some([0x11, 0x90, 0x56, 0xE5, 0x00].as_slice())
+        );
+    }
+
+    #[test]
+    fn esds_handles_optional_es_descriptor_flags_and_mp3_object_type() {
+        // streamDependenceFlag | URL_Flag | OCRstreamFlag all set (0xE0)
+        let asc = [0x12u8, 0x10];
+        let payload = build_esds_payload(2, 0xE0, 0x40, &asc);
+        let parsed = parse_esds(&payload).expect("esds with optional flags must parse");
+        assert_eq!(
+            parsed.audio_specific_config.as_deref(),
+            Some(asc.as_slice())
+        );
+
+        // MP3 inside mp4a (objectTypeIndication = 0x6B, empty DecoderSpecificInfo)
+        let mp3_payload = build_esds_payload(1, 0x00, 0x6B, &[]);
+        let mp3_parsed = parse_esds(&mp3_payload).expect("MP3 esds must parse");
+        assert_eq!(mp3_parsed.object_type_indication, 0x6B);
+        assert_eq!(mp3_parsed.audio_specific_config, None);
+    }
+
+    #[test]
+    fn esds_rejects_truncated_or_overlong_length_encoding_without_panic() {
+        assert!(parse_esds(&[]).is_none());
+        assert!(parse_esds(&[0, 0, 0]).is_none());
+        // Truncated descriptor length
+        assert!(parse_esds(&[0, 0, 0, 0, 0x03, 0x80]).is_none());
+        // 5-byte unterminated expandable length (>4 bytes is invalid)
+        assert!(parse_esds(&[0, 0, 0, 0, 0x03, 0x80, 0x80, 0x80, 0x80, 0x01]).is_none());
+        // Declared length exceeds remaining buffer
+        assert!(parse_esds(&[0, 0, 0, 0, 0x03, 0x40, 0x00, 0x01, 0x00]).is_none());
+    }
+
+    #[test]
+    fn mp4_demuxer_populates_raw_asc_extradata_from_mp4a_esds() {
+        // Build a valid minimal MP4 whose `mp4a` entry contains a 4-byte-padded FFmpeg `esds`.
+        let asc = [0x11u8, 0x90, 0x56, 0xE5, 0x00];
+        let esds_box = box_bytes(b"esds", &build_esds_payload(4, 0x00, 0x40, &asc));
+
+        let mut mp4a_payload = vec![0u8; 28];
+        mp4a_payload[17] = 2; // 2 channels
+        mp4a_payload[19] = 16; // 16-bit
+        mp4a_payload[24] = 0xBB;
+        mp4a_payload[25] = 0x80; // 48000 Hz
+        mp4a_payload.extend_from_slice(&esds_box);
+        let mp4a = box_bytes(b"mp4a", &mp4a_payload);
+
+        let mut stsd_rest = Vec::new();
+        stsd_rest.extend_from_slice(&be32(1));
+        stsd_rest.extend_from_slice(&mp4a);
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1024));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = Vec::new();
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = Vec::new();
+        stsz_rest.extend_from_slice(&be32(0));
+        stsz_rest.extend_from_slice(&be32(1));
+        stsz_rest.extend_from_slice(&be32(4));
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mdat = box_bytes(b"mdat", b"ABCD");
+        let data_offset = (ftyp.len() + 8) as u32;
+
+        let mut stco_rest = Vec::new();
+        stco_rest.extend_from_slice(&be32(1));
+        stco_rest.extend_from_slice(&be32(data_offset));
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut stbl_body = Vec::new();
+        for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+            stbl_body.extend_from_slice(b);
+        }
+        let minf = box_bytes(b"minf", &box_bytes(b"stbl", &stbl_body));
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&be32(48_000));
+        mdhd_body[12..16].copy_from_slice(&be32(1024));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"soun");
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body)),
+        );
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+
+        let mut ctx = ctx_from(file);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+        assert_eq!(ctx.streams.len(), 1);
+        let st = &ctx.streams[0];
+        assert_eq!(st.codec_id, CodecId::Aac);
+        assert_eq!(st.codec_params.sample_rate, Some(48_000));
+        assert_eq!(st.codec_params.channels, Some(2));
+        assert_eq!(st.codec_params.bit_rate, Some(126_595));
+        assert_eq!(
+            st.codec_params.extradata.as_deref(),
+            Some(asc.as_slice()),
+            "extradata must contain raw AudioSpecificConfig without esds wrapper"
+        );
     }
 }

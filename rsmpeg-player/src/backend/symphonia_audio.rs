@@ -331,37 +331,64 @@ fn audio_buffer_to_frame(
 /// Mirrors the helper used by the native pipeline so AAC packet-in works with
 /// either raw ASC or full esds extradata.
 fn extract_aac_asc(esds: &[u8]) -> Option<Vec<u8>> {
-    let mut i = 0usize;
-    while i < esds.len() {
-        let tag = esds[i];
-        i += 1;
-        if i >= esds.len() {
-            return None;
-        }
-        // Expandable MPEG-4 length
+    // Support full `esds` FullBox payload (4-byte version/flags + ES_Descriptor 0x03)
+    // as well as bare descriptor streams starting with 0x03/0x04/0x05.
+    let slice = if esds.len() >= 6 && esds[0..4] == [0, 0, 0, 0] && esds[4] == 0x03 {
+        &esds[4..]
+    } else if matches!(esds.first(), Some(0x03..=0x05)) {
+        esds
+    } else {
+        return None;
+    };
+
+    fn read_desc(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, mut rest) = buf.split_first()?;
         let mut len = 0usize;
+        let mut done = false;
         for _ in 0..4 {
-            if i >= esds.len() {
-                return None;
-            }
-            let b = esds[i];
-            i += 1;
-            len = (len << 7) | (b & 0x7f) as usize;
+            let (&b, next) = rest.split_first()?;
+            rest = next;
+            len = (len << 7) | usize::from(b & 0x7F);
             if b & 0x80 == 0 {
+                done = true;
                 break;
             }
         }
-        if tag == 0x05 {
-            if i + len <= esds.len() && len > 0 {
-                return Some(esds[i..i + len].to_vec());
-            }
+        if !done || len > rest.len() {
             return None;
         }
-        // Nested descriptors (ES / DecoderConfig) — continue scanning inside.
-        if tag == 0x03 || tag == 0x04 {
-            continue;
+        let (payload, tail) = rest.split_at(len);
+        Some((tag, payload, tail))
+    }
+
+    let mut rest = slice;
+    while !rest.is_empty() {
+        let (tag, payload, next) = read_desc(rest)?;
+        match tag {
+            0x05 => return (!payload.is_empty()).then(|| payload.to_vec()),
+            0x03 => {
+                if payload.len() < 3 {
+                    return None;
+                }
+                let flags = payload[2];
+                let mut inner = &payload[3..];
+                if flags & 0x80 != 0 {
+                    inner = inner.get(2..)?;
+                }
+                if flags & 0x40 != 0 {
+                    let (&url_len, after) = inner.split_first()?;
+                    inner = after.get(usize::from(url_len)..)?;
+                }
+                if flags & 0x20 != 0 {
+                    inner = inner.get(2..)?;
+                }
+                rest = inner;
+            }
+            0x04 => {
+                rest = payload.get(13..)?;
+            }
+            _ => rest = next,
         }
-        i = i.saturating_add(len);
     }
     None
 }
@@ -568,13 +595,15 @@ mod tests {
 
     #[test]
     fn construct_aac_with_raw_asc() {
-        // AAC-LC, 48 kHz, stereo ASC: 0x11 0x90
-        let mut p = CodecParameters::new(CodecId::Aac);
-        p.sample_rate = Some(48_000);
-        p.channels = Some(2);
-        p.extradata = Some(vec![0x11, 0x90]);
-        let dec = SymphoniaAudioDecoder::try_new(&p).expect("aac decoder");
-        assert_eq!(dec.codec_id(), CodecId::Aac);
+        // AAC-LC, 48 kHz, stereo ASC (2-byte and 5-byte FFmpeg form)
+        for asc in [vec![0x11, 0x90], vec![0x11, 0x90, 0x56, 0xE5, 0x00]] {
+            let mut p = CodecParameters::new(CodecId::Aac);
+            p.sample_rate = Some(48_000);
+            p.channels = Some(2);
+            p.extradata = Some(asc);
+            let dec = SymphoniaAudioDecoder::try_new(&p).expect("aac decoder");
+            assert_eq!(dec.codec_id(), CodecId::Aac);
+        }
     }
 
     #[test]
