@@ -365,7 +365,10 @@ fn run_native_inner(
         let tb = &ctx.streams[si].time_base;
         tb.num as f64 / tb.den.max(1) as f64
     });
-    let mut base_video_pts: Option<i64> = None;
+    // Establish a stable 0-based media time origin before any seek can run
+    // (MP4Demuxer builds 0-based DTS/PTS and `ctx.seek(ts_ms)` maps directly
+    // against that origin).
+    let mut base_video_pts: Option<i64> = video_si.map(|_| 0i64);
     let mut deferred_cmd: Option<PlayerCommand> = None;
     let mut eof_draining = false;
 
@@ -463,7 +466,7 @@ fn run_native_inner(
                             appended_samples =
                                 MasterClock::duration_to_audio_samples(position, audio_rate);
                             video_frame_index = 0;
-                            force_one_frame = true;
+                            force_one_frame = video_dec.is_some();
                             eof_draining = false;
                             video_scheduler.reset_stats();
                             emit(
@@ -592,6 +595,7 @@ fn run_native_inner(
                                     let tb = &ctx.streams[index].time_base;
                                     tb.num as f64 / tb.den.max(1) as f64
                                 });
+                                base_video_pts = Some(0);
                                 let ts_ms = (position.as_secs_f64().max(0.0) * 1000.0) as i64;
                                 let _ = ctx.seek(ts_ms);
                                 pending = ctx.read_frame().ok().flatten();
@@ -611,7 +615,7 @@ fn run_native_inner(
                                 playback_clock.seek(position);
                                 clock_started = true;
                                 video_scheduler.reset_stats();
-                                force_one_frame = true;
+                                force_one_frame = video_dec.is_some();
                                 eof_draining = false;
                                 emit(
                                     event_tx,
@@ -761,6 +765,7 @@ fn run_native_inner(
                             }
                         }
                     }
+                    force_one_frame = false;
                     eof_draining = true;
                     continue;
                 }
@@ -786,11 +791,8 @@ fn run_native_inner(
                                     let pts = f.pts.unwrap_or(0);
                                     let abs_pos = match video_time_base {
                                         Some(spt) if spt > 0.0 && spt.is_finite() => {
-                                            if base_video_pts.is_none() {
-                                                base_video_pts = Some(pts);
-                                            }
-                                            let base = base_video_pts.unwrap_or(pts);
-                                            (pts - base) as f64 * spt
+                                            let base = *base_video_pts.get_or_insert(0);
+                                            pts.saturating_sub(base) as f64 * spt
                                         }
                                         _ => video_frame_index as f64 * assumed_frame_dur,
                                     };

@@ -541,7 +541,10 @@ fn run_worker(
     let mut clock_started = false;
     let mut last_level_emit: Option<Instant> = None;
     let mut video_scheduler = VideoScheduler::new();
-    let mut base_video_pts: Option<i64> = None;
+    // Establish a stable media time origin from the container's `start_ts`
+    // before any seek can run.
+    let mut base_video_pts: Option<i64> =
+        video_track.as_ref().map(|t| t.codec_params.start_ts as i64);
     let mut video_frame_index = 0u64;
     let sync_state = WorkerSync::new();
     // Last rendered VideoFrame event, reused on `Duplicate` to repeat a frame.
@@ -734,7 +737,7 @@ fn run_worker(
                             clock_started = true;
                             video_scheduler.reset_stats();
                             video_frame_index = 0;
-                            force_one_frame = true;
+                            force_one_frame = video_dec.is_some();
                             eof_draining = false;
                             emit(
                                 &event_tx,
@@ -918,6 +921,7 @@ fn run_worker(
                                 default_video_tb =
                                     video_time_base.unwrap_or_else(|| Rational::new(1, 30_000));
                                 seek_track_id = Some(vt.id);
+                                base_video_pts = Some(vt.codec_params.start_ts as i64);
                                 video_track = Some(vt);
                                 let cur_secs = position.as_secs_f64().max(0.0);
                                 let _ = format.seek(
@@ -949,7 +953,7 @@ fn run_worker(
                                 playback_clock.seek(position);
                                 clock_started = true;
                                 video_scheduler.reset_stats();
-                                force_one_frame = true;
+                                force_one_frame = video_dec.is_some();
                                 eof_draining = false;
                                 emit(
                                     &event_tx,
@@ -1085,6 +1089,7 @@ fn run_worker(
                         }
                     }
                 }
+                force_one_frame = false;
                 eof_draining = true;
                 continue;
             }
@@ -1110,12 +1115,9 @@ fn run_worker(
                                     };
                                     let abs_pos = match raw_pts {
                                         Some(p) => {
-                                            if base_video_pts.is_none() {
-                                                base_video_pts = Some(p);
-                                            }
-                                            let base = base_video_pts.unwrap_or(p);
+                                            let base = *base_video_pts.get_or_insert(0);
                                             let den = tb.den.max(1) as f64;
-                                            (p - base) as f64 * (tb.num as f64 / den)
+                                            p.saturating_sub(base) as f64 * (tb.num as f64 / den)
                                         }
                                         None => match sec_per_tick {
                                             Some(spt) => {

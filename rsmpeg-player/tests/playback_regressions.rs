@@ -22,6 +22,19 @@ const AAC_MONO_48K_FRAME: &[u8] = &[
 /// AAC-LC 48 kHz mono AudioSpecificConfig (`objectType=2`, `freqIdx=3`, `channels=1`).
 const AAC_MONO_48K_ASC: &[u8] = &[0x11, 0x88];
 
+/// Minimal valid H.264 Baseline 16×16 `avcC` box payload (SPS + PPS).
+const H264_16X16_AVCC: &[u8] = &[
+    0x01, 0x42, 0xC0, 0x0A, 0xFF, 0xE1, 0x00, 0x16, 0x67, 0x42, 0xC0, 0x0A, 0xD9, 0x1E, 0xC0, 0x44,
+    0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x08, 0x3C, 0x48, 0x99, 0x20, 0x01, 0x00,
+    0x05, 0x68, 0xCB, 0x83, 0xCB, 0x20,
+];
+
+/// Matching 4-byte AVCC length-prefixed 16×16 IDR slice NAL unit.
+const H264_16X16_IDR_SAMPLE: &[u8] = &[
+    0x00, 0x00, 0x00, 0x14, 0x65, 0x88, 0x84, 0x05, 0x7C, 0x46, 0x28, 0x00, 0x0E, 0xA0, 0xC7, 0x00,
+    0x01, 0xB0, 0x68, 0xE0, 0x00, 0x23, 0x43, 0x80,
+];
+
 static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(1);
 
 fn unique_temp_path(stem: &str, ext: &str) -> PathBuf {
@@ -367,5 +380,297 @@ fn eof_audio_drain_handles_seek_and_track_switch_in_native_and_fallback() {
         let _ = player.shutdown();
     }
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Build a valid 48 kHz 16-bit stereo PCM WAV of `duration_secs` seconds.
+fn build_pcm_wav(duration_secs: u32) -> Vec<u8> {
+    let sample_rate: u32 = 48_000;
+    let channels: u16 = 2;
+    let bits_per_sample: u16 = 16;
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+    let total_frames = sample_rate * duration_secs;
+    let data_bytes = total_frames * u32::from(block_align);
+    let riff_size = 36 + data_bytes;
+
+    let mut out = Vec::with_capacity((44 + data_bytes) as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+
+    for i in 0..total_frames {
+        let s: i16 = if (i / 55) % 2 == 0 { 4000 } else { -4000 };
+        out.extend_from_slice(&s.to_le_bytes());
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// Build a valid self-contained H.264 baseline 16×16 MP4 with `frame_count` IDR keyframes
+/// spaced at `frame_duration_ms` intervals (timescale = 1000).
+fn build_h264_mp4(frame_count: u32, frame_duration_ms: u32) -> Vec<u8> {
+    let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
+
+    let sample_size = H264_16X16_IDR_SAMPLE.len() as u32;
+    let mut mdat_payload = Vec::with_capacity((sample_size * frame_count) as usize);
+    for _ in 0..frame_count {
+        mdat_payload.extend_from_slice(H264_16X16_IDR_SAMPLE);
+    }
+    let mdat = box_bytes(b"mdat", &mdat_payload);
+
+    let data_offset = (ftyp.len() + 8) as u32;
+    let duration_ms = frame_count * frame_duration_ms;
+
+    // mvhd
+    let mut mvhd_body = vec![0u8; 96];
+    mvhd_body[8..12].copy_from_slice(&be32(1000));
+    mvhd_body[12..16].copy_from_slice(&be32(duration_ms));
+    mvhd_body[16..20].copy_from_slice(&be32(0x0001_0000));
+    mvhd_body[20..22].copy_from_slice(&0x0100u16.to_be_bytes());
+    mvhd_body[32..36].copy_from_slice(&be32(0x0001_0000));
+    mvhd_body[48..52].copy_from_slice(&be32(0x0001_0000));
+    mvhd_body[64..68].copy_from_slice(&be32(0x4000_0000));
+    mvhd_body[92..96].copy_from_slice(&be32(2));
+    let mvhd = box_bytes(b"mvhd", &fullbox(0, 0, &mvhd_body));
+
+    // tkhd
+    let mut tkhd_body = vec![0u8; 80];
+    tkhd_body[8..12].copy_from_slice(&be32(1));
+    tkhd_body[16..20].copy_from_slice(&be32(duration_ms));
+    tkhd_body[36..40].copy_from_slice(&be32(0x0001_0000));
+    tkhd_body[52..56].copy_from_slice(&be32(0x0001_0000));
+    tkhd_body[68..72].copy_from_slice(&be32(0x4000_0000));
+    tkhd_body[72..76].copy_from_slice(&be32(16 << 16)); // width 16.0
+    tkhd_body[76..80].copy_from_slice(&be32(16 << 16)); // height 16.0
+    let tkhd = box_bytes(b"tkhd", &fullbox(0, 3, &tkhd_body));
+
+    // mdhd (timescale = 1000)
+    let mut mdhd_body = vec![0u8; 20];
+    mdhd_body[8..12].copy_from_slice(&be32(1000));
+    mdhd_body[12..16].copy_from_slice(&be32(duration_ms));
+    let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+    // hdlr
+    let mut hdlr_body = vec![0u8; 21];
+    hdlr_body[4..8].copy_from_slice(b"vide");
+    let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+    let vmhd = box_bytes(b"vmhd", &fullbox(0, 1, &[0u8; 8]));
+    let url_box = box_bytes(b"url ", &fullbox(0, 1, &[]));
+    let mut dref_body = Vec::new();
+    dref_body.extend_from_slice(&be32(1));
+    dref_body.extend_from_slice(&url_box);
+    let dinf = box_bytes(b"dinf", &box_bytes(b"dref", &fullbox(0, 0, &dref_body)));
+
+    // stsd -> avc1 (78-byte VisualSampleEntry header) -> avcC
+    let mut avc1_body = vec![0u8; 78];
+    avc1_body[6..8].copy_from_slice(&1u16.to_be_bytes());
+    avc1_body[24..26].copy_from_slice(&16u16.to_be_bytes()); // width
+    avc1_body[26..28].copy_from_slice(&16u16.to_be_bytes()); // height
+    avc1_body[28..32].copy_from_slice(&be32(0x0048_0000));
+    avc1_body[32..36].copy_from_slice(&be32(0x0048_0000));
+    avc1_body[40..42].copy_from_slice(&1u16.to_be_bytes());
+    avc1_body[74..76].copy_from_slice(&24u16.to_be_bytes());
+    avc1_body[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    avc1_body.extend_from_slice(&box_bytes(b"avcC", H264_16X16_AVCC));
+    let avc1 = box_bytes(b"avc1", &avc1_body);
+
+    let mut stsd_body = Vec::new();
+    stsd_body.extend_from_slice(&be32(1));
+    stsd_body.extend_from_slice(&avc1);
+    let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_body));
+
+    let mut stts_body = Vec::new();
+    stts_body.extend_from_slice(&be32(1));
+    stts_body.extend_from_slice(&be32(frame_count));
+    stts_body.extend_from_slice(&be32(frame_duration_ms));
+    let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_body));
+
+    let mut stsc_body = Vec::new();
+    stsc_body.extend_from_slice(&be32(1));
+    stsc_body.extend_from_slice(&be32(1));
+    stsc_body.extend_from_slice(&be32(frame_count));
+    stsc_body.extend_from_slice(&be32(1));
+    let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_body));
+
+    let mut stsz_body = Vec::new();
+    stsz_body.extend_from_slice(&be32(sample_size));
+    stsz_body.extend_from_slice(&be32(frame_count));
+    let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_body));
+
+    let mut stco_body = Vec::new();
+    stco_body.extend_from_slice(&be32(1));
+    stco_body.extend_from_slice(&be32(data_offset));
+    let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_body));
+
+    let mut stss_body = Vec::new();
+    stss_body.extend_from_slice(&be32(frame_count));
+    for i in 1..=frame_count {
+        stss_body.extend_from_slice(&be32(i));
+    }
+    let stss = box_bytes(b"stss", &fullbox(0, 0, &stss_body));
+
+    let mut stbl_body = Vec::new();
+    for b in [&stsd, &stts, &stsc, &stsz, &stco, &stss] {
+        stbl_body.extend_from_slice(b);
+    }
+    let stbl = box_bytes(b"stbl", &stbl_body);
+
+    let mut minf_body = Vec::new();
+    minf_body.extend_from_slice(&vmhd);
+    minf_body.extend_from_slice(&dinf);
+    minf_body.extend_from_slice(&stbl);
+    let minf = box_bytes(b"minf", &minf_body);
+
+    let mut mdia_body = Vec::new();
+    mdia_body.extend_from_slice(&mdhd);
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = box_bytes(b"mdia", &mdia_body);
+
+    let mut trak_body = Vec::new();
+    trak_body.extend_from_slice(&tkhd);
+    trak_body.extend_from_slice(&mdia);
+    let trak = box_bytes(b"trak", &trak_body);
+
+    let mut moov_body = Vec::new();
+    moov_body.extend_from_slice(&mvhd);
+    moov_body.extend_from_slice(&trak);
+    let moov = box_bytes(b"moov", &moov_body);
+
+    let mut file = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&mdat);
+    file.extend_from_slice(&moov);
+    file
+}
+
+/// P1-03a regression: seeking an audio-only file while paused must NOT trigger `Ended`
+/// (there is no decodable video stream to clear `force_one_frame`).
+#[test]
+fn paused_wav_seek_does_not_emit_ended_in_native_and_fallback() {
+    let path = unique_temp_path("p1_03_paused_wav", "wav");
+    std::fs::write(&path, build_pcm_wav(3)).expect("write wav fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .volume(0.0)
+            .build()
+            .expect("build wav player");
+
+        assert!(
+            watch(&mut player, Duration::from_secs(2), |ev| {
+                matches!(ev, PlayerEvent::Tracks { .. })
+            }),
+            "native={prefer_native}: expected Tracks event"
+        );
+        player.pause().expect("pause wav");
+        assert!(
+            watch(&mut player, Duration::from_secs(1), |ev| {
+                matches!(ev, PlayerEvent::Snapshot(s) if s.status == "paused")
+            }),
+            "native={prefer_native}: expected paused Snapshot"
+        );
+
+        let target = Duration::from_millis(400);
+        player.seek(target).expect("seek paused wav");
+        let seek_gen = player.generation();
+
+        let mut seek_ack = false;
+        let ended = watch(&mut player, Duration::from_millis(600), |ev| match ev {
+            PlayerEvent::SeekCompleted {
+                position,
+                generation,
+            } if generation == seek_gen => {
+                seek_ack = position == target;
+                false
+            }
+            PlayerEvent::Ended { generation } if generation == seek_gen => true,
+            _ => false,
+        });
+
+        assert!(
+            seek_ack,
+            "native={prefer_native}: expected SeekCompleted(400ms)"
+        );
+        assert!(
+            !ended,
+            "native={prefer_native}: paused audio-only seek must not emit Ended"
+        );
+
+        let _ = player.shutdown();
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P1-03b regression: opening a video with `autoplay(false)` and immediately seeking to 5.5 s
+/// before any frame has been decoded must keep the 0-based media time origin so the first
+/// preview frame and `Player::position()` reflect ~5.0–5.5 s rather than jumping back to 0 ns.
+#[test]
+fn initial_seek_with_autoplay_false_preserves_media_time_origin() {
+    // 14 keyframes × 500 ms = 7.0 s video (keyframes at 0.0 s, 0.5 s, ..., 5.0 s, 5.5 s, ...).
+    let path = unique_temp_path("p1_03_initial_seek", "mp4");
+    std::fs::write(&path, build_h264_mp4(14, 500)).expect("write h264 fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(false)
+        .volume(0.0)
+        .build()
+        .expect("build paused video player");
+
+    let target = Duration::from_millis(5500);
+    player.seek(target).expect("initial seek");
+    let seek_gen = player.generation();
+
+    let mut ack = None;
+    let mut first_frame_pts = None;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && first_frame_pts.is_none() {
+        match player.poll_event() {
+            Some(PlayerEvent::SeekCompleted {
+                position,
+                generation,
+            }) if generation == seek_gen => {
+                ack = Some(position);
+            }
+            Some(PlayerEvent::VideoFrame {
+                pts, generation, ..
+            }) if generation == seek_gen => {
+                first_frame_pts = Some(pts);
+            }
+            Some(_) => {}
+            None => thread::sleep(Duration::from_millis(4)),
+        }
+    }
+
+    assert_eq!(ack, Some(target), "expected SeekCompleted at 5.5 s");
+    let frame_pts = first_frame_pts.expect("expected preview VideoFrame after paused seek");
+    assert!(
+        frame_pts >= Duration::from_secs(5) && frame_pts <= target,
+        "preview frame pts must match media timeline (~5.0..=5.5s), got {frame_pts:?}"
+    );
+    assert!(
+        player.position() >= Duration::from_secs(5) && player.position() <= target,
+        "Player::position() must stay at ~5.0..=5.5s, got {:?}",
+        player.position()
+    );
+
+    let _ = player.shutdown();
     let _ = std::fs::remove_file(&path);
 }
