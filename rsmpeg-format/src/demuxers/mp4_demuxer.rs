@@ -242,6 +242,22 @@ impl InputFormat for MP4Demuxer {
             return Ok(None);
         }
 
+        // Secondary guard: never translate an unaddressable index entry into a
+        // packet. `build_sample_index` already drops such samples, but a track
+        // built by any other path must not fall through to reading byte 0.
+        for track in &mut self.tracks {
+            while track.next_sample < track.samples.len()
+                && !sample_is_readable(&track.samples[track.next_sample])
+            {
+                tracing::warn!(
+                    "MP4: skipping sample {} of stream {} (offset/size unavailable)",
+                    track.next_sample,
+                    track.stream_index
+                );
+                track.next_sample += 1;
+            }
+        }
+
         // Pick the track whose next sample has the earliest DTS in seconds.
         let mut best: Option<(usize, f64)> = None;
         for (ti, track) in self.tracks.iter().enumerate() {
@@ -416,7 +432,13 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
     let mut offsets = Vec::with_capacity(sample_count);
     let mut sample_i = 0usize;
     for (ci, &spc) in samples_per_chunk.iter().enumerate() {
-        let mut off = t.stco.get(ci).copied().unwrap_or(0);
+        let Some(&chunk_off) = t.stco.get(ci) else {
+            // Chunk table shorter than the sample-per-chunk table: nothing to
+            // read from, so these samples stay unaddressed (see the truncation
+            // below — they must never reach the packet reader).
+            break;
+        };
+        let mut off = chunk_off;
         for _ in 0..spc {
             if sample_i >= sample_count {
                 break;
@@ -426,9 +448,22 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
             sample_i += 1;
         }
     }
-    while offsets.len() < sample_count {
-        offsets.push(0);
+
+    // Any sample without a chunk of its own cannot be located. Padding it with
+    // offset 0 would make `read_frame` return file-header bytes dressed up as
+    // a media packet (the review caught exactly this), so drop such samples
+    // instead: a shorter DTS-ordered index is safe, bogus packets are not.
+    // Lower-index samples are always addressed first, so the truncation keeps
+    // the temporally earliest part of the track.
+    if offsets.len() < sample_count {
+        tracing::warn!(
+            "MP4: {} of {} samples have no chunk mapping (stsc/stco/stsz disagree); \
+             dropping the unaddressable tail",
+            sample_count - offsets.len(),
+            sample_count
+        );
     }
+    let sample_count = offsets.len();
 
     // Keyframes
     let mut is_key = vec![false; sample_count];
@@ -461,6 +496,15 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
         });
     }
     samples
+}
+
+/// Whether a sample index entry can be read as media data.
+///
+/// `offset == 0` means the sample was never assigned a chunk (a file header
+/// starts at byte 0, so reading there would hand back garbage); `size == 0`
+/// yields an empty packet. Both are skipped instead of being emitted.
+fn sample_is_readable(sample: &SampleEntry) -> bool {
+    sample.offset != 0 && sample.size != 0
 }
 
 /// Clamp a container `timescale` (raw `u32` from `mdhd`) into the `i32`
@@ -1309,26 +1353,30 @@ mod tests {
     }
 
     #[test]
-    fn stsc_first_chunk_past_table_does_not_panic() {
+    fn stsc_first_chunk_past_table_yields_no_bogus_samples() {
         // Malformed `stsc`: `first_chunk` far beyond the real chunk count.
-        // Regression guard — this used to slice out of range and panic.
+        // Regression guard for two bugs in a row: the slice used to panic, and
+        // the fix then padded the missing offsets with 0 — which made
+        // `read_frame` hand back file-header bytes as a media packet.
         let tables = TrackTables {
             timescale: 1000,
             stts: vec![(2, 40)],
             stsc: vec![(999, 1, 1)],
             stsz: vec![1, 1],
-            stco: vec![0],
+            stco: vec![100],
             ..Default::default()
         };
         let samples = build_sample_index(&tables);
-        // Samples are still enumerated; they just carry offset 0 because no
-        // chunk claim matched.
-        assert_eq!(samples.len(), 2);
-        assert!(samples.iter().all(|s| s.offset == 0));
+        // No sample can be located, so the index must be empty — not two
+        // samples pointing at offset 0.
+        assert!(
+            samples.is_empty(),
+            "unaddressable samples must be dropped, got {samples:?}"
+        );
     }
 
     #[test]
-    fn stsc_inverted_range_does_not_panic() {
+    fn stsc_inverted_range_drops_only_the_unmapped_samples() {
         // Second entry claims an *earlier* chunk than the first, producing an
         // inverted range (start > end).
         let tables = TrackTables {
@@ -1336,11 +1384,85 @@ mod tests {
             stts: vec![(3, 10)],
             stsc: vec![(3, 1, 1), (1, 1, 1)],
             stsz: vec![1, 1, 1],
-            stco: vec![0, 4],
+            stco: vec![100, 200],
             ..Default::default()
         };
         let samples = build_sample_index(&tables);
-        assert_eq!(samples.len(), 3);
+        // The inverted entry covers nothing, so chunk 0 keeps `samples_per_chunk`
+        // 0 from the fallback and only chunk 1 supplies a sample. What matters
+        // is that no surviving entry is unaddressable (offset/size 0).
+        assert_eq!(samples.len(), 2, "got {samples:?}");
+        assert!(
+            samples.iter().all(sample_is_readable),
+            "every surviving sample must be readable: {samples:?}"
+        );
+        assert!(
+            samples.iter().all(|s| s.offset >= 100),
+            "no sample may point at the file header: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn sample_is_readable_rejects_zero_offset_and_zero_size() {
+        // A file header lives at offset 0; such an entry must never be emitted.
+        let unaddressed = SampleEntry {
+            offset: 0,
+            size: 16,
+            dts: 0,
+            pts: 0,
+            duration: 1,
+            is_key: true,
+        };
+        let empty = SampleEntry {
+            offset: 32,
+            size: 0,
+            ..unaddressed
+        };
+        let good = SampleEntry {
+            offset: 32,
+            size: 16,
+            ..unaddressed
+        };
+        assert!(!sample_is_readable(&unaddressed));
+        assert!(!sample_is_readable(&empty));
+        assert!(sample_is_readable(&good));
+    }
+
+    #[test]
+    fn demuxing_a_broken_stsc_never_returns_header_bytes() {
+        // End-to-end: a file whose stsc cannot address any sample must yield no
+        // packets at all, instead of packets built from the `ftyp` bytes.
+        let mut data = build_minimal_mp4();
+        // Locate "stsc" and set its first_chunk to an impossible value.
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stsc")
+            .expect("minimal mp4 contains an stsc box");
+        // stsc payload: version/flags (4) + entry_count (4) + first_chunk (4)
+        let first_chunk_at = pos + 4 + 4 + 4;
+        data[first_chunk_at..first_chunk_at + 4].copy_from_slice(&be32(9_999));
+
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        assert_eq!(ctx.streams.len(), 1);
+
+        let packet = demuxer.read_frame(&mut ctx).unwrap();
+        assert!(
+            packet.is_none(),
+            "no packet may be produced from an unaddressable sample table, got {:?}",
+            packet.map(|p| p.data.to_vec())
+        );
     }
 
     #[test]
