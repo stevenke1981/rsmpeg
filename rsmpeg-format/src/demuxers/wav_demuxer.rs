@@ -101,15 +101,43 @@ impl InputFormat for WAVDemuxer {
 
         let bit_rate = sample_rate as u64 * channels as u64 * bits_per_sample as u64;
 
+        // The stream time base is 1/sample_rate, which must be representable as
+        // an `i32` pair. Falling back to 1/1 (the previous behaviour) did not
+        // just lose precision — it re-interpreted every timestamp in seconds,
+        // turning 4 samples of a 2^31 Hz file into "4 seconds". Reject the file
+        // instead of emitting metadata we cannot honour.
+        let time_base_den = time_base_den(sample_rate).ok_or_else(|| {
+            RsError::InvalidData(
+                format!(
+                    "WAV: sample rate {sample_rate} Hz cannot be represented as a time base \
+                     (must be 1..={})",
+                    i32::MAX
+                )
+                .into(),
+            )
+        })?;
+
         // ~20 ms of audio per packet
         let samples_per_packet = (sample_rate as usize / 50).max(1);
         // `samples_per_packet * block_align` is derived from file fields; use
         // checked math so a hostile `sample_rate`/`block_align` pair cannot
         // overflow `usize` (which wraps in release builds and then aborts on a
-        // huge allocation).
+        // huge allocation). Saturating is not enough on its own: a bogus pair
+        // would ask for a `usize::MAX`-byte buffer, so cap the packet size at
+        // a sane bound and let `read_frame` clamp to the remaining bytes.
         let packet_bytes = samples_per_packet
-            .saturating_mul(block_align as usize)
-            .max(block_align as usize);
+            .checked_mul(block_align as usize)
+            .ok_or_else(|| {
+                RsError::InvalidData(
+                    format!(
+                        "WAV: packet size overflow ({} samples/packet × {} bytes/block)",
+                        samples_per_packet, block_align
+                    )
+                    .into(),
+                )
+            })?
+            .max(block_align as usize)
+            .min(MAX_PACKET_BYTES);
 
         self.data_remaining = data_size;
         self.sample_rate = sample_rate;
@@ -133,7 +161,7 @@ impl InputFormat for WAVDemuxer {
             extradata: None,
             h264_bitstream_format: Default::default(),
         };
-        stream.time_base = rsmpeg_util::Rational::new(1, time_base_den(sample_rate));
+        stream.time_base = rsmpeg_util::Rational::new(1, time_base_den);
         stream.duration = duration_ms;
         ctx.duration = duration_ms;
         ctx.bit_rate = bit_rate;
@@ -187,7 +215,16 @@ impl InputFormat for WAVDemuxer {
         let samples = to_read as i64 / self.block_align.max(1) as i64;
         let mut packet = Packet::new(bytes::Bytes::from(buf), 0);
         packet.duration = samples;
-        packet.time_base = rsmpeg_util::Rational::new(1, time_base_den(self.sample_rate));
+        // `read_header` refused to open files whose rate cannot be represented,
+        // so this cannot silently degrade to 1/1.
+        packet.time_base = match time_base_den(self.sample_rate) {
+            Some(den) => rsmpeg_util::Rational::new(1, den),
+            None => {
+                return Err(RsError::InvalidData(
+                    "WAV: sample rate cannot be represented as a time base".into(),
+                ))
+            }
+        };
         packet.flags = rsmpeg_codec::PacketFlags::KEY;
         Ok(Some(packet))
     }
@@ -220,16 +257,20 @@ impl Default for WAVDemuxer {
     }
 }
 
-/// Clamp a `u32` sample rate into the `i32` numerator a [`Rational`] time base
-/// can hold.
+/// Upper bound for one PCM packet (~64 KiB), so a hostile header cannot make
+/// the demuxer allocate an enormous buffer.
+const MAX_PACKET_BYTES: usize = 64 * 1024;
+
+/// Represent `sample_rate` as the `i32` denominator of a [`Rational`] time base.
 ///
 /// The raw `u32` comes straight from the container header: `as i32` would turn
 /// e.g. `4_000_000_000` into a negative denominator, and `0` into a division by
-/// zero on every later timestamp conversion.
-fn time_base_den(sample_rate: u32) -> i32 {
+/// zero on every later timestamp conversion. Neither is representable, so this
+/// returns `None` and the caller reports an error rather than guessing `1/1`.
+fn time_base_den(sample_rate: u32) -> Option<i32> {
     match i32::try_from(sample_rate) {
-        Ok(v) if v > 0 => v,
-        _ => 1,
+        Ok(v) if v > 0 => Some(v),
+        _ => None,
     }
 }
 
@@ -414,21 +455,107 @@ mod tests {
     }
 
     #[test]
-    fn time_base_den_never_wraps_or_zeroes() {
+    fn time_base_den_reports_unrepresentable_rates() {
         // Valid rates round-trip unchanged.
-        assert_eq!(time_base_den(48_000), 48_000);
-        assert_eq!(time_base_den(1), 1);
-        // A rate above i32::MAX used to become a negative denominator via `as i32`.
-        assert_eq!(time_base_den(u32::MAX), 1);
-        assert_eq!(time_base_den(i32::MAX as u32 + 1), 1);
+        assert_eq!(time_base_den(48_000), Some(48_000));
+        assert_eq!(time_base_den(1), Some(1));
+        // A rate above i32::MAX used to become a negative denominator via
+        // `as i32`, then a silent 1/1 fallback (4 samples reading as 4
+        // seconds). It must now be reported as unrepresentable.
+        assert_eq!(time_base_den(u32::MAX), None);
+        assert_eq!(time_base_den(0x8000_0000), None);
         // Zero must not produce a division-by-zero time base.
-        assert_eq!(time_base_den(0), 1);
+        assert_eq!(time_base_den(0), None);
+    }
+
+    /// Build a minimal WAV whose `fmt ` claims `sample_rate`.
+    fn wav_with_rate(sample_rate: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&1u16.to_le_bytes()); // mono
+        v.extend_from_slice(&sample_rate.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // block align
+        v.extend_from_slice(&8u16.to_le_bytes()); // bits
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&4u32.to_le_bytes());
+        v.extend_from_slice(&[0x80, 0x80, 0x80, 0x80]);
+        v
+    }
+
+    #[test]
+    fn unrepresentable_sample_rate_is_an_error_not_a_1_over_1_time_base() {
+        // Review finding: a 2^31 Hz file opened fine and reported 1/1, so four
+        // samples looked like four seconds. It must be rejected outright.
+        let mut ctx = ctx_with(wav_with_rate(0x8000_0000));
+        let mut demuxer = WAVDemuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("an unrepresentable sample rate must fail");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert!(
+            ctx.streams.is_empty(),
+            "no stream may be published for a rejected file"
+        );
+
+        // Sample rate 0 is equally unrepresentable.
+        let mut ctx = ctx_with(wav_with_rate(0));
+        let mut demuxer = WAVDemuxer::default();
+        assert!(demuxer.read_header(&mut ctx).is_err());
+    }
+
+    #[test]
+    fn representable_rate_keeps_an_exact_time_base() {
+        // The boundary value i32::MAX is still representable and must be kept.
+        let mut ctx = ctx_with(wav_with_rate(i32::MAX as u32));
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        assert_eq!(ctx.streams[0].time_base, rsmpeg_util::Rational::new(1, i32::MAX));
+        let packet = demuxer
+            .read_frame(&mut ctx)
+            .unwrap()
+            .expect("one packet of audio");
+        assert_eq!(packet.time_base, rsmpeg_util::Rational::new(1, i32::MAX));
+        assert_eq!(packet.duration, 4, "4 mono u8 samples = 4 ticks, not seconds");
+    }
+
+    #[test]
+    fn packet_size_is_bounded_and_never_overflows() {
+        // 4e9 samples/packet (rate/50) × 65535 bytes/block would overflow a
+        // 32-bit usize and is nonsense on 64-bit; the demuxer must clamp.
+        let mut v = wav_with_rate(4_000_000_000u32.min(i32::MAX as u32));
+        // Overwrite block_align with 65535 (offset: 12 + 8 + 12 = 32).
+        v[32..34].copy_from_slice(&65535u16.to_le_bytes());
+        let mut ctx = ctx_with(v);
+        let mut demuxer = WAVDemuxer::default();
+        // Either a clean rejection or a bounded packet size is acceptable —
+        // what must never happen is a usize overflow feeding a huge alloc.
+        if demuxer.read_header(&mut ctx).is_ok() {
+            assert!(
+                demuxer.packet_bytes <= MAX_PACKET_BYTES,
+                "packet_bytes must stay bounded, got {}",
+                demuxer.packet_bytes
+            );
+            let packet = demuxer.read_frame(&mut ctx).unwrap().expect("packet");
+            assert!(
+                packet.data.len() <= MAX_PACKET_BYTES,
+                "a single packet must not exceed the bound, got {}",
+                packet.data.len()
+            );
+        }
     }
 
     #[test]
     fn hostile_sample_rate_and_block_align_do_not_overflow_packet_bytes() {
-        // sample_rate = 4e9, block_align = 65535: `samples_per_packet *
-        // block_align` overflows usize on 32-bit and is enormous on 64-bit.
+        // sample_rate = 4e9 is above i32::MAX, so the file must be rejected
+        // outright now that the 1/1 fallback is gone (it used to "succeed"
+        // with a bogus time base). The point of the test is that nothing
+        // panics and no nonsense stream escapes.
         let mut v = Vec::new();
         v.extend_from_slice(b"RIFF");
         v.extend_from_slice(&0u32.to_le_bytes());
@@ -446,10 +573,13 @@ mod tests {
 
         let mut ctx = ctx_with(v);
         let mut demuxer = WAVDemuxer::default();
-        // Must not panic, and the derived time base must stay usable.
-        demuxer.read_header(&mut ctx).unwrap();
-        assert_eq!(ctx.streams.len(), 1);
-        assert!(ctx.streams[0].time_base.den > 0);
-        assert_eq!(ctx.duration, 0);
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("4 GHz cannot be represented as a time base");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert!(
+            ctx.streams.is_empty(),
+            "no stream may escape for a rejected file"
+        );
     }
 }

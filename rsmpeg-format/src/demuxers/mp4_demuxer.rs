@@ -179,6 +179,19 @@ impl InputFormat for MP4Demuxer {
             }
 
             let timescale = tables.timescale.max(1);
+            // `tb = 1/timescale` must be representable as an `i32` pair. The
+            // previous fallback to 1/1 silently re-interpreted every DTS/PTS in
+            // seconds instead of ticks, so refuse the track rather than publish
+            // metadata we cannot honour.
+            let Some(time_base) = timescale_den(timescale) else {
+                tracing::error!(
+                    "MP4: track {} has timescale {} which cannot be represented as a \
+                     time base; skipping the track",
+                    idx,
+                    tables.timescale
+                );
+                continue;
+            };
             let duration_tb = if tables.duration > 0 {
                 tables.duration as i64
             } else {
@@ -208,7 +221,7 @@ impl InputFormat for MP4Demuxer {
             if tables.channels > 0 {
                 stream.codec_params.channels = Some(tables.channels);
             }
-            stream.time_base = Rational::new(1, timescale_den(timescale));
+            stream.time_base = Rational::new(1, time_base);
             stream.duration = duration_tb;
             ctx.streams.push(stream);
 
@@ -283,7 +296,19 @@ impl InputFormat for MP4Demuxer {
         track.next_sample += 1;
         let stream_index = track.stream_index;
         let timescale = track.timescale;
-        let time_base = Rational::new(1, timescale_den(timescale));
+        // `read_header` skips tracks with an unrepresentable timescale, so this
+        // is unreachable in practice; fail loudly rather than emit 1/1 ticks.
+        let time_base = Rational::new(
+            1,
+            timescale_den(timescale).ok_or_else(|| {
+                RsError::InvalidData(
+                    format!(
+                        "MP4: timescale {timescale} cannot be represented as a time base"
+                    )
+                    .into(),
+                )
+            })?,
+        );
 
         let io = ctx
             .io
@@ -512,11 +537,12 @@ fn sample_is_readable(sample: &SampleEntry) -> bool {
 ///
 /// `as i32` would wrap values above `i32::MAX` into a negative (or zero)
 /// denominator, which silently corrupts every timestamp derived from the
-/// stream's time base.
-fn timescale_den(timescale: u32) -> i32 {
+/// stream's time base, so an unrepresentable value returns `None` and the
+/// caller reports an error instead of substituting `1/1`.
+fn timescale_den(timescale: u32) -> Option<i32> {
     match i32::try_from(timescale) {
-        Ok(v) if v > 0 => v,
-        _ => 1,
+        Ok(v) if v > 0 => Some(v),
+        _ => None,
     }
 }
 
@@ -1509,11 +1535,48 @@ mod tests {
     }
 
     #[test]
-    fn timescale_den_never_wraps() {
-        assert_eq!(timescale_den(1000), 1000);
-        assert_eq!(timescale_den(90_000), 90_000);
-        // Raw u32 values above i32::MAX used to become negative denominators.
-        assert_eq!(timescale_den(u32::MAX), 1);
-        assert_eq!(timescale_den(0), 1);
+    fn timescale_den_reports_unrepresentable_values() {
+        assert_eq!(timescale_den(1000), Some(1000));
+        assert_eq!(timescale_den(90_000), Some(90_000));
+        // Raw u32 values above i32::MAX used to become negative denominators,
+        // and the first fix substituted 1/1 — both corrupt timestamps. They
+        // must now be reported as unrepresentable.
+        assert_eq!(timescale_den(u32::MAX), None);
+        assert_eq!(timescale_den(i32::MAX as u32 + 1), None);
+        assert_eq!(timescale_den(0), None);
+    }
+
+    #[test]
+    fn track_with_unrepresentable_timescale_is_rejected_not_coerced() {
+        // End-to-end: patch mdhd's timescale to 2^31 and confirm the track is
+        // dropped (no stream promising 1/1 ticks over real tick timestamps).
+        let mut data = build_minimal_mp4();
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"mdhd")
+            .expect("minimal mp4 contains an mdhd box");
+        // mdhd v0 payload: version/flags(4) creation(4) modification(4) timescale(4)
+        let timescale_at = pos + 4 + 4 + 4 + 4;
+        data[timescale_at..timescale_at + 4].copy_from_slice(&be32(0x8000_0000));
+
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        assert!(
+            ctx.streams.is_empty(),
+            "a track whose timescale cannot form a time base must not be published: {:?}",
+            ctx.streams.iter().map(|s| s.time_base).collect::<Vec<_>>()
+        );
+        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
     }
 }
