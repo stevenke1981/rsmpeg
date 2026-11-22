@@ -575,6 +575,32 @@ fn expand_stsc(
     // the table stopped early, which is only acceptable when the sample tables
     // are exhausted too (a genuinely short tail); otherwise those chunks are
     // unmapped and would shift ordinals.
+    //
+    // A *run* declaring 0 samples per chunk is the same defect one level down
+    // and was the fifth review's reproduction: `stsc` = [(1, 0), (2, 1)] starts
+    // at chunk 1 (so the guard above passed) but leaves chunk 1 empty. The walk
+    // then handed chunk 2's bytes to sample 0 — emitting the truncated `BBB`
+    // with DTS 0 instead of `AAA`/0 and `BBBB`/1000. While samples remain to be
+    // placed, a zero-sample chunk cannot be distinguished from a missing
+    // mapping, so refuse the track. A zero *trailing* run (all samples already
+    // placed) strands nothing and stays acceptable.
+    let mut placed: u64 = 0;
+    for (ci, &spc) in samples_per_chunk.iter().enumerate() {
+        if placed >= sample_count as u64 {
+            break;
+        }
+        if spc == 0 {
+            tracing::warn!(
+                "MP4: stsc declares 0 samples for chunk {} while {} of {sample_count} \
+                 samples are still unplaced; the mapping cannot be trusted",
+                ci + 1,
+                sample_count as u64 - placed
+            );
+            return None;
+        }
+        placed += u64::from(spc);
+    }
+
     let declared: u64 = samples_per_chunk.iter().map(|&c| u64::from(c)).sum();
     if declared == 0 {
         tracing::warn!("MP4: stsc declares no sample for any of {chunk_count} chunk(s)");
@@ -1969,6 +1995,17 @@ mod tests {
     /// Same fixture, but with an arbitrary chunk layout, so chunk runs can be
     /// made to skip a chunk in the middle.
     fn build_mp4_with_chunks(chunks: &[&[u8]], stsc_runs: &[(u32, u32)]) -> Vec<u8> {
+        build_mp4_with_chunks_and_samples(chunks, stsc_runs, chunks.len())
+    }
+
+    /// Same fixture with a chosen `stsz`/`stts` sample count, so the sample
+    /// tables can be exhausted before the last chunk (the trailing-empty-chunk
+    /// shape that real muxers produce).
+    fn build_mp4_with_chunks_and_samples(
+        chunks: &[&[u8]],
+        stsc_runs: &[(u32, u32)],
+        sample_count: usize,
+    ) -> Vec<u8> {
         let ftyp = box_bytes(b"ftyp", b"isom\0\0\0\0isom");
         let payload: Vec<u8> = chunks.concat();
         let mdat = box_bytes(b"mdat", &payload);
@@ -1983,7 +2020,7 @@ mod tests {
         let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
 
         let mut stts_rest = be32(1).to_vec();
-        stts_rest.extend_from_slice(&be32(chunks.len() as u32));
+        stts_rest.extend_from_slice(&be32(sample_count as u32));
         stts_rest.extend_from_slice(&be32(1000));
         let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
 
@@ -1996,8 +2033,8 @@ mod tests {
         let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
 
         let mut stsz_rest = be32(0).to_vec();
-        stsz_rest.extend_from_slice(&be32(chunks.len() as u32));
-        for chunk in chunks {
+        stsz_rest.extend_from_slice(&be32(sample_count as u32));
+        for chunk in chunks.iter().take(sample_count) {
             stsz_rest.extend_from_slice(&be32(chunk.len() as u32));
         }
         let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
@@ -2097,6 +2134,68 @@ mod tests {
             packets.is_empty(),
             "a zero-based chunk run must not shift ordinals: {:?}",
             packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn review_zero_sample_prefix_run_must_not_shift_the_valid_chunk() {
+        // Fifth review P1 reproduction, and the neighbour of the
+        // `first_chunk > 1` case: `stsc` has two runs, starts at chunk 1
+        // (satisfying the leading-gap guard) but declares **0** samples per
+        // chunk for the first run. Chunk 1 is therefore empty, so the walk
+        // handed chunk 2's bytes to sample 0 and emitted the truncated `BBB`
+        // stamped with DTS 0.
+        //
+        // Mirrors `extra-probe/make_fixtures.py`: `stsc = (1, 0, 1, 2, 1, 1)`.
+        // Samples 0 and 1 are still unplaced when chunk 1 is visited, so the
+        // mapping is unprovable and nothing may be emitted.
+        let data = build_two_chunk_mp4(&[(1, 0), (2, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        let rendered: Vec<(Option<i64>, Vec<u8>)> = packets
+            .iter()
+            .map(|p| (p.dts, p.data.to_vec()))
+            .collect();
+        assert!(
+            rendered.is_empty(),
+            "a zero-sample first run must not shift the valid chunk into sample 0's \
+             size and DTS: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn review_trailing_zero_sample_run_keeps_the_full_prefix() {
+        // The guard must not over-reject: a zero-sample run that starts *after*
+        // every sample has been placed strands nothing (chunk 3+ simply holds
+        // no samples), and the two real samples must still come back verbatim.
+        let data = build_mp4_with_chunks_and_samples(
+            &[b"AAA", b"BBBB", b"CC"],
+            &[(1, 1), (2, 1), (3, 0)],
+            2,
+        );
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer
+            .read_header(&mut ctx)
+            .expect("a trailing empty run is harmless");
+        let packets = read_all(&mut demuxer, &mut ctx);
+        let got: Vec<(Option<i64>, &[u8])> = packets
+            .iter()
+            .map(|p| (p.dts, p.data.as_ref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(0), b"AAA".as_slice()),
+                (Some(1000), b"BBBB".as_slice()),
+            ],
+            "samples before a trailing empty run must be decoded verbatim"
         );
     }
 
