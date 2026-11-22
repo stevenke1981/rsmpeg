@@ -31,6 +31,10 @@ impl CodecContext {
 
     /// Open the codec context — finds the codec in the registry and creates
     /// a decoder or encoder instance.
+    ///
+    /// Re-opening an already-open context replaces the previous codec
+    /// instance, which drops the old decoder/encoder (and any buffered frames
+    /// or packets it owned) before the new one is created.
     pub fn open(&mut self) -> RsResult<()> {
         let registry = global_codec_registry()
             .read()
@@ -42,7 +46,11 @@ impl CodecContext {
 
         // Try to create a decoder first
         if codec.capabilities().can_decode {
-            self.decoder = Some(codec.create_decoder()?);
+            let decoder = codec.create_decoder()?;
+            // Build the replacement *before* dropping the old decoder so a
+            // failed (re-)open leaves the context exactly as it was.
+            self.encoder = None;
+            self.decoder = Some(decoder);
             self.is_open = true;
             tracing::info!("Opened decoder for {:?}", self.codec_id);
             return Ok(());
@@ -50,7 +58,9 @@ impl CodecContext {
 
         // Then try encoder
         if codec.capabilities().can_encode {
-            self.encoder = Some(codec.create_encoder()?);
+            let encoder = codec.create_encoder()?;
+            self.decoder = None;
+            self.encoder = Some(encoder);
             self.is_open = true;
             tracing::info!("Opened encoder for {:?}", self.codec_id);
             return Ok(());
@@ -59,6 +69,18 @@ impl CodecContext {
         Err(RsError::NotFound(
             format!("No decoder or encoder for {:?}", self.codec_id).into(),
         ))
+    }
+
+    /// Release the underlying decoder/encoder and return the context to its
+    /// pre-[`open`](Self::open) state.
+    ///
+    /// Equivalent to FFmpeg's `avcodec_close()`. Dropping the `Box<dyn Decoder>`
+    /// also releases whatever internal buffers the codec backend held, so this
+    /// is the only way to free that memory without dropping the whole context.
+    pub fn close(&mut self) {
+        self.decoder = None;
+        self.encoder = None;
+        self.is_open = false;
     }
 
     /// Decode a packet into frames.
@@ -257,5 +279,43 @@ mod tests {
         let packet = Packet::new(Bytes::new(), 0);
         let result = ctx.decode(&packet);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn close_returns_context_to_unopened_state() {
+        crate::codec_registry::register_builtin_codecs();
+        let mut ctx = CodecContext::builder()
+            .codec_id(CodecId::RawVideo)
+            .width(16)
+            .height(16)
+            .build();
+        ctx.open().expect("raw video codec is registered");
+        assert!(ctx.is_open());
+
+        ctx.close();
+        assert!(!ctx.is_open(), "close() must clear the open flag");
+        // Buffered state is gone: decoding/encoding now reports a lifecycle error
+        // instead of running against a half-torn-down codec.
+        let packet = Packet::new(Bytes::new(), 0);
+        assert!(ctx.decode(&packet).is_err());
+        assert!(matches!(
+            ctx.flush_decoder(),
+            Ok(frames) if frames.is_empty()
+        ));
+
+        // Re-opening after close must work again (no leaked half-open state).
+        ctx.open().unwrap();
+        assert!(ctx.is_open());
+        ctx.close();
+    }
+
+    #[test]
+    fn failed_open_keeps_the_context_closed_and_drops_nothing() {
+        let mut ctx = CodecContext::builder().codec_id(CodecId::H264).build();
+        assert!(ctx.open().is_err());
+        assert!(!ctx.is_open());
+        // A second attempt fails the same way — no partially-created codec.
+        assert!(ctx.open().is_err());
+        assert!(!ctx.is_open());
     }
 }
