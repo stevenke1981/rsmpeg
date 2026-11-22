@@ -293,36 +293,71 @@ impl Scaler {
     }
 }
 
-/// BT.601 YUV → RGB conversion.
+/// BT.601 inverse-matrix coefficients in 16.16 fixed point.
+///
+/// The limited-range set folds the studio-swing expansion (Y `255/219`,
+/// UV `255/224`) into the matrix so a pixel conversion is three multiply-adds
+/// and three shifts instead of a dozen floating-point operations.
+const COEF_Y_LTD: i32 = 76_309; // 255 / 219                  * 65536
+const COEF_RV_LTD: i32 = 104_597; // 1.402    * (255 / 224)    * 65536
+const COEF_GU_LTD: i32 = 25_675; // 0.344136 * (255 / 224)     * 65536
+const COEF_GV_LTD: i32 = 53_279; // 0.714136 * (255 / 224)     * 65536
+const COEF_BU_LTD: i32 = 132_201; // 1.772    * (255 / 224)    * 65536
+
+const COEF_RV_FULL: i32 = 91_881; // 1.402    * 65536
+const COEF_GU_FULL: i32 = 22_553; // 0.344136 * 65536
+const COEF_GV_FULL: i32 = 46_802; // 0.714136 * 65536
+const COEF_BU_FULL: i32 = 116_130; // 1.772    * 65536
+
+/// Fixed-point rounding bias (half of the 16.16 fraction).
+const ROUND_BIAS: i32 = 1 << 15;
+
+/// Clamp a 16.16 fixed-point colour value to an 8-bit channel.
+#[inline]
+fn clamp_fixed_u8(v: i32) -> u8 {
+    let v = (v + ROUND_BIAS) >> 16;
+    if v <= 0 {
+        0
+    } else if v >= 255 {
+        255
+    } else {
+        v as u8
+    }
+}
+
+/// BT.601 YUV → RGB conversion (integer fixed point).
 ///
 /// Limited range uses studio swing (Y 16–235, UV 16–240).
 /// Full range treats Y/U/V as 0–255 with neutral chroma at 128.
+///
+/// This is the hot path for every YUV frame shown on screen, so it avoids
+/// floating point entirely: each channel is one multiply-add per input
+/// component plus a shift, with ±0.5 LSB accuracy versus the exact matrix.
+#[inline]
 fn yuv_to_rgb_bt601(y: u8, u: u8, v: u8, limited: bool) -> (u8, u8, u8) {
-    let (yf, uf, vf) = if limited {
-        let yf = ((y as f32) - 16.0).max(0.0) * (255.0 / 219.0);
-        let uf = ((u as f32) - 128.0) * (255.0 / 224.0);
-        let vf = ((v as f32) - 128.0) * (255.0 / 224.0);
-        (yf, uf, vf)
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+    let (y_scaled, rv, gu, gv, bu) = if limited {
+        let y_scaled = (y as i32 - 16).max(0) * COEF_Y_LTD;
+        (y_scaled, COEF_RV_LTD, COEF_GU_LTD, COEF_GV_LTD, COEF_BU_LTD)
     } else {
-        (y as f32, (u as f32) - 128.0, (v as f32) - 128.0)
+        (
+            y as i32 * 65536,
+            COEF_RV_FULL,
+            COEF_GU_FULL,
+            COEF_GV_FULL,
+            COEF_BU_FULL,
+        )
     };
 
-    // BT.601 inverse matrix (Kr=0.299, Kb=0.114).
-    let r = yf + 1.402 * vf;
-    let g = yf - 0.344136 * uf - 0.714136 * vf;
-    let b = yf + 1.772 * uf;
-
-    (clamp_u8(r), clamp_u8(g), clamp_u8(b))
-}
-
-fn clamp_u8(v: f32) -> u8 {
-    if v <= 0.0 {
-        0
-    } else if v >= 255.0 {
-        255
-    } else {
-        (v + 0.5) as u8
-    }
+    let r = y_scaled + rv * e;
+    let g = y_scaled - gu * d - gv * e;
+    let b = y_scaled + bu * d;
+    (
+        clamp_fixed_u8(r),
+        clamp_fixed_u8(g),
+        clamp_fixed_u8(b),
+    )
 }
 
 fn clone_frame_metadata(frame: &Frame, data: Vec<Vec<u8>>, linesize: Vec<usize>) -> Frame {

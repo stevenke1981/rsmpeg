@@ -253,7 +253,9 @@ fn run_worker(
 
     use crate::backend::OpenH264Decoder;
     use crate::backend::SymphoniaAudioDecoder;
-    use crate::video_convert::yuv420p_frame_to_rgba;
+    // Cached converter: reuses one `Scaler` per resolution instead of building
+    // a fresh one for every decoded frame (byte-identical output).
+    use crate::video_convert::yuv420p_frame_to_rgba_cached;
 
     if prefer_native {
         match crate::native_pipeline::try_run_native(&path, volume, &cmd_rx, &event_tx) {
@@ -809,11 +811,11 @@ fn run_worker(
                                         emit_frame = true;
                                     }
                                     if (present || force_one_frame) && emit_frame {
-                                        if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                                        if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
                                             let ev = PlayerEvent::VideoFrame {
                                                 width: w,
                                                 height: h,
-                                                rgba,
+                                                rgba: std::sync::Arc::new(rgba),
                                                 pts: position,
                                                 generation,
                                             };
@@ -946,7 +948,7 @@ fn run_worker(
                 loop {
                     match dec.receive_frame() {
                         Ok(DecodeStatus::Frame(f)) => {
-                            if let Ok(rgba) = yuv420p_frame_to_rgba(&f) {
+                            if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
                                 let w = f.width;
                                 let h = f.height;
                                 if w > 0 && h > 0 {
@@ -955,7 +957,7 @@ fn run_worker(
                                         PlayerEvent::VideoFrame {
                                             width: w,
                                             height: h,
-                                            rgba,
+                                            rgba: std::sync::Arc::new(rgba),
                                             pts: position,
                                             generation,
                                         },

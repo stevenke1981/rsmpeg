@@ -201,9 +201,22 @@ impl Encoder for PCMAudioEncoder {
     }
 
     fn encode(&mut self, frame: &Frame) -> RsResult<Vec<Packet>> {
-        let data: Vec<u8> = frame.data.concat();
+        // Fast path: a single (interleaved) plane can be moved into `Bytes`
+        // directly, avoiding the `concat()` intermediate allocation + copy that
+        // `data.concat()` performs even for the common one-plane case.
+        let data: Bytes = match frame.data.as_slice() {
+            [only] => Bytes::copy_from_slice(only),
+            planes => {
+                let total: usize = planes.iter().map(Vec::len).sum();
+                let mut buf = Vec::with_capacity(total);
+                for p in planes {
+                    buf.extend_from_slice(p);
+                }
+                Bytes::from(buf)
+            }
+        };
         let packet = Packet {
-            data: Bytes::from(data),
+            data,
             pts: frame.pts,
             dts: None,
             duration: frame.duration,

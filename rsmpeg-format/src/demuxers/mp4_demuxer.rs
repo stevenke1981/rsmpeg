@@ -13,7 +13,7 @@ use rsmpeg_util::{MediaType, Rational, RsError, RsResult};
 use std::io::SeekFrom;
 
 /// One indexed sample ready for packet emission.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct SampleEntry {
     offset: u64,
     size: u32,
@@ -262,7 +262,8 @@ impl InputFormat for MP4Demuxer {
         };
 
         let track = &mut self.tracks[ti];
-        let sample = track.samples[track.next_sample].clone();
+        // `SampleEntry` is `Copy`, so this is a plain byte copy (no `Vec` clone).
+        let sample = track.samples[track.next_sample];
         track.next_sample += 1;
         let stream_index = track.stream_index;
         let timescale = track.timescale;

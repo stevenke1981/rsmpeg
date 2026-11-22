@@ -1,5 +1,6 @@
 //! Events emitted by the player toward UI / CLI consumers.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Lightweight state snapshot for UI binding (replaces large shared Mutex state).
@@ -13,7 +14,11 @@ pub struct PlayerSnapshot {
     pub status: String,
 }
 
-/// Player → host events.  Frame payloads stay small / reference-counted later.
+/// Player → host events.
+///
+/// Video frames carry their pixel buffer as an [`Arc`] so repeating a frame
+/// (`SyncAction::Duplicate`) or fanning it out to several consumers costs a
+/// reference-count bump instead of a full-frame `memcpy`.
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Snapshot(PlayerSnapshot),
@@ -25,7 +30,7 @@ pub enum PlayerEvent {
     VideoFrame {
         width: usize,
         height: usize,
-        rgba: Vec<u8>,
+        rgba: Arc<Vec<u8>>,
         pts: Duration,
         generation: u64,
     },
