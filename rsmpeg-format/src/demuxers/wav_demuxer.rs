@@ -162,7 +162,9 @@ impl InputFormat for WAVDemuxer {
             h264_bitstream_format: Default::default(),
         };
         stream.time_base = rsmpeg_util::Rational::new(1, time_base_den);
-        stream.duration = duration_ms;
+        // `Stream::duration` is in `time_base` ticks, not milliseconds: storing
+        // ms here made a 80 ms file report 0.01 s (4 ticks × 1/44100).
+        stream.set_duration_ms(duration_ms);
         ctx.duration = duration_ms;
         ctx.bit_rate = bit_rate;
         ctx.streams.push(stream);
@@ -374,6 +376,48 @@ mod tests {
         assert_eq!(ctx.duration, 1_000);
         // bit_rate = rate * channels * bits
         assert_eq!(ctx.bit_rate, 48_000 * 2 * 16);
+    }
+
+    #[test]
+    fn short_wav_reports_the_right_duration_in_seconds() {
+        // 80 ms of 8 kHz mono u8 → 640 samples. The stream used to store the
+        // millisecond figure in a 1/sample_rate time base, so `probe_basic`
+        // printed 0.01 s (640 ticks × 1/8000 would have been 0.08 s, but the
+        // stored value was the 80 ms number itself).
+        let nb = 640u32;
+        let data = build_wav(nb, 8_000, 1, 8);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        let stream = &ctx.streams[0];
+        assert_eq!(ctx.duration, 80, "container duration is milliseconds");
+        assert_eq!(
+            stream.time_base,
+            rsmpeg_util::Rational::new(1, 8_000),
+            "time base is 1/sample_rate"
+        );
+        assert_eq!(
+            stream.duration, 640,
+            "stream duration must be in ticks (samples), not milliseconds"
+        );
+        let seconds = stream.duration_seconds();
+        assert!(
+            (seconds - 0.08).abs() < 1e-9,
+            "80 ms must report 0.08 s, got {seconds}"
+        );
+    }
+
+    #[test]
+    fn one_second_wav_reports_one_second() {
+        let data = build_wav(44_100, 44_100, 2, 16);
+        let mut ctx = ctx_with(data);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let stream = &ctx.streams[0];
+        assert_eq!(stream.duration, 44_100, "44 100 ticks at 1/44100");
+        assert!((stream.duration_seconds() - 1.0).abs() < 1e-9);
+        assert_eq!(ctx.duration, 1_000);
     }
 
     #[test]

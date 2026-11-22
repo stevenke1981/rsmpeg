@@ -136,7 +136,8 @@ impl InputFormat for FLACDemuxer {
             extradata: None,
             h264_bitstream_format: Default::default(),
         };
-        stream.duration = duration_ms;
+        // Ticks, not milliseconds (see `Stream::set_duration_ms`).
+        stream.set_duration_ms(duration_ms);
         ctx.duration = duration_ms;
         ctx.streams.push(stream);
 
