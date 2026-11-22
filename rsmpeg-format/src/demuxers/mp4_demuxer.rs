@@ -208,7 +208,7 @@ impl InputFormat for MP4Demuxer {
             if tables.channels > 0 {
                 stream.codec_params.channels = Some(tables.channels);
             }
-            stream.time_base = Rational::new(1, timescale as i32);
+            stream.time_base = Rational::new(1, timescale_den(timescale));
             stream.duration = duration_tb;
             ctx.streams.push(stream);
 
@@ -267,7 +267,7 @@ impl InputFormat for MP4Demuxer {
         track.next_sample += 1;
         let stream_index = track.stream_index;
         let timescale = track.timescale;
-        let time_base = Rational::new(1, timescale.max(1) as i32);
+        let time_base = Rational::new(1, timescale_den(timescale));
 
         let io = ctx
             .io
@@ -461,6 +461,19 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
         });
     }
     samples
+}
+
+/// Clamp a container `timescale` (raw `u32` from `mdhd`) into the `i32`
+/// denominator a [`Rational`] time base can hold.
+///
+/// `as i32` would wrap values above `i32::MAX` into a negative (or zero)
+/// denominator, which silently corrupts every timestamp derived from the
+/// stream's time base.
+fn timescale_den(timescale: u32) -> i32 {
+    match i32::try_from(timescale) {
+        Ok(v) if v > 0 => v,
+        _ => 1,
+    }
 }
 
 // ── Box parsing ──────────────────────────────────────────────────────
@@ -1371,5 +1384,14 @@ mod tests {
         let mut demuxer = MP4Demuxer::default();
         // Either a clean error or an empty track list is fine — never a panic.
         let _ = demuxer.read_header(&mut ctx);
+    }
+
+    #[test]
+    fn timescale_den_never_wraps() {
+        assert_eq!(timescale_den(1000), 1000);
+        assert_eq!(timescale_den(90_000), 90_000);
+        // Raw u32 values above i32::MAX used to become negative denominators.
+        assert_eq!(timescale_den(u32::MAX), 1);
+        assert_eq!(timescale_den(0), 1);
     }
 }

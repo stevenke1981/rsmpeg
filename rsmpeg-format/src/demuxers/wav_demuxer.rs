@@ -103,7 +103,13 @@ impl InputFormat for WAVDemuxer {
 
         // ~20 ms of audio per packet
         let samples_per_packet = (sample_rate as usize / 50).max(1);
-        let packet_bytes = (samples_per_packet * block_align as usize).max(block_align as usize);
+        // `samples_per_packet * block_align` is derived from file fields; use
+        // checked math so a hostile `sample_rate`/`block_align` pair cannot
+        // overflow `usize` (which wraps in release builds and then aborts on a
+        // huge allocation).
+        let packet_bytes = samples_per_packet
+            .saturating_mul(block_align as usize)
+            .max(block_align as usize);
 
         self.data_remaining = data_size;
         self.sample_rate = sample_rate;
@@ -127,7 +133,7 @@ impl InputFormat for WAVDemuxer {
             extradata: None,
             h264_bitstream_format: Default::default(),
         };
-        stream.time_base = rsmpeg_util::Rational::new(1, sample_rate.max(1) as i32);
+        stream.time_base = rsmpeg_util::Rational::new(1, time_base_den(sample_rate));
         stream.duration = duration_ms;
         ctx.duration = duration_ms;
         ctx.bit_rate = bit_rate;
@@ -181,7 +187,7 @@ impl InputFormat for WAVDemuxer {
         let samples = to_read as i64 / self.block_align.max(1) as i64;
         let mut packet = Packet::new(bytes::Bytes::from(buf), 0);
         packet.duration = samples;
-        packet.time_base = rsmpeg_util::Rational::new(1, self.sample_rate.max(1) as i32);
+        packet.time_base = rsmpeg_util::Rational::new(1, time_base_den(self.sample_rate));
         packet.flags = rsmpeg_codec::PacketFlags::KEY;
         Ok(Some(packet))
     }
@@ -211,6 +217,19 @@ impl Default for WAVDemuxer {
             block_align: 1,
             packet_bytes: 4096,
         }
+    }
+}
+
+/// Clamp a `u32` sample rate into the `i32` numerator a [`Rational`] time base
+/// can hold.
+///
+/// The raw `u32` comes straight from the container header: `as i32` would turn
+/// e.g. `4_000_000_000` into a negative denominator, and `0` into a division by
+/// zero on every later timestamp conversion.
+fn time_base_den(sample_rate: u32) -> i32 {
+    match i32::try_from(sample_rate) {
+        Ok(v) if v > 0 => v,
+        _ => 1,
     }
 }
 
@@ -392,5 +411,45 @@ mod tests {
     fn find_data_chunk_returns_zero_at_eof() {
         let mut io = IOContext::from_buffer(Vec::new());
         assert_eq!(find_data_chunk(&mut io).unwrap(), 0);
+    }
+
+    #[test]
+    fn time_base_den_never_wraps_or_zeroes() {
+        // Valid rates round-trip unchanged.
+        assert_eq!(time_base_den(48_000), 48_000);
+        assert_eq!(time_base_den(1), 1);
+        // A rate above i32::MAX used to become a negative denominator via `as i32`.
+        assert_eq!(time_base_den(u32::MAX), 1);
+        assert_eq!(time_base_den(i32::MAX as u32 + 1), 1);
+        // Zero must not produce a division-by-zero time base.
+        assert_eq!(time_base_den(0), 1);
+    }
+
+    #[test]
+    fn hostile_sample_rate_and_block_align_do_not_overflow_packet_bytes() {
+        // sample_rate = 4e9, block_align = 65535: `samples_per_packet *
+        // block_align` overflows usize on 32-bit and is enormous on 64-bit.
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&2u16.to_le_bytes()); // 2 channels
+        v.extend_from_slice(&4_000_000_000u32.to_le_bytes()); // absurd rate
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&65535u16.to_le_bytes()); // absurd block align
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut ctx = ctx_with(v);
+        let mut demuxer = WAVDemuxer::default();
+        // Must not panic, and the derived time base must stay usable.
+        demuxer.read_header(&mut ctx).unwrap();
+        assert_eq!(ctx.streams.len(), 1);
+        assert!(ctx.streams[0].time_base.den > 0);
+        assert_eq!(ctx.duration, 0);
     }
 }
