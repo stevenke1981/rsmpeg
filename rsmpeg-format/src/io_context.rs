@@ -85,6 +85,45 @@ impl IOContext {
         self.seek(SeekFrom::Start(pos))?;
         Ok(buf)
     }
+
+    /// Like [`peek`](Self::peek), but returns *up to* `len` bytes.
+    ///
+    /// Probing only needs a prefix, so a file shorter than the probe window
+    /// (or a stream that ends mid-window) must not be an error — that made
+    /// `FormatContext::open_input` reject perfectly valid tiny/truncated
+    /// inputs with "failed to fill whole buffer" before the demuxer could
+    /// even look at them.
+    pub fn peek_prefix(&mut self, len: usize) -> RsResult<Vec<u8>> {
+        let pos = self.tell()?;
+        let mut buf = vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            match self.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Restore the position before surfacing I/O failures so a
+                    // retry starts from the same place.
+                    self.seek(SeekFrom::Start(pos))?;
+                    return Err(e.into());
+                }
+            }
+        }
+        self.seek(SeekFrom::Start(pos))?;
+        buf.truncate(filled);
+        Ok(buf)
+    }
+
+    /// Read into `buf`, returning the number of bytes read (0 at end of input).
+    ///
+    /// Unlike [`read_exact`](Self::read_exact) this never fails on a short read.
+    pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            IOContext::File(f) => f.read(buf),
+            IOContext::Buffer(c) => c.read(buf),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +195,43 @@ mod tests {
         let mut io = buf_ctx();
         assert!(io.read_bytes(0).unwrap().is_empty());
         assert_eq!(io.tell().unwrap(), 0);
+    }
+
+    #[test]
+    fn peek_prefix_returns_short_buffer_at_eof_without_error() {
+        // A file shorter than the probe window must yield what exists instead
+        // of "failed to fill whole buffer".
+        let mut io = buf_ctx(); // 8 bytes
+        let head = io.peek_prefix(2048).unwrap();
+        assert_eq!(head, vec![0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+        // Position is unchanged.
+        assert_eq!(io.tell().unwrap(), 0);
+    }
+
+    #[test]
+    fn peek_prefix_on_empty_input_is_empty() {
+        let mut io = IOContext::from_buffer(Vec::new());
+        assert!(io.peek_prefix(2048).unwrap().is_empty());
+        assert_eq!(io.tell().unwrap(), 0);
+    }
+
+    #[test]
+    fn peek_prefix_respects_the_start_offset() {
+        let mut io = buf_ctx();
+        io.seek(SeekFrom::Start(6)).unwrap();
+        let head = io.peek_prefix(16).unwrap();
+        assert_eq!(head, vec![0xde, 0xf0]);
+        assert_eq!(io.tell().unwrap(), 6);
+    }
+
+    #[test]
+    fn read_returns_zero_at_eof_and_partial_counts() {
+        let mut io = buf_ctx();
+        let mut buf = [0u8; 4];
+        assert_eq!(io.read(&mut buf).unwrap(), 4);
+        assert_eq!(&buf, &[0x12, 0x34, 0x56, 0x78]);
+        let mut rest = [0u8; 8];
+        assert_eq!(io.read(&mut rest).unwrap(), 4, "short read must not error");
+        assert_eq!(io.read(&mut rest).unwrap(), 0, "EOF must report 0");
     }
 }

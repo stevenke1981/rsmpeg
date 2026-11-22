@@ -30,7 +30,9 @@ impl FormatContext {
         let path = path.as_ref();
         let mut io = IOContext::open_file(path)?;
 
-        let probe_buf = io.peek(2048)?;
+        // Probe with as many bytes as the file actually has: a short file (or
+        // an empty one) is a valid input, not an I/O error.
+        let probe_buf = io.peek_prefix(2048)?;
         let mut ctx = FormatContext {
             input: None,
             output: None,
