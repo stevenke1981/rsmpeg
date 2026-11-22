@@ -188,17 +188,14 @@ impl InputFormat for MP4Demuxer {
         let mut media_ranges: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0u64;
 
-        while cursor + 8 <= file_end {
+        while file_end.saturating_sub(cursor) >= 8 {
             io.seek(SeekFrom::Start(cursor))?;
             let (box_size, box_type, header_len) = read_box_header_at(io, file_end)?;
-            if box_size < header_len {
+            let Some((payload_start, payload_end)) =
+                checked_child_box_bounds(cursor, box_size, header_len, file_end)
+            else {
                 break;
-            }
-            let payload_start = cursor + header_len;
-            let payload_end = cursor.saturating_add(box_size);
-            if payload_end > file_end || payload_end < payload_start {
-                break;
-            }
+            };
 
             match &box_type {
                 b"moov" => {
@@ -826,19 +823,41 @@ fn timescale_den(timescale: u32) -> Option<i32> {
 
 // ── Box parsing ──────────────────────────────────────────────────────
 
+/// Validate a child box's `(payload_start, payload_end)` inside `cursor..=parent_end`.
+///
+/// Uses checked 64-bit arithmetic so a malformed 64-bit extended `box_size`
+/// cannot overflow/panic in debug builds, wrap `cursor` backwards in release
+/// builds, or read beyond `parent_end`.
+fn checked_child_box_bounds(
+    cursor: u64,
+    box_size: u64,
+    header_len: u64,
+    parent_end: u64,
+) -> Option<(u64, u64)> {
+    if box_size < header_len {
+        return None;
+    }
+    let payload_start = cursor.checked_add(header_len)?;
+    let payload_end = cursor.checked_add(box_size)?;
+    if payload_start > parent_end || payload_end > parent_end || payload_end < payload_start {
+        return None;
+    }
+    Some((payload_start, payload_end))
+}
+
 fn read_box_header_at(
     io: &mut crate::io_context::IOContext,
     parent_end: u64,
 ) -> RsResult<(u64, [u8; 4], u64)> {
     let start = io.tell()?;
-    if start + 8 > parent_end {
+    if parent_end.saturating_sub(start) < 8 {
         return Err(RsError::InvalidData("box header past parent end".into()));
     }
     let size32 = io.read_u32_be()?;
     let mut btype = [0u8; 4];
     io.read_exact(&mut btype)?;
     let (size, header_len) = if size32 == 1 {
-        if start + 16 > parent_end {
+        if parent_end.saturating_sub(start) < 16 {
             return Err(RsError::InvalidData("extended size past parent".into()));
         }
         let size64 = io.read_u64_be()?;
@@ -859,14 +878,14 @@ fn parse_moov(
     tracks: &mut Vec<TrackTables>,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"trak" {
             let mut tables = TrackTables::default();
             parse_trak(io, payload_start, payload_end, &mut tables)?;
@@ -887,14 +906,14 @@ fn parse_trak(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"mdia" {
             parse_mdia(io, payload_start, payload_end, tables)?
         }
@@ -913,14 +932,14 @@ fn parse_mdia(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         match &box_type {
             b"mdhd" => parse_mdhd(io, payload_start, payload_end, tables)?,
             b"hdlr" => parse_hdlr(io, payload_start, payload_end, tables)?,
@@ -1009,14 +1028,14 @@ fn parse_minf(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"stbl" {
             parse_stbl(io, payload_start, payload_end, tables)?;
         }
@@ -1035,14 +1054,14 @@ fn parse_stbl(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         match &box_type {
             b"stsd" => parse_stsd(io, payload_start, payload_end, tables)?,
             b"stts" => parse_stts(io, payload_start, payload_end, tables)?,
@@ -1064,7 +1083,7 @@ fn parse_stbl(
 }
 
 fn parse_full_box_header(io: &mut crate::io_context::IOContext, end: u64) -> RsResult<(u8, u32)> {
-    if io.tell()? + 4 > end {
+    if end.saturating_sub(io.tell()?) < 4 {
         return Err(RsError::InvalidData("truncated fullbox".into()));
     }
     let version = io.read_u8()?;
@@ -1242,22 +1261,22 @@ fn parse_stsd(
 ) -> RsResult<()> {
     io.seek(SeekFrom::Start(start))?;
     let (_v, _f) = parse_full_box_header(io, end)?;
-    if io.tell()? + 4 > end {
+    if end.saturating_sub(io.tell()?) < 4 {
         return Ok(());
     }
     let entry_count = io.read_u32_be()?;
     let mut cursor = io.tell()?;
     for _ in 0..entry_count {
-        if cursor + 8 > end {
+        if end.saturating_sub(cursor) < 8 {
             break;
         }
         io.seek(SeekFrom::Start(cursor))?;
         let (entry_size, entry_type, header_len) = read_box_header_at(io, end)?;
-        if entry_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, entry_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + entry_size).min(end);
+        };
         match &entry_type {
             b"avc1" | b"avc3" => {
                 tables.codec_id = CodecId::H264;
@@ -1322,16 +1341,16 @@ fn parse_visual_sample_entry(
     tables.height = io.read_u16_be()?;
 
     // Child boxes start after 78-byte header
-    let child_start = start + HDR;
+    let child_start = start.saturating_add(HDR);
     let mut cursor = child_start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"avcC" {
             let len = payload_end.saturating_sub(payload_start) as usize;
             if len > 0 && len < 1024 * 1024 {
@@ -1385,14 +1404,14 @@ fn parse_audio_sample_entry(
     };
     let child_start = start.saturating_add(header_size);
     let mut cursor = child_start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"esds" {
             let len = payload_end.saturating_sub(payload_start) as usize;
             if len > 0 && len < 64 * 1024 {
@@ -2907,6 +2926,174 @@ mod tests {
             st.codec_params.extradata.as_deref(),
             Some(asc.as_slice()),
             "extradata must contain raw AudioSpecificConfig without esds wrapper"
+        );
+    }
+
+    fn build_mp4_with_audio_child_box(child_box: &[u8]) -> Vec<u8> {
+        let mut mp4a_payload = vec![0u8; 28];
+        mp4a_payload[17] = 2;
+        mp4a_payload[19] = 16;
+        mp4a_payload[24] = 0xBB;
+        mp4a_payload[25] = 0x80; // 48000 Hz
+        mp4a_payload.extend_from_slice(child_box);
+        let mp4a = box_bytes(b"mp4a", &mp4a_payload);
+
+        let mut stsd_rest = Vec::new();
+        stsd_rest.extend_from_slice(&be32(1));
+        stsd_rest.extend_from_slice(&mp4a);
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1024));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = Vec::new();
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = Vec::new();
+        stsz_rest.extend_from_slice(&be32(0));
+        stsz_rest.extend_from_slice(&be32(1));
+        stsz_rest.extend_from_slice(&be32(4));
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mdat = box_bytes(b"mdat", b"ABCD");
+        let data_offset = (ftyp.len() + 8) as u32;
+
+        let mut stco_rest = Vec::new();
+        stco_rest.extend_from_slice(&be32(1));
+        stco_rest.extend_from_slice(&be32(data_offset));
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut stbl_body = Vec::new();
+        for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+            stbl_body.extend_from_slice(b);
+        }
+        let minf = box_bytes(b"minf", &box_bytes(b"stbl", &stbl_body));
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&be32(48_000));
+        mdhd_body[12..16].copy_from_slice(&be32(1024));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"soun");
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body)),
+        );
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    #[test]
+    fn checked_child_box_bounds_rejects_overflow_wrap_and_past_parent() {
+        // u64::MAX overflows cursor + box_size.
+        assert_eq!(checked_child_box_bounds(128, u64::MAX, 16, 256), None);
+        // Exact wrap-around past u64::MAX back to an offset < parent_end.
+        let wrap_back = u64::MAX - 128 + 1 + 10;
+        assert_eq!(checked_child_box_bounds(128, wrap_back, 16, 256), None);
+        // Box smaller than its own header.
+        assert_eq!(checked_child_box_bounds(128, 12, 16, 256), None);
+        // Declared extent exceeds parent_end.
+        assert_eq!(checked_child_box_bounds(128, 200, 16, 256), None);
+        // Valid 64-bit extended box inside parent.
+        assert_eq!(checked_child_box_bounds(128, 64, 16, 256), Some((144, 192)));
+    }
+
+    #[test]
+    fn public_demux_handles_overflowing_64bit_esds_and_container_box_sizes_without_panic() {
+        let asc = [0x11u8, 0x90];
+        let valid_esds_payload = build_esds_payload(1, 0x00, 0x40, &asc);
+
+        // Case 1: `mp4a` child `esds` declares 64-bit size = u64::MAX.
+        let mut overflow_esds = Vec::new();
+        overflow_esds.extend_from_slice(&be32(1));
+        overflow_esds.extend_from_slice(b"esds");
+        overflow_esds.extend_from_slice(&u64::MAX.to_be_bytes());
+        overflow_esds.extend_from_slice(&valid_esds_payload);
+
+        let file_max = build_mp4_with_audio_child_box(&overflow_esds);
+        let mut ctx_max = ctx_from(file_max);
+        let mut demuxer_max = MP4Demuxer::default();
+        demuxer_max
+            .read_header(&mut ctx_max)
+            .expect("overflowing esds must not panic");
+        assert_eq!(ctx_max.streams.len(), 1);
+        assert_eq!(
+            ctx_max.streams[0].codec_params.extradata, None,
+            "malformed overflowing esds payload must not be read"
+        );
+
+        // Case 2: 64-bit size engineered to wrap `cursor + box_size` backward into the parent.
+        let mut wrap_box = Vec::new();
+        wrap_box.extend_from_slice(&be32(1));
+        wrap_box.extend_from_slice(b"free");
+        wrap_box.extend_from_slice(&(u64::MAX - 20).to_be_bytes());
+        wrap_box.extend_from_slice(&[0u8; 8]);
+        let file_wrap = build_mp4_with_audio_child_box(&wrap_box);
+        let mut ctx_wrap = ctx_from(file_wrap);
+        let mut demuxer_wrap = MP4Demuxer::default();
+        demuxer_wrap
+            .read_header(&mut ctx_wrap)
+            .expect("wrap-around child box must not panic or loop forever");
+        assert_eq!(ctx_wrap.streams.len(), 1);
+
+        // Case 3: 64-bit `esds` size does not overflow u64, but exceeds parent `mp4a` end.
+        let mut past_parent_esds = Vec::new();
+        past_parent_esds.extend_from_slice(&be32(1));
+        past_parent_esds.extend_from_slice(b"esds");
+        past_parent_esds.extend_from_slice(&10_000u64.to_be_bytes());
+        past_parent_esds.extend_from_slice(&valid_esds_payload);
+        let file_past = build_mp4_with_audio_child_box(&past_parent_esds);
+        let mut ctx_past = ctx_from(file_past);
+        let mut demuxer_past = MP4Demuxer::default();
+        demuxer_past
+            .read_header(&mut ctx_past)
+            .expect("past-parent esds must not panic");
+        assert_eq!(ctx_past.streams.len(), 1);
+        assert_eq!(
+            ctx_past.streams[0].codec_params.extradata, None,
+            "esds extending past parent mp4a must be rejected"
+        );
+
+        // Case 4: `moov` child box with 64-bit size = u64::MAX via FormatContext::open_input.
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mut bad_moov_child = Vec::new();
+        bad_moov_child.extend_from_slice(&be32(1));
+        bad_moov_child.extend_from_slice(b"trak");
+        bad_moov_child.extend_from_slice(&u64::MAX.to_be_bytes());
+        let moov = box_bytes(b"moov", &bad_moov_child);
+        let mut file_moov = Vec::new();
+        file_moov.extend_from_slice(&ftyp);
+        file_moov.extend_from_slice(&moov);
+
+        let tmp = std::env::temp_dir().join("rsmpeg_p1_01_overflow_moov.mp4");
+        std::fs::write(&tmp, &file_moov).expect("write temp mp4");
+        let open_res = FormatContext::open_input(&tmp).and_then(|mut c| {
+            c.read_header()?;
+            Ok(c.streams.len())
+        });
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            open_res.expect("public FormatContext::open_input + read_header must not panic"),
+            0
         );
     }
 }
