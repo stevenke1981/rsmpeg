@@ -32,6 +32,56 @@ struct TrackState {
     next_sample: usize,
 }
 
+/// Why `read_header` refused to publish a `trak`.
+///
+/// Kept per track so the "nothing is playable" error can describe the real
+/// cause: a sample-mapping failure and an unrepresentable `mdhd` timescale are
+/// different bugs and must not be reported as each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackRejection {
+    /// No sample could be placed inside an `mdat` payload (`stsc`/`stco`/`stsz`
+    /// disagree, or the offsets point outside the media data).
+    UnlocatableSamples,
+    /// `mdhd` timescale is 0 or does not fit an `i32` denominator.
+    UnrepresentableTimeBase,
+}
+
+/// Build the "all tracks rejected" error from the per-track reasons.
+///
+/// When every track failed for the same reason the message names it directly;
+/// otherwise the mix is spelled out so neither cause is hidden behind the
+/// other. The error *variant* follows the cause as well: an untrustworthy
+/// sample mapping is a container-structure problem ([`RsError::Format`]),
+/// while a `mdhd` timescale that cannot form a time base is malformed data
+/// ([`RsError::InvalidData`]). Both were previously reported as the latter,
+/// which pointed readers at `mdhd` for a bug that lived in `stsc`/`stco`.
+fn rejection_error(rejections: &[TrackRejection], track_total: usize) -> RsError {
+    let unlocatable = rejections
+        .iter()
+        .filter(|r| **r == TrackRejection::UnlocatableSamples)
+        .count();
+    let bad_time_base = rejections.len() - unlocatable;
+    let detail = match (unlocatable, bad_time_base) {
+        (0, n) => format!(
+            "{n} track(s) have a timescale that cannot be represented as a time base"
+        ),
+        (n, 0) => format!(
+            "{n} track(s) have no sample that can be located inside an mdat payload \
+             (sample mapping is invalid or references non-media bytes)"
+        ),
+        (u, t) => format!(
+            "{u} track(s) have no locatable sample and {t} track(s) have a timescale \
+             that cannot be represented as a time base"
+        ),
+    };
+    let message = format!("MP4: all {track_total} track(s) unusable: {detail}");
+    if unlocatable == 0 {
+        RsError::InvalidData(message.into())
+    } else {
+        RsError::Format(message.into())
+    }
+}
+
 /// Intermediate tables collected while parsing one `trak`.
 struct TrackTables {
     timescale: u32,
@@ -188,8 +238,9 @@ impl InputFormat for MP4Demuxer {
 
         let mut max_duration_ms: i64 = 0;
         let track_total = track_builds.len();
-        let mut skipped_invalid_time_base = 0usize;
-        let mut skipped_unplayable = 0usize;
+        // Why each `trak` was dropped, so the end-of-`moov` report can name the
+        // real cause instead of assuming the time base was at fault.
+        let mut rejections: Vec<TrackRejection> = Vec::new();
         for (trak_idx, tables) in track_builds.into_iter().enumerate() {
             let samples = build_sample_index(&tables);
             if samples.is_empty()
@@ -215,7 +266,7 @@ impl InputFormat for MP4Demuxer {
                     "MP4: track {} has no sample inside any mdat payload; not publishing it",
                     trak_idx
                 );
-                skipped_unplayable += 1;
+                rejections.push(TrackRejection::UnlocatableSamples);
                 continue;
             }
 
@@ -230,7 +281,7 @@ impl InputFormat for MP4Demuxer {
                     trak_idx,
                     tables.timescale
                 );
-                skipped_invalid_time_base += 1;
+                rejections.push(TrackRejection::UnrepresentableTimeBase);
                 continue;
             };
             let timescale = time_base as u32;
@@ -282,19 +333,16 @@ impl InputFormat for MP4Demuxer {
             });
         }
 
-        // Every track was rejected (unusable time base or unlocatable samples):
-        // report the failure instead of returning success with an empty stream
-        // list, which reads like an intentionally empty file.
-        let skipped_any = skipped_invalid_time_base + skipped_unplayable;
-        if ctx.streams.is_empty() && skipped_any > 0 && skipped_any == track_total
-        {
-            return Err(RsError::InvalidData(
-                format!(
-                    "MP4: all {track_total} track(s) have a timescale that cannot be \
-                     represented as a time base"
-                )
-                .into(),
-            ));
+        // Every track was rejected: report the failure instead of returning
+        // success with an empty stream list, which reads like an intentionally
+        // empty file. The message has to name the *actual* reason — a track
+        // dropped because its samples are not inside any `mdat` payload has a
+        // perfectly valid time base, and claiming otherwise sent readers
+        // chasing `mdhd` when the bug was in `stsc`/`stco`.
+        if ctx.streams.is_empty() && rejections.len() == track_total && track_total > 0 {
+            let err = rejection_error(&rejections, track_total);
+            tracing::error!("{err}");
+            return Err(err);
         }
 
         ctx.duration = max_duration_ms;
@@ -2220,6 +2268,55 @@ mod tests {
             .expect_err("no usable track remains");
         assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
         assert_eq!(ctx.streams.len(), 0);
+    }
+
+    #[test]
+    fn review_unlocatable_samples_are_not_reported_as_a_time_base_error() {
+        // Review P2: this fixture's `mdhd` timescale (1000) is perfectly valid;
+        // only the chunk offset points at `ftyp` instead of the `mdat` payload.
+        // The old diagnostic blamed the timescale, sending readers after a bug
+        // that lives in `stco`/`stsc`.
+        let mut data = build_probe_mp4(&[(1000, 2, 1, 0)]);
+        let pos = data.windows(4).position(|w| w == b"stco").expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(4));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("the only track has no locatable sample");
+        let text = err.to_string();
+        assert!(
+            !text.contains("timescale"),
+            "a sample-location failure must not be reported as a time base error: {text}"
+        );
+        assert!(
+            text.contains("no sample that can be located"),
+            "the error must name the real cause: {text}"
+        );
+        // A broken sample mapping is a container-structure problem, not
+        // malformed numeric data.
+        assert!(matches!(err, RsError::Format(_)), "got {err:?}");
+        assert!(ctx.streams.is_empty());
+    }
+
+    #[test]
+    fn review_time_base_rejection_still_names_the_timescale() {
+        // The counterpart: a genuinely unrepresentable `mdhd` timescale must
+        // keep reporting the time base, so the fix above does not just move the
+        // wrong message onto the other case.
+        let mut ctx = ctx_from(build_probe_mp4(&[(0, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("timescale 0 cannot form a time base");
+        let text = err.to_string();
+        assert!(
+            text.contains("timescale"),
+            "the time base failure must still be reported as such: {text}"
+        );
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
     }
 
     #[test]
