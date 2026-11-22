@@ -36,9 +36,10 @@ struct TrackState {
 struct TrackTables {
     timescale: u32,
     duration: u64,
-    /// Length of the enclosing file, used to bound sample ranges. `0` means
-    /// "unknown" (buffer-backed inputs of unknown size).
-    file_size: u64,
+    /// Payload ranges `[start, end)` of every `mdat` box. Sample data must live
+    /// inside one of them; anything else (the `ftyp`/`moov` header region, or a
+    /// range spanning two boxes) is structural bytes, not media.
+    media_ranges: Vec<(u64, u64)>,
     media_type: MediaType,
     codec_id: CodecId,
     width: u16,
@@ -61,7 +62,7 @@ impl Default for TrackTables {
         Self {
             timescale: 0,
             duration: 0,
-            file_size: 0,
+            media_ranges: Vec::new(),
             media_type: MediaType::Data,
             codec_id: CodecId::Unknown,
             width: 0,
@@ -130,6 +131,7 @@ impl InputFormat for MP4Demuxer {
 
         let mut track_builds: Vec<TrackTables> = Vec::new();
         let mut found_moov = false;
+        let mut media_ranges: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0u64;
 
         while cursor + 8 <= file_end {
@@ -148,6 +150,12 @@ impl InputFormat for MP4Demuxer {
                 b"moov" => {
                     found_moov = true;
                     parse_moov(io, payload_start, payload_end, &mut track_builds)?;
+                }
+                b"mdat" => {
+                    // Only the payload is media; the 8/16-byte box header is not.
+                    if payload_end > payload_start {
+                        media_ranges.push((payload_start, payload_end));
+                    }
                 }
                 b"moof" => {
                     tracing::warn!(
@@ -169,14 +177,19 @@ impl InputFormat for MP4Demuxer {
             return Ok(());
         }
 
-        // Sample ranges are validated against the real file length.
+        // Sample ranges must fall inside an `mdat` payload; the file length alone
+        // is not enough (byte 4 of a tiny file is `ftyp`, not media).
+        if media_ranges.is_empty() {
+            tracing::warn!("MP4: no mdat payload found; no sample can be located");
+        }
         for tables in &mut track_builds {
-            tables.file_size = file_end;
+            tables.media_ranges = media_ranges.clone();
         }
 
         let mut max_duration_ms: i64 = 0;
         let track_total = track_builds.len();
         let mut skipped_invalid_time_base = 0usize;
+        let mut skipped_unplayable = 0usize;
         for (trak_idx, tables) in track_builds.into_iter().enumerate() {
             let samples = build_sample_index(&tables);
             if samples.is_empty()
@@ -187,6 +200,23 @@ impl InputFormat for MP4Demuxer {
                     "MP4: track {} has no samples (fragmented or incomplete stbl)",
                     trak_idx
                 );
+            }
+
+            // A track with no locatable sample cannot be played: publishing it
+            // would put a dead entry in `ctx.streams`, and `find_best_stream`
+            // could select it while every packet belongs to a different track.
+            // Data/subtitle tracks are metadata-only and stay publishable.
+            let playable_kind = !matches!(
+                tables.media_type,
+                MediaType::Data | MediaType::Subtitle
+            );
+            if samples.is_empty() && playable_kind {
+                tracing::error!(
+                    "MP4: track {} has no sample inside any mdat payload; not publishing it",
+                    trak_idx
+                );
+                skipped_unplayable += 1;
+                continue;
             }
 
             // `tb = 1/timescale` must be representable as an `i32` pair, and a
@@ -252,10 +282,11 @@ impl InputFormat for MP4Demuxer {
             });
         }
 
-        // Every track was rejected for its time base: report the failure instead
-        // of returning success with an empty stream list (which looks like an
-        // intentionally empty file to the caller).
-        if ctx.streams.is_empty() && skipped_invalid_time_base > 0 && skipped_invalid_time_base == track_total
+        // Every track was rejected (unusable time base or unlocatable samples):
+        // report the failure instead of returning success with an empty stream
+        // list, which reads like an intentionally empty file.
+        let skipped_any = skipped_invalid_time_base + skipped_unplayable;
+        if ctx.streams.is_empty() && skipped_any > 0 && skipped_any == track_total
         {
             return Err(RsError::InvalidData(
                 format!(
@@ -507,16 +538,22 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
         }
     }
 
-    // A chunk that starts at byte 0 (or whose samples run past the end of the
-    // file) cannot be read as media: byte 0 is the `ftyp`/`moov` header, and
-    // reading it produced packets that looked structurally fine. Dropping just
-    // the offending entries is not enough — the sample/duration tables are
-    // indexed by ordinal, so removing the middle of a chunk shifts every later
-    // sample's DTS/size onto the wrong bytes. Treat the whole track as
-    // unaddressable instead.
+    // Every sample must lie completely inside one `mdat` payload. Checking only
+    // "offset != 0 and inside the file" was not enough: offset 4 of a small file
+    // is the `ftyp` box, so a structurally valid packet was built out of
+    // container header bytes. Running past the end of the file, or spanning two
+    // boxes, is rejected the same way.
+    //
+    // Dropping just the offending entries is not enough either — the
+    // sample/duration tables are indexed by ordinal, so removing the middle of a
+    // chunk shifts every later sample's DTS/size onto the wrong bytes. Treat the
+    // whole track as unaddressable instead.
     let valid_chunks = offsets.iter().zip(&sizes).take(offsets.len()).all(|(&off, &size)| {
-        off != 0
-            && (t.file_size == 0 || (off as u128 + size as u128) <= t.file_size as u128)
+        let end = off as u128 + size as u128;
+        size != 0
+            && t.media_ranges
+                .iter()
+                .any(|&(start, stop)| off >= start && end <= stop as u128)
     });
     if !valid_chunks {
         tracing::warn!(
@@ -1172,6 +1209,14 @@ mod tests {
     use crate::format_context::FormatContext;
     use crate::io_context::IOContext;
 
+    /// Media range covering a synthetic test file's payload.
+    ///
+    /// Sample data is only accepted inside an `mdat` payload, so unit tests that
+    /// hand-build `TrackTables` must declare the region their offsets point into.
+    fn media_range(start: u64, end: u64) -> Vec<(u64, u64)> {
+        vec![(start, end)]
+    }
+
     fn be32(v: u32) -> [u8; 4] {
         v.to_be_bytes()
     }
@@ -1315,6 +1360,7 @@ mod tests {
             stsc: vec![(1, 3, 1)],
             stsz: vec![10, 20, 30],
             stco: vec![100],
+            media_ranges: media_range(1, u64::MAX / 2),
             stss: vec![1, 3],
             ..Default::default()
         };
@@ -1342,6 +1388,7 @@ mod tests {
             stsc: vec![(1, 2, 1)],
             stsz: vec![1, 1],
             stco: vec![2048],
+            media_ranges: media_range(1, u64::MAX / 2),
             stss: vec![],
             ..Default::default()
         };
@@ -1443,6 +1490,7 @@ mod tests {
             stsc: vec![(999, 1, 1)],
             stsz: vec![1, 1],
             stco: vec![100],
+            media_ranges: media_range(1, u64::MAX / 2),
             ..Default::default()
         };
         let samples = build_sample_index(&tables);
@@ -1464,6 +1512,7 @@ mod tests {
             stsc: vec![(3, 1, 1), (1, 1, 1)],
             stsz: vec![1, 1, 1],
             stco: vec![100, 200],
+            media_ranges: media_range(1, u64::MAX / 2),
             ..Default::default()
         };
         let samples = build_sample_index(&tables);
@@ -1533,15 +1582,12 @@ mod tests {
             format_name: Some("mp4".into()),
         };
         let mut demuxer = MP4Demuxer::default();
-        demuxer.read_header(&mut ctx).unwrap();
-        assert_eq!(ctx.streams.len(), 1);
-
-        let packet = demuxer.read_frame(&mut ctx).unwrap();
-        assert!(
-            packet.is_none(),
-            "no packet may be produced from an unaddressable sample table, got {:?}",
-            packet.map(|p| p.data.to_vec())
-        );
+        // The only track has no locatable sample, so it is not published and the
+        // file reports that nothing is playable (rather than exposing a stream
+        // that can never yield a packet).
+        assert!(demuxer.read_header(&mut ctx).is_err());
+        assert!(ctx.streams.is_empty());
+        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1555,6 +1601,7 @@ mod tests {
             stsc: vec![(1, 4, 1)],
             stsz: vec![3, 3],
             stco: vec![2048],
+            media_ranges: media_range(1, u64::MAX / 2),
             stss: vec![99],
             ..Default::default()
         };
@@ -1760,7 +1807,7 @@ mod tests {
         // Review P1: dropping track 0 left the surviving track's Stream and
         // Packet indices at 1, while the player selects position 0.
         // Track 1 starts at the second payload ("BBBB").
-        let second_payload = (box_bytes(b"ftyp", b"isom    isom").len() + 8 + 3) as u64;
+        let second_payload = (box_bytes(b"ftyp", b"isom\0\0\0\0isom").len() + 8 + 3) as u64;
         let data = build_probe_mp4(&[(0x8000_0000, 1, 1, 0), (1000, 2, 1, second_payload)]);
         let mut ctx = ctx_from(data);
         let mut demuxer = MP4Demuxer::default();
@@ -1786,6 +1833,91 @@ mod tests {
         );
         assert_eq!(&packets[0].data[..], b"BBB");
         assert!(packets.iter().all(|p| p.stream_index == selected));
+    }
+
+    #[test]
+    fn review_track_without_locatable_samples_is_not_published() {
+        // Third review round: dropping a track's samples still left it in
+        // `ctx.streams`, so `find_best_stream` selected index 0 (the broken
+        // track) while every packet belonged to index 1. Selection must only
+        // ever see playable tracks.
+        let broken = (1000u32, 1usize, 1usize, u64::MAX); // chunk offset 0
+        let second_payload = (box_bytes(b"ftyp", b"isom    isom").len() + 8 + 3) as u64;
+        let healthy = (1000u32, 2usize, 1usize, second_payload);
+        let mut data = build_probe_mp4(&[broken, healthy]);
+        // Force the first track's chunk offset to 0.
+        let pos = data.windows(4).position(|w| w == b"stco").expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(0));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        // Only the healthy track is published, renumbered to position 0.
+        let indices: Vec<usize> = ctx.streams.iter().map(|s| s.index).collect();
+        assert_eq!(indices, vec![0], "streams must contain playable tracks only");
+        let selected = ctx.find_best_stream(MediaType::Audio);
+        assert_eq!(selected, Some(0));
+
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert_eq!(packets.len(), 1, "got {packets:?}");
+        assert_eq!(
+            packets[0].stream_index, 0,
+            "packets must be routed to the selected stream"
+        );
+        assert_eq!(&packets[0].data[..], b"BBB");
+    }
+
+    #[test]
+    fn review_sample_offsets_must_point_inside_mdat() {
+        // Offset 4 is inside the file but inside the `ftyp` box, not the media
+        // payload; the old check (non-zero, before EOF) let it through and
+        // returned the bytes "ftyp" as a packet.
+        let mut data = build_probe_mp4(&[(1000, 2, 1, 0)]);
+        let pos = data.windows(4).position(|w| w == b"stco").expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(4));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "container header bytes must never become a packet: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn review_sample_spanning_two_boxes_is_rejected() {
+        // A sample that starts inside `mdat` but runs past its end (into `moov`)
+        // must be rejected: the range check is on the whole sample, not the start.
+        let mut data = build_probe_mp4(&[(1000, 2, 2, 0)]);
+        let pos = data.windows(4).position(|w| w == b"stco").expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        // mdat payload starts after ftyp (24 bytes) + 8-byte mdat header.
+        let mdat_payload_start = 24u32 + 8;
+        // Point two bytes before the last media byte so aAAA straddles the end.
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(mdat_payload_start + 5));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "a sample crossing the mdat boundary must be dropped: {packets:?}"
+        );
     }
 
     #[test]
@@ -1853,8 +1985,13 @@ mod tests {
 
         let mut ctx = ctx_from(data);
         let mut demuxer = MP4Demuxer::default();
-        demuxer.read_header(&mut ctx).unwrap();
-        let packets = read_all(&mut demuxer, &mut ctx);
+        // The payload is outside every `mdat`, so the track is unplayable.
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
         assert!(packets.is_empty(), "samples past EOF must be dropped");
     }
 }
