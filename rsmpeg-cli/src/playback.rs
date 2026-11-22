@@ -44,11 +44,9 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 PlayerEvent::Warning { message, .. } => {
                     eprintln!("  Warning: {}", message);
                 }
-                PlayerEvent::Snapshot(s) => {
-                    if s.duration > Duration::ZERO {
-                        // optional: print once
-                    }
-                }
+                // Snapshot metadata is not needed by the legacy minifb `play`
+                // window; it is only reported for duration display in the GUI.
+                PlayerEvent::Snapshot(_s) => {}
                 _ => {}
             }
         }

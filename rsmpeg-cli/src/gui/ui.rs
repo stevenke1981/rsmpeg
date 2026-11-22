@@ -55,7 +55,7 @@ fn render_welcome(app: &mut MediaApp, ctx: &egui::Context) {
                 rect,
                 Rounding::same(8.0),
                 Color32::from_rgba_unmultiplied(40, 80, 140, 40),
-                Stroke::new(2.0, Color32::from_rgb(80, 160, 255)),
+                Stroke::new(2.0_f32, Color32::from_rgb(80, 160, 255)),
             );
         }
         ui.vertical_centered(|ui| {

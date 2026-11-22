@@ -330,8 +330,8 @@ impl Resampler {
                 if any {
                     best.min(src_ch.saturating_sub(1))
                 } else {
-                    // No weight: downmix takes first channel, upmix duplicates it.
-                    0.min(src_ch.saturating_sub(1))
+                    // No weight: downmix takes the first source channel.
+                    0
                 }
             }
             None => dst_idx.min(src_ch.saturating_sub(1)),
