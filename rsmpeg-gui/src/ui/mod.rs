@@ -1,22 +1,29 @@
 //! Main GPUI view hosting the `rsmpeg-player` session, polling loop, and UI composition.
 
+pub mod controls;
 pub mod stage;
 pub mod theme;
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, Context, ExternalPaths, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, RenderImage, Styled, Task, Window,
+    div, prelude::*, px, Bounds, Context, ExternalPaths, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    RenderImage, Styled, Task, Window,
 };
 use rsmpeg_player::{Player, PlayerEvent};
 
 use crate::i18n::{strings, Locale, UiStrings};
 use crate::media_info::probe_file;
 use crate::playlist::{is_supported_media_extension, MEDIA_EXTENSIONS};
-use crate::state::{EventOutcome, PlaybackStatus, PlaybackUiState};
+use crate::shortcuts::{map_key_to_action, KeyInput, ShortcutAction, SEEK_STEP_SECS, VOLUME_STEP};
+use crate::state::{
+    fraction_from_pointer, EventOutcome, PlaybackStatus, PlaybackUiState, SidePanel,
+};
 use crate::video::build_render_image;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -33,6 +40,9 @@ pub struct PlayerView {
     _poll_task: Task<()>,
     probe_task: Option<Task<()>>,
     dialog_task: Option<Task<()>>,
+    seek_track_bounds: Rc<Cell<Bounds<Pixels>>>,
+    volume_track_bounds: Rc<Cell<Bounds<Pixels>>>,
+    dragging_volume: bool,
 }
 
 impl Focusable for PlayerView {
@@ -74,6 +84,9 @@ impl PlayerView {
             _poll_task: poll_task,
             probe_task: None,
             dialog_task: None,
+            seek_track_bounds: Rc::new(Cell::new(Bounds::default())),
+            volume_track_bounds: Rc::new(Cell::new(Bounds::default())),
+            dragging_volume: false,
         };
 
         if !initial_files.is_empty() {
@@ -104,6 +117,252 @@ impl PlayerView {
         window.toggle_fullscreen();
         self.state.is_fullscreen = window.is_fullscreen();
         cx.notify();
+    }
+
+    pub(crate) fn toggle_play_pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.state.status {
+            PlaybackStatus::Playing | PlaybackStatus::Opening => {
+                if let Some(p) = self.player.as_mut() {
+                    let _ = p.pause();
+                }
+                self.state.status = PlaybackStatus::Paused;
+                cx.notify();
+            }
+            PlaybackStatus::Paused | PlaybackStatus::Seeking => {
+                if let Some(p) = self.player.as_mut() {
+                    let _ = p.play();
+                    self.state.status = PlaybackStatus::Playing;
+                    cx.notify();
+                } else if let Some(item) = self.state.playlist.current_item().cloned() {
+                    let resume_at = if self.state.position.is_zero() {
+                        None
+                    } else {
+                        Some(self.state.position)
+                    };
+                    self.load_path(item.path, true, resume_at, window, cx);
+                }
+            }
+            PlaybackStatus::Stopped | PlaybackStatus::Ended | PlaybackStatus::Error => {
+                if let Some(item) = self.state.playlist.current_item().cloned() {
+                    self.load_path(item.path, true, None, window, cx);
+                } else {
+                    self.open_file_dialog(window, cx);
+                }
+            }
+            PlaybackStatus::Idle => {
+                if let Some(item) = self.state.playlist.current_item().cloned() {
+                    self.load_path(item.path, true, None, window, cx);
+                } else {
+                    self.open_file_dialog(window, cx);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn stop_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(mut p) = self.player.take() {
+            let _ = p.stop();
+            let _ = p.shutdown();
+        }
+        if let Some(old_img) = self.current_frame.take() {
+            let _ = window.drop_image(old_img);
+        }
+        self.state.has_video_frame = false;
+        self.state.position = Duration::ZERO;
+        self.state.scrubbing = false;
+        self.state.scrub_fraction = 0.0;
+        self.state.reset_waveform();
+        self.state.status = if self.state.playlist.current_item().is_some() {
+            PlaybackStatus::Stopped
+        } else {
+            PlaybackStatus::Idle
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn seek_to(
+        &mut self,
+        target: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let clamped = if !self.state.duration.is_zero() {
+            target.min(self.state.duration)
+        } else {
+            target
+        };
+        self.state.position = clamped;
+
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.seek(clamped);
+            cx.notify();
+        } else if let Some(item) = self.state.playlist.current_item().cloned() {
+            let autoplay = self.state.status == PlaybackStatus::Playing;
+            self.load_path(item.path, autoplay, Some(clamped), window, cx);
+        }
+    }
+
+    pub(crate) fn seek_relative(
+        &mut self,
+        delta_secs: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.playlist.current_item().is_none() {
+            return;
+        }
+        let target = self.state.seek_relative_target(delta_secs);
+        self.seek_to(target, window, cx);
+    }
+
+    pub(crate) fn begin_seek_drag(&mut self, mouse_x: Pixels, cx: &mut Context<Self>) {
+        if self.state.duration.is_zero() {
+            return;
+        }
+        let bounds = self.seek_track_bounds.get();
+        let frac = fraction_from_pointer(
+            f32::from(mouse_x),
+            f32::from(bounds.origin.x),
+            f32::from(bounds.size.width),
+        );
+        self.state.scrubbing = true;
+        self.state.scrub_fraction = frac;
+        cx.notify();
+    }
+
+    pub(crate) fn update_seek_drag(&mut self, mouse_x: Pixels, cx: &mut Context<Self>) {
+        if !self.state.scrubbing {
+            return;
+        }
+        let bounds = self.seek_track_bounds.get();
+        let frac = fraction_from_pointer(
+            f32::from(mouse_x),
+            f32::from(bounds.origin.x),
+            f32::from(bounds.size.width),
+        );
+        self.state.scrub_fraction = frac;
+        cx.notify();
+    }
+
+    pub(crate) fn finish_seek_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.scrubbing {
+            return;
+        }
+        let target = self.state.displayed_position();
+        self.state.scrubbing = false;
+        self.seek_to(target, window, cx);
+    }
+
+    pub(crate) fn begin_volume_drag(&mut self, mouse_x: Pixels, cx: &mut Context<Self>) {
+        self.dragging_volume = true;
+        self.apply_volume_from_x(mouse_x, cx);
+    }
+
+    fn apply_volume_from_x(&mut self, mouse_x: Pixels, cx: &mut Context<Self>) {
+        let bounds = self.volume_track_bounds.get();
+        let frac = fraction_from_pointer(
+            f32::from(mouse_x),
+            f32::from(bounds.origin.x),
+            f32::from(bounds.size.width),
+        );
+        let eff = self.state.set_volume(frac as f32);
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.set_volume(eff);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn adjust_volume(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let eff = self.state.adjust_volume(delta);
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.set_volume(eff);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        let eff = self.state.toggle_mute();
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.set_volume(eff);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_playback_rate(&mut self, cx: &mut Context<Self>) {
+        let rate = self.state.cycle_rate();
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.set_playback_rate(rate);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn step_playback_rate(&mut self, up: bool, cx: &mut Context<Self>) {
+        let rate = if up {
+            self.state.step_rate_up()
+        } else {
+            self.state.step_rate_down()
+        };
+        if let Some(p) = self.player.as_mut() {
+            let _ = p.set_playback_rate(rate);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn play_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = self.state.playlist.advance_next().cloned() {
+            self.load_path(item.path, true, None, window, cx);
+        }
+    }
+
+    pub(crate) fn play_prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = self.state.playlist.step_prev().cloned() {
+            self.load_path(item.path, true, None, window, cx);
+        }
+    }
+
+    fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key_input = KeyInput {
+            key: &ev.keystroke.key,
+            ctrl: ev.keystroke.modifiers.control,
+            alt: ev.keystroke.modifiers.alt,
+            shift: ev.keystroke.modifiers.shift,
+            meta: ev.keystroke.modifiers.platform,
+        };
+        let Some(action) = map_key_to_action(key_input) else {
+            return;
+        };
+
+        match action {
+            ShortcutAction::TogglePlayPause => self.toggle_play_pause(window, cx),
+            ShortcutAction::SeekBackward => self.seek_relative(-SEEK_STEP_SECS, window, cx),
+            ShortcutAction::SeekForward => self.seek_relative(SEEK_STEP_SECS, window, cx),
+            ShortcutAction::VolumeUp => self.adjust_volume(VOLUME_STEP, cx),
+            ShortcutAction::VolumeDown => self.adjust_volume(-VOLUME_STEP, cx),
+            ShortcutAction::ToggleFullscreen => self.toggle_fullscreen(window, cx),
+            ShortcutAction::ExitFullscreen => {
+                if window.is_fullscreen() {
+                    self.toggle_fullscreen(window, cx);
+                } else if self.state.active_panel != SidePanel::None {
+                    self.state.active_panel = SidePanel::None;
+                    cx.notify();
+                }
+            }
+            ShortcutAction::ToggleMute => self.toggle_mute(cx),
+            ShortcutAction::OpenFile => self.open_file_dialog(window, cx),
+            ShortcutAction::Stop => self.stop_playback(window, cx),
+            ShortcutAction::NextTrack => self.play_next(window, cx),
+            ShortcutAction::PrevTrack => self.play_prev(window, cx),
+            ShortcutAction::ToggleInfoPanel => {
+                self.state.toggle_panel(SidePanel::MediaInfo);
+                cx.notify();
+            }
+            ShortcutAction::TogglePlaylistPanel => {
+                self.state.toggle_panel(SidePanel::Playlist);
+                cx.notify();
+            }
+            ShortcutAction::SpeedDown => self.step_playback_rate(false, cx),
+            ShortcutAction::SpeedUp => self.step_playback_rate(true, cx),
+        }
     }
 
     /// Open a native multi-file picker off the UI thread and load/enqueue selected files.
@@ -472,6 +731,13 @@ impl Render for PlayerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.strings();
         let stage_el = stage::render_stage(&self.state, self.current_frame.as_ref(), s, cx);
+        let controls_el = controls::render_controls(
+            &self.state,
+            self.seek_track_bounds.clone(),
+            self.volume_track_bounds.clone(),
+            s,
+            cx,
+        );
 
         div()
             .id("rsmpeg-root")
@@ -482,6 +748,34 @@ impl Render for PlayerView {
             .bg(theme::bg_window())
             .text_color(theme::text_primary())
             .font_family(theme::UI_FONT_FAMILY)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.handle_key_down(ev, window, cx);
+            }))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
+                if this.state.scrubbing {
+                    this.update_seek_drag(ev.position.x, cx);
+                } else if this.dragging_volume {
+                    this.apply_volume_from_x(ev.position.x, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, window, cx| {
+                    if this.state.scrubbing {
+                        this.finish_seek_drag(window, cx);
+                    }
+                    this.dragging_volume = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, window, cx| {
+                    if this.state.scrubbing {
+                        this.finish_seek_drag(window, cx);
+                    }
+                    this.dragging_volume = false;
+                }),
+            )
             .drag_over::<ExternalPaths>(|style, _, _, _| {
                 style.border_2().border_color(theme::accent())
             })
@@ -498,5 +792,6 @@ impl Render for PlayerView {
                     .min_h_0()
                     .child(stage_el),
             )
+            .child(controls_el)
     }
 }
