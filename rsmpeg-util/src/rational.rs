@@ -66,31 +66,40 @@ fn approximate_wide(num: Wide, den: Wide) -> Option<Rational> {
     best_approximation(num, den)
 }
 
-/// Closest representable value to `num/den`, found on the Stern-Brocot tree.
+/// Closest representable value to `num/den`, found from the continued-fraction
+/// expansion.
 ///
-/// The representable set is `{p/q : |p| <= i32::MAX, 1 <= q <= i32::MAX}`, and
-/// the tree enumerates it in strictly increasing order, so a bounded search
-/// visits exactly the candidates that bracket the target. The two neighbours of
-/// the value are then compared by exact cross multiplication (no floating point,
-/// no rounding), which yields the true minimum — not merely the point nearest on
-/// one chosen grid.
+/// The representable set is `{p/q : 0 <= p <= i32::MAX, 1 <= q <= i32::MAX}`
+/// (sign handled by the caller). Among the fractions with `q <= max` the closest
+/// to `num/den` is always either
+///
+/// * the last convergent that still fits the bound, or
+/// * the **maximal semiconvergent** between it and the first convergent that
+///   overflows, i.e. `p0 + k*p1 / (q0 + k*q1)` for the largest feasible `k`.
+///
+/// This is the classical "best rational approximation with bounded denominator"
+/// result. The earlier implementation compared raw `|p*den - num*q|` magnitudes
+/// and never formed the semiconvergent, so it settled on `99999/100003` for
+/// `(50000/50001)^2` — about six times further from the target than the
+/// representable `2147303527/2147389420`.
+///
+/// Both candidates are compared by exact integer cross multiplication of
+/// `|p*den - num*q| / q`, never by floating point, so the choice is the true
+/// minimum over the representable set rather than an estimate.
 ///
 /// Callers must pass an already-normalized, non-representable pair.
 fn best_approximation(num: Wide, den: Wide) -> Option<Rational> {
     let max = i32::MAX as Wide;
     let negative = num < 0;
     let (num, den) = (num.abs(), den.abs());
+    if den == 0 {
+        return None;
+    }
 
-    // The representable values are `p/q` with `1 <= q <= i32::MAX` and
-    // `0 <= p <= i32::MAX`. For a fixed `q` the best numerator is the one that
-    // minimises `|p*den - num*q|`, i.e. `round(num*q / den)`; that numerator must
-    // also stay inside the box, which bounds `q` from above.
-    //
-    // Rather than scanning all 2^31 denominators, walk the run-length-encoded
-    // continued-fraction expansion of `num/den`: within one run the function
-    // `q -> |p*den - num*q|` is piecewise linear, so its minimum over the run is
-    // attained at one of the run's endpoints (or where the box clips it).
-    let mut best: Option<(Wide, Wide, Wide)> = None; // (error, p, q)
+    // `(|p*den - num*q|, p, q)` for the best candidate so far. Two candidates are
+    // ordered by `|p*den - num*q| / q` (the value error times the constant
+    // `den`), compared by cross multiplication so the ordering is exact.
+    let mut best: Option<(Wide, Wide, Wide)> = None;
     let mut consider = |p: Wide, q: Wide| {
         if q < 1 || q > max || p > max || p < 0 {
             return;
@@ -99,8 +108,10 @@ fn best_approximation(num: Wide, den: Wide) -> Option<Rational> {
         best = match best {
             None => Some((error, p, q)),
             Some((be, bp, bq)) => {
+                let left = error * bq;
+                let right = be * q;
                 // Ties keep the smaller denominator for a canonical result.
-                if error < be || (error == be && q < bq) {
+                if left < right || (left == right && q < bq) {
                     Some((error, p, q))
                 } else {
                     Some((be, bp, bq))
@@ -109,35 +120,46 @@ fn best_approximation(num: Wide, den: Wide) -> Option<Rational> {
         };
     };
 
-    // Endpoint candidates from the continued-fraction convergents.
-    let (mut p0, mut q0) = (1 as Wide, 0 as Wide);
-    let (mut p1, mut q1) = (0 as Wide, 1 as Wide);
+    // Continued-fraction expansion. `(p1, q1)` is the last convergent whose
+    // denominator still fits the bound and `(p0, q0)` the convergent before it.
+    let (mut p0, mut q0) = (0 as Wide, 1 as Wide);
+    let (mut p1, mut q1) = (1 as Wide, 0 as Wide);
     let (mut n, mut d) = (num, den);
     while d != 0 {
         let a = n / d;
-        // Convergent, clipped to the box.
-        let p = (a * p0 + p1).min(max);
-        let q = (a * q0 + q1).min(max);
-        consider(p.saturating_sub(1), q);
-        consider(p, q);
-        consider((p + 1).min(max), q);
-        // Also the exact rounding for this denominator.
-        consider(round_div(num * q, den).min(max), q);
-        if p0 == p && q0 == q {
+        let p2 = p0 + a * p1;
+        let q2 = q0 + a * q1;
+        // Both components are bounded. `2^31/1` overflows the *numerator* on the
+        // very first step while its denominator stays 1, so checking only `q`
+        // let an unrepresentable numerator through and the tracked pair ended up
+        // describing a different value entirely.
+        if q2 > max || p2 > max {
             break;
         }
-        (p0, p1) = (p, p0);
-        (q0, q1) = (q, q0);
-        let r = n % d;
+        (p0, q0, p1, q1) = (p1, q1, p2, q2);
+        let r = n - a * d;
         n = d;
         d = r;
     }
 
-    // Denominators just below the box limit can still be optimal.
-    for q in [max, max - 1, max / 2, max / 2 - 1] {
-        if q >= 1 {
-            consider(round_div(num * q, den).min(max), q);
-        }
+    // The optimum is one of the two neighbours of the target on the bounded
+    // grid: the last fitting convergent, or the maximal semiconvergent between
+    // it and the first one that overflowed.
+    let k = (max - q0) / q1.max(1);
+    if k > 0 {
+        let (p, q) = (p0 + k * p1, q0 + k * q1);
+        consider(p, q);
+        // The nearest numerator for that denominator can differ from the
+        // semiconvergent's own, so probe the rounded one as well.
+        consider(round_div(num * q, den).min(max), q);
+    }
+    consider(p1, q1);
+    // The rounded numerator for a boundary denominator can beat both neighbours.
+    // `q == 1` matters when the numerator bound bites first: for `2^31/1` the
+    // expansion overflows immediately, and only `round(2^31/1) = i32::MAX` at
+    // denominator 1 is within one unit of the target.
+    for q in [1, q1, q0.max(1), max, max - 1] {
+        consider(round_div(num * q, den).min(max), q);
     }
 
     let (_, p, q) = best?;
@@ -663,7 +685,10 @@ mod tests {
         // does not become something else.
         let huge = Rational::new(i32::MAX, 1).mul(Rational::new(i32::MAX, 1));
         assert!(huge.to_f64() >= i32::MAX as f64, "got {huge:?}");
-        assert_eq!(huge.den, 1);
+        // The clamps are best expressed as "as large as the type allows": the
+        // nearest representable fraction to 2^31-1 squared is `i32::MAX/1`,
+        // since any denominator above 1 pulls the value back under i32::MAX.
+        assert_eq!(huge, Rational::new(i32::MAX, 1));
     }
 
     #[test]
@@ -679,15 +704,19 @@ mod tests {
             squared.to_f64()
         );
         assert_ne!(squared, Rational::new(i32::MAX, 1));
-        // The value must be at least as close as any other representable
-        // fraction, checked by exact cross multiplication over a spread of
-        // plausible denominators.
+        // The result must be the closest representable fraction, compared by
+        // exact cross multiplication against a rival that a magnitude-only
+        // search preferred. `|p*den - num*q| <= 1` was the wrong criterion: for
+        // a value near 1 the numerator bound `p <= i32::MAX` bites long before
+        // the denominator bound, so the true optimum has a *large* numerator
+        // error and a correspondingly small value error.
         let exact_num = 2_500_000_000i128;
         let exact_den = 2_500_100_001i128;
         let err = |r: Rational| (exact_num * r.den as i128 - exact_den * r.num as i128).abs();
+        let rival = Rational::new(99_999, 100_003);
         assert!(
-            err(squared) * i32::MAX as i128 <= i32::MAX as i128,
-            "within one numerator unit: {squared:?}"
+            err(squared) * (rival.den as i128) < err(rival) * (squared.den as i128),
+            "{squared:?} must be closer than {rival:?}"
         );
 
         // Values near 1 are limited by the type, not the arithmetic: the grid
@@ -922,7 +951,10 @@ mod tests {
         // preserved and a positive denominator.
         let huge = Rational::new(i32::MIN, -1).normalized();
         assert!(huge.den > 0, "denominator must stay positive, got {huge:?}");
-        // 2^31 approximates to 2^31-1 = i32::MAX (the grid has no 2^31).
+        // 2^31 approximates to 2^31-1 = i32::MAX (the grid has no 2^31). The
+        // expansion's very first convergent overflows here, so the seed pair has
+        // to stay in the candidate set or the search falls through to a long
+        // denominator and lands on `i32::MAX/(i32::MAX-1)` ≈ 1.0.
         assert_eq!(huge, Rational::new(i32::MAX, 1));
     }
 
@@ -931,5 +963,107 @@ mod tests {
         assert!((Rational::timestamp_to_seconds(90_000, Rational::new(1, 90_000)) - 1.0).abs() < 1e-9);
         assert_eq!(Rational::timestamp_to_seconds(5, Rational::new(1, 0)), 0.0);
         assert_eq!(Rational::timestamp_to_seconds(0, Rational::new(1, 25)), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod review_fifth {
+    use super::*;
+
+    /// Exact value error, scaled by the denominators so it compares as an
+    /// integer: `|p*den - num*q| / q` for the target `num/den`.
+    fn scaled_error(num: Wide, den: Wide, r: Rational) -> Wide {
+        (num * r.den as Wide - den * r.num as Wide).abs()
+    }
+
+    #[test]
+    fn squared_value_50000_over_50001_is_the_true_nearest() {
+        // Fifth review P2: `(50000/50001)^2` returned `99999/100003`
+        // (error 4.0e-15) while `2147303527/2147389420` (error 6.6e-16) is
+        // representable and six times closer. The value is just under 1, so the
+        // binding constraint is the *numerator* bound, and the optimum is the
+        // maximal semiconvergent rather than the largest denominator.
+        let exact_num: Wide = 2_500_000_000;
+        let exact_den: Wide = 2_500_100_001;
+        let got = approximate_wide(exact_num, exact_den).unwrap();
+        let witness = Rational::new(2_147_303_527, 2_147_389_420);
+
+        assert_eq!(
+            got, witness,
+            "the documented nearest fraction is the representable witness"
+        );
+        assert!(
+            scaled_error(exact_num, exact_den, got) * (witness.den as Wide)
+                <= scaled_error(exact_num, exact_den, witness) * (got.den as Wide),
+            "{got:?} must be at least as close as {witness:?}"
+        );
+    }
+
+    #[test]
+    fn nearest_fraction_beats_every_small_denominator() {
+        // The contract is "no representable p/q is closer". Check that
+        // exhaustively over a dense box: every `q <= 1200` and enough numerators
+        // to bracket the target from both sides.
+        const BOX: i128 = 1_200;
+        for den in 1..=60i128 {
+            for num in 1..=60i128 {
+                let got = approximate_wide(num, den).unwrap();
+                let got_error = scaled_error(num, den, got);
+                for q in 1..=BOX {
+                    let p = (num * q * 2 + den) / (2 * den);
+                    if p > i32::MAX as i128 {
+                        continue;
+                    }
+                    let rival_error = (num * q - den * p).abs();
+                    assert!(
+                        rival_error * (got.den as Wide) >= got_error * q,
+                        "{num}/{den}: {p}/{q} is closer than the chosen {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numerator_bound_is_respected_for_values_above_one() {
+        // `2^31/1` overflows the numerator immediately, while the denominator
+        // stays 1 — so a denominator-only bound would let it through and the
+        // result collapsed to `i32::MAX/(i32::MAX-1)` (~1.0) for a value of 2^31.
+        let got = approximate_wide(i32::MAX as Wide + 1, 1).unwrap();
+        assert_eq!(got, Rational::new(i32::MAX, 1));
+        // Just inside the box the exact value is returned unchanged.
+        assert_eq!(
+            approximate_wide(i32::MAX as Wide, 1).unwrap(),
+            Rational::new(i32::MAX, 1)
+        );
+    }
+
+    #[test]
+    fn every_approximation_stays_inside_the_representable_box() {
+        // Fuzz the shape of the inputs: both components bounded, denominator
+        // positive, and a non-zero value (never the canonical 0/1 unless the
+        // target really is 0).
+        let max = i32::MAX as Wide;
+        let samples = [
+            (3 as Wide, 7 as Wide),
+            (22, 7),
+            (1, max),
+            (max, 1),
+            (max, max),
+            (max - 1, max),
+            (max * 3, max * 7),
+            (1, 2),
+            (123_456_789, 987_654_321),
+        ];
+        for (num, den) in samples {
+            let r = approximate_wide(num, den).expect("non-zero denominator");
+            assert!(r.den >= 1, "denominator must be positive: {r:?}");
+            assert!(r.num >= 0, "numerator must keep the sign: {r:?}");
+            assert!(
+                (r.den as Wide) <= max && (r.num as Wide) <= max,
+                "{r:?} escapes the representable box"
+            );
+            assert_ne!(r, Rational::new(0, 1), "{num}/{den} collapsed to zero");
+        }
     }
 }
