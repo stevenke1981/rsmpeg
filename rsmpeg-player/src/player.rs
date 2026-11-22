@@ -16,6 +16,11 @@ use crate::event::{PlayerEvent, PlayerSnapshot};
 const CMD_CAPACITY: usize = 64;
 const EVT_CAPACITY: usize = 128;
 
+/// Minimum supported playback speed multiplier.
+pub const MIN_PLAYBACK_RATE: f64 = 0.25;
+/// Maximum supported playback speed multiplier.
+pub const MAX_PLAYBACK_RATE: f64 = 4.0;
+
 /// Player lifecycle / readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
@@ -48,6 +53,7 @@ pub struct PlayerBuilder {
     input: Option<PathBuf>,
     prefer_native_pipeline: bool,
     volume: f32,
+    playback_rate: f64,
     /// Start playback immediately when the worker opens the file.
     autoplay: bool,
 }
@@ -58,6 +64,7 @@ impl PlayerBuilder {
             input: None,
             prefer_native_pipeline: true,
             volume: 0.8,
+            playback_rate: 1.0,
             autoplay: true,
         }
     }
@@ -77,6 +84,11 @@ impl PlayerBuilder {
         self
     }
 
+    pub fn playback_rate(mut self, rate: f64) -> Self {
+        self.playback_rate = clamp_playback_rate(rate);
+        self
+    }
+
     pub fn autoplay(mut self, yes: bool) -> Self {
         self.autoplay = yes;
         self
@@ -88,8 +100,17 @@ impl PlayerBuilder {
             path,
             self.prefer_native_pipeline,
             self.volume,
+            self.playback_rate,
             self.autoplay,
         ))
+    }
+}
+
+fn clamp_playback_rate(rate: f64) -> f64 {
+    if !rate.is_finite() {
+        1.0
+    } else {
+        rate.clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
     }
 }
 
@@ -101,6 +122,7 @@ pub struct Player {
     state: PlayerState,
     generation: AtomicU64,
     volume: f32,
+    playback_rate: f64,
     position: Duration,
     duration: Duration,
     playing: bool,
@@ -112,9 +134,16 @@ pub struct Player {
 }
 
 impl Player {
-    fn open(path: PathBuf, prefer_native: bool, volume: f32, autoplay: bool) -> Self {
+    fn open(
+        path: PathBuf,
+        prefer_native: bool,
+        volume: f32,
+        playback_rate: f64,
+        autoplay: bool,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
+        let rate = clamp_playback_rate(playback_rate);
         let handle =
             demux_worker::spawn_worker(path.clone(), volume, prefer_native, cmd_rx, event_tx);
 
@@ -124,6 +153,7 @@ impl Player {
             state: PlayerState::Opening,
             generation: AtomicU64::new(1),
             volume,
+            playback_rate: rate,
             position: Duration::ZERO,
             duration: Duration::ZERO,
             playing: autoplay,
@@ -134,6 +164,13 @@ impl Player {
             last_error: None,
         };
 
+        if (rate - 1.0).abs() > f64::EPSILON {
+            let g = player.generation();
+            let _ = player.send_command(PlayerCommand::SetPlaybackRate {
+                rate,
+                generation: g,
+            });
+        }
         if !autoplay {
             let g = player.generation();
             let _ = player.send_command(PlayerCommand::Pause { generation: g });
@@ -163,6 +200,10 @@ impl Player {
 
     pub fn volume(&self) -> f32 {
         self.volume
+    }
+
+    pub fn playback_rate(&self) -> f64 {
+        self.playback_rate
     }
 
     pub fn is_playing(&self) -> bool {
@@ -236,6 +277,17 @@ impl Player {
             generation: g,
         })?;
         self.volume = volume;
+        Ok(())
+    }
+
+    pub fn set_playback_rate(&mut self, rate: f64) -> Result<(), PlayerError> {
+        let g = self.generation();
+        let rate = clamp_playback_rate(rate);
+        self.send_command(PlayerCommand::SetPlaybackRate {
+            rate,
+            generation: g,
+        })?;
+        self.playback_rate = rate;
         Ok(())
     }
 
@@ -324,7 +376,7 @@ impl Player {
                     self.state = PlayerState::Playing;
                 }
             }
-            PlayerEvent::Warning { .. } => {}
+            PlayerEvent::Warning { .. } | PlayerEvent::AudioLevel { .. } => {}
         }
     }
 
@@ -405,5 +457,25 @@ mod tests {
             let _ = p.pause();
         }
         assert_eq!(p.state(), PlayerState::Paused);
+    }
+
+    #[test]
+    fn set_playback_rate_clamps_and_stores() {
+        let mut p = Player::builder()
+            .input("definitely-missing-file-xyz.mp4")
+            .autoplay(false)
+            .playback_rate(1.5)
+            .build()
+            .unwrap();
+        assert!((p.playback_rate() - 1.5).abs() < f64::EPSILON);
+
+        let _ = p.set_playback_rate(0.1);
+        assert!((p.playback_rate() - MIN_PLAYBACK_RATE).abs() < f64::EPSILON);
+
+        let _ = p.set_playback_rate(10.0);
+        assert!((p.playback_rate() - MAX_PLAYBACK_RATE).abs() < f64::EPSILON);
+
+        let _ = p.set_playback_rate(f64::NAN);
+        assert!((p.playback_rate() - 1.0).abs() < f64::EPSILON);
     }
 }

@@ -11,6 +11,8 @@ use std::io::SeekFrom;
 /// Parses the RIFF/WAVE header, reads the `fmt ` chunk for audio parameters,
 /// locates the `data` chunk, and streams PCM packets from `read_frame`.
 pub struct WAVDemuxer {
+    data_start: u64,
+    data_total: u64,
     data_remaining: u64,
     sample_rate: u32,
     channels: u16,
@@ -87,6 +89,7 @@ impl InputFormat for WAVDemuxer {
 
         // --- Find `data` chunk for duration ---
         let data_size = find_data_chunk(io)? as u64;
+        let data_start = io.tell()?;
         let bytes_per_sample = (bits_per_sample / 8) as u64;
         let frame_size = bytes_per_sample * channels as u64;
 
@@ -146,6 +149,8 @@ impl InputFormat for WAVDemuxer {
             .max(block_align as usize)
             .min(MAX_PACKET_BYTES);
 
+        self.data_start = data_start;
+        self.data_total = data_size;
         self.data_remaining = data_size;
         self.sample_rate = sample_rate;
         self.channels = channels;
@@ -240,18 +245,20 @@ impl InputFormat for WAVDemuxer {
         Ok(Some(packet))
     }
 
-    fn seek(&mut self, ctx: &mut FormatContext, timestamp: i64) -> RsResult<()> {
-        // timestamp is in stream time_base (samples for us)
+    fn seek(&mut self, ctx: &mut FormatContext, timestamp_ms: i64) -> RsResult<()> {
         let io = ctx
             .io
             .as_mut()
             .ok_or_else(|| RsError::InvalidData("No IO context".into()))?;
-        // Re-find data chunk start: simplistic — seek is best-effort for PCM
-        // Full seek would need stored data_start; for now only support restart.
-        if timestamp <= 0 {
-            // Not fully implemented for mid-file; leave position as-is
-            let _ = io;
-        }
+        let target_ms = timestamp_ms.max(0) as u128;
+        let align = u128::from(self.block_align.max(1));
+        let frame_offset = (target_ms * u128::from(self.sample_rate)) / 1000;
+        let raw_bytes = frame_offset.saturating_mul(align);
+        let max_aligned = (u128::from(self.data_total) / align) * align;
+        let byte_offset = raw_bytes.min(max_aligned) as u64;
+
+        io.seek(SeekFrom::Start(self.data_start.saturating_add(byte_offset)))?;
+        self.data_remaining = self.data_total.saturating_sub(byte_offset);
         Ok(())
     }
 }
@@ -259,6 +266,8 @@ impl InputFormat for WAVDemuxer {
 impl Default for WAVDemuxer {
     fn default() -> Self {
         Self {
+            data_start: 0,
+            data_total: 0,
             data_remaining: 0,
             sample_rate: 0,
             channels: 0,
@@ -666,13 +675,19 @@ mod tests {
         let mut ctx = ctx_with(wav_with_rate(i32::MAX as u32));
         let mut demuxer = WAVDemuxer::default();
         demuxer.read_header(&mut ctx).unwrap();
-        assert_eq!(ctx.streams[0].time_base, rsmpeg_util::Rational::new(1, i32::MAX));
+        assert_eq!(
+            ctx.streams[0].time_base,
+            rsmpeg_util::Rational::new(1, i32::MAX)
+        );
         let packet = demuxer
             .read_frame(&mut ctx)
             .unwrap()
             .expect("one packet of audio");
         assert_eq!(packet.time_base, rsmpeg_util::Rational::new(1, i32::MAX));
-        assert_eq!(packet.duration, 4, "4 mono u8 samples = 4 ticks, not seconds");
+        assert_eq!(
+            packet.duration, 4,
+            "4 mono u8 samples = 4 ticks, not seconds"
+        );
     }
 
     #[test]
@@ -732,5 +747,43 @@ mod tests {
             ctx.streams.is_empty(),
             "no stream may escape for a rejected file"
         );
+    }
+
+    #[test]
+    fn wav_seek_positions_to_requested_millisecond_and_clamps() {
+        // 1 second of 1000 Hz mono 16-bit PCM = 2000 bytes (2 bytes/ms).
+        let mut wav = build_wav(1000, 1000, 1, 16);
+        let data_offset = wav.len() - 2000;
+        for i in 0..1000u16 {
+            let bytes = i.to_le_bytes();
+            wav[data_offset + (i as usize) * 2] = bytes[0];
+            wav[data_offset + (i as usize) * 2 + 1] = bytes[1];
+        }
+
+        let mut ctx = ctx_with(wav);
+        let mut demuxer = WAVDemuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        // Seek to 500 ms -> sample index 500.
+        demuxer.seek(&mut ctx, 500).unwrap();
+        let pkt = demuxer
+            .read_frame(&mut ctx)
+            .unwrap()
+            .expect("packet at 500ms");
+        let first_sample = u16::from_le_bytes([pkt.data[0], pkt.data[1]]);
+        assert_eq!(first_sample, 500);
+
+        // Seek back to 0 ms (and negative timestamps clamp to 0).
+        demuxer.seek(&mut ctx, -100).unwrap();
+        let pkt0 = demuxer
+            .read_frame(&mut ctx)
+            .unwrap()
+            .expect("packet at 0ms");
+        let sample0 = u16::from_le_bytes([pkt0.data[0], pkt0.data[1]]);
+        assert_eq!(sample0, 0);
+
+        // Seek past end yields EOF without error.
+        demuxer.seek(&mut ctx, 5000).unwrap();
+        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
     }
 }

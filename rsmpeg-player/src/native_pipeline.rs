@@ -12,13 +12,16 @@ use rsmpeg_codec::CodecId;
 use rsmpeg_format::FormatContext;
 use rsmpeg_util::MediaType;
 
-use crate::clock::MasterClock;
+use crate::clock::{MasterClock, PlaybackClock};
 use crate::command::PlayerCommand;
-use crate::event::{PlayerEvent, PlayerSnapshot};
+use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot};
+use crate::player::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
+const AUDIO_LEVEL_INTERVAL: Duration = Duration::from_millis(40);
+const AUDIO_ONLY_LEAD_LIMIT: Duration = Duration::from_millis(250);
 
 fn emit(tx: &SyncSender<PlayerEvent>, ev: PlayerEvent) {
     let _ = tx.try_send(ev);
@@ -160,12 +163,15 @@ fn run_native_inner(
     let mut playing = true;
     let mut stop = false;
     let mut position = Duration::ZERO;
+    let mut playback_rate = 1.0f64;
     let mut audio_master = MasterClock::new();
     audio_master.set_audio_master(true);
     let mut appended_samples: u64 = 0;
     let mut force_one_frame = false;
     let mut was_playing = true;
-    let mut playback_start: Option<Instant> = None;
+    let mut playback_clock = PlaybackClock::new();
+    let mut clock_started = false;
+    let mut last_level_emit: Option<Instant> = None;
     let mut video_frame_index = 0u64;
     let assumed_frame_dur = 1.0 / 30.0;
     // ~50 ms late-drop threshold (VideoScheduler::new default).
@@ -271,10 +277,14 @@ fn run_native_inner(
                     match cmd {
                         PlayerCommand::Play { .. } => {
                             if !was_playing {
-                                playback_start = Some(
-                                    Instant::now()
-                                        - Duration::from_secs_f64(position.as_secs_f64()),
-                                );
+                                if !clock_started {
+                                    playback_clock.seek(position);
+                                    playback_clock.start();
+                                    clock_started = true;
+                                } else {
+                                    playback_clock.resume();
+                                }
+                                audio_master.resume();
                                 if let Some(ref s) = sink {
                                     s.play();
                                 }
@@ -289,6 +299,8 @@ fn run_native_inner(
                         PlayerCommand::Pause { .. } => {
                             playing = false;
                             was_playing = false;
+                            playback_clock.pause();
+                            audio_master.pause();
                             if let Some(ref s) = sink {
                                 s.pause();
                             }
@@ -330,11 +342,21 @@ fn run_native_inner(
                             }
                             if let Some(ref s) = sink {
                                 s.clear();
+                                s.set_speed(playback_rate as f32);
                                 if playing {
                                     s.play();
+                                } else {
+                                    s.pause();
                                 }
                             }
-                            playback_start = Some(Instant::now() - Duration::from_secs_f64(capped));
+                            playback_clock.seek(position);
+                            clock_started = true;
+                            audio_master.seek_to(position);
+                            if !playing {
+                                audio_master.pause();
+                            }
+                            appended_samples =
+                                MasterClock::duration_to_audio_samples(position, audio_rate);
                             video_frame_index = 0;
                             base_video_pts = None;
                             force_one_frame = true;
@@ -362,6 +384,24 @@ fn run_native_inner(
                             emit(
                                 event_tx,
                                 snap(playing, position, duration, volume, g, "volume"),
+                            );
+                        }
+                        PlayerCommand::SetPlaybackRate {
+                            rate,
+                            generation: g,
+                        } => {
+                            playback_rate = if rate.is_finite() {
+                                rate.clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
+                            } else {
+                                1.0
+                            };
+                            playback_clock.set_rate(playback_rate);
+                            if let Some(ref s) = sink {
+                                s.set_speed(playback_rate as f32);
+                            }
+                            emit(
+                                event_tx,
+                                snap(playing, position, duration, volume, g, "rate"),
                             );
                         }
                         other => {
@@ -392,6 +432,28 @@ fn run_native_inner(
         if !playing && !force_one_frame {
             thread::sleep(Duration::from_millis(16));
             continue;
+        }
+
+        if video_si.is_none() && playing && clock_started {
+            let queued_pos =
+                PlaybackClock::duration_from_audio_samples(appended_samples, audio_rate);
+            let now = playback_clock.now();
+            if duration > Duration::ZERO {
+                position = now.min(duration);
+            } else {
+                position = now;
+            }
+            if queued_pos > now.saturating_add(AUDIO_ONLY_LEAD_LIMIT) {
+                emit(
+                    event_tx,
+                    PlayerEvent::PositionChanged {
+                        position,
+                        generation,
+                    },
+                );
+                thread::sleep(Duration::from_millis(8));
+                continue;
+            }
         }
 
         if let Some(ref s) = sink {
@@ -442,20 +504,21 @@ fn run_native_inner(
                                     // Seek preview: always display without wait/drop.
                                     let mut present = true;
                                     if !force_one_frame {
-                                        if playback_start.is_none() {
-                                            playback_start = Some(Instant::now());
+                                        if !clock_started {
+                                            playback_clock.start();
+                                            clock_started = true;
                                         }
-                                        let now = playback_start
-                                            .map(|t0| t0.elapsed())
-                                            .unwrap_or(Duration::ZERO);
+                                        let now = playback_clock.now();
                                         match video_scheduler.schedule(frame_pts, now) {
                                             ScheduleAction::DropLate => {
                                                 present = false;
                                             }
                                             ScheduleAction::Wait { duration } => {
-                                                // Cap wait so a bad PTS cannot freeze the loop.
+                                                // Scale wait time by playback_rate; cap so bad PTS cannot freeze.
+                                                let scaled_wait = duration
+                                                    .div_f64(playback_rate.max(MIN_PLAYBACK_RATE));
                                                 let mut rem =
-                                                    duration.min(Duration::from_millis(500));
+                                                    scaled_wait.min(Duration::from_millis(500));
                                                 while rem > Duration::ZERO {
                                                     thread::sleep(rem.min(MAX_PACE_SLEEP));
                                                     rem = rem.saturating_sub(MAX_PACE_SLEEP);
@@ -548,6 +611,20 @@ fn run_native_inner(
                                     .unwrap_or_default();
                                 let sample_count = samples.len();
                                 if !samples.is_empty() {
+                                    let should_emit_level = last_level_emit
+                                        .map_or(true, |t| t.elapsed() >= AUDIO_LEVEL_INTERVAL);
+                                    if should_emit_level {
+                                        let (rms, peak) = compute_pcm_level(&samples);
+                                        emit(
+                                            event_tx,
+                                            PlayerEvent::AudioLevel {
+                                                rms,
+                                                peak,
+                                                generation,
+                                            },
+                                        );
+                                        last_level_emit = Some(Instant::now());
+                                    }
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
                                             device_ch,
@@ -558,13 +635,23 @@ fn run_native_inner(
                                 }
                                 // Drive position from audio when no video.
                                 if video_si.is_none() {
+                                    if !clock_started {
+                                        playback_clock.seek(position);
+                                        playback_clock.start();
+                                        clock_started = true;
+                                    }
                                     if audio_master.audio_sample_rate() == 0 {
                                         audio_master.set_audio_sample_rate(device_rate);
                                     }
                                     // samples is interleaved i16; frames = len / channels.
                                     appended_samples += sample_count as u64 / device_ch as u64;
                                     audio_master.set_audio_samples_played(appended_samples);
-                                    position = audio_master.now();
+                                    let now = playback_clock.now();
+                                    position = if duration > Duration::ZERO {
+                                        now.min(duration)
+                                    } else {
+                                        now
+                                    };
                                     emit(
                                         event_tx,
                                         PlayerEvent::PositionChanged {
@@ -640,9 +727,89 @@ fn run_native_inner(
             }
         }
         if let Some(ref s) = sink {
-            s.sleep_until_end();
+            while !s.empty() && !stop {
+                match cmd_rx.try_recv() {
+                    Ok(PlayerCommand::Stop { .. })
+                    | Ok(PlayerCommand::Shutdown { .. })
+                    | Err(TryRecvError::Disconnected) => {
+                        stop = true;
+                        s.pause();
+                        s.clear();
+                        break;
+                    }
+                    Ok(PlayerCommand::Pause { generation: g }) => {
+                        playing = false;
+                        playback_clock.pause();
+                        s.pause();
+                        emit(
+                            event_tx,
+                            snap(false, position, duration, volume, g, "paused"),
+                        );
+                    }
+                    Ok(PlayerCommand::Play { generation: g }) => {
+                        playing = true;
+                        playback_clock.resume();
+                        s.play();
+                        emit(
+                            event_tx,
+                            snap(true, position, duration, volume, g, "playing"),
+                        );
+                    }
+                    Ok(PlayerCommand::SetVolume {
+                        volume: v,
+                        generation: g,
+                    }) => {
+                        volume = v.clamp(0.0, 1.0);
+                        s.set_volume(volume);
+                        emit(
+                            event_tx,
+                            snap(playing, position, duration, volume, g, "volume"),
+                        );
+                    }
+                    Ok(PlayerCommand::SetPlaybackRate {
+                        rate,
+                        generation: g,
+                    }) => {
+                        playback_rate = if rate.is_finite() {
+                            rate.clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
+                        } else {
+                            1.0
+                        };
+                        playback_clock.set_rate(playback_rate);
+                        s.set_speed(playback_rate as f32);
+                        emit(
+                            event_tx,
+                            snap(playing, position, duration, volume, g, "rate"),
+                        );
+                    }
+                    Ok(_) | Err(TryRecvError::Empty) => {}
+                }
+                if video_si.is_none() && playing && clock_started {
+                    let now = playback_clock.now();
+                    position = if duration > Duration::ZERO {
+                        now.min(duration)
+                    } else {
+                        now
+                    };
+                    emit(
+                        event_tx,
+                        PlayerEvent::PositionChanged {
+                            position,
+                            generation,
+                        },
+                    );
+                }
+                thread::sleep(Duration::from_millis(12));
+            }
         }
-        emit(event_tx, PlayerEvent::Ended { generation });
+        if !stop {
+            emit(event_tx, PlayerEvent::Ended { generation });
+        } else {
+            emit(
+                event_tx,
+                snap(false, position, duration, volume, generation, "stopped"),
+            );
+        }
     } else {
         emit(
             event_tx,

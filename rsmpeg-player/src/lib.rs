@@ -30,13 +30,15 @@ pub use codec_detect::{
     find_unsupported_video, DetectedVideoCodec, TrackKind,
 };
 pub use command::{PlayerCommand, SeekMode};
-pub use event::{PlayerEvent, PlayerSnapshot};
+pub use event::{compute_pcm_level, PlayerEvent, PlayerSnapshot};
 pub use h264_bitstream::{
     avcc_extradata_to_annex_b, avcc_nal_length_size, avcc_packet_to_annex_b,
     extract_avcc_streaming, is_annex_b, packet_for_decoder, H264BitstreamError,
     H264BitstreamFormat,
 };
-pub use player::{Player, PlayerBuilder, PlayerError, PlayerState};
+pub use player::{
+    Player, PlayerBuilder, PlayerError, PlayerState, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE,
+};
 pub use queue::BoundedQueue;
 pub use video_convert::yuv420p_frame_to_rgba;
 pub use video_scheduler::{ScheduleAction, VideoScheduler, VideoSchedulerStats};

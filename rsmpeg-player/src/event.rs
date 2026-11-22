@@ -50,6 +50,31 @@ pub enum PlayerEvent {
         message: String,
         generation: u64,
     },
+    /// Lightweight audio amplitude meter (normalized `0.0..=1.0`) for GUI visualizers.
+    AudioLevel {
+        rms: f32,
+        peak: f32,
+        generation: u64,
+    },
+}
+
+/// Compute normalized `(rms, peak)` levels in `0.0..=1.0` from signed 16-bit PCM samples.
+pub fn compute_pcm_level(samples: &[i16]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0f64;
+    let mut peak = 0.0f32;
+    for &sample in samples {
+        let normalized = (f32::from(sample) / 32768.0).abs().min(1.0);
+        if normalized > peak {
+            peak = normalized;
+        }
+        let v = f64::from(normalized);
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / samples.len() as f64).sqrt().clamp(0.0, 1.0) as f32;
+    (rms, peak)
 }
 
 impl PlayerEvent {
@@ -61,7 +86,8 @@ impl PlayerEvent {
             | Self::SeekCompleted { generation, .. }
             | Self::Ended { generation }
             | Self::Error { generation, .. }
-            | Self::Warning { generation, .. } => *generation,
+            | Self::Warning { generation, .. }
+            | Self::AudioLevel { generation, .. } => *generation,
         }
     }
 }
@@ -110,6 +136,11 @@ mod tests {
                 message: "meh".into(),
                 generation: 7,
             },
+            PlayerEvent::AudioLevel {
+                rms: 0.25,
+                peak: 0.75,
+                generation: 7,
+            },
         ];
         for ev in &variants {
             assert_eq!(ev.generation(), 7, "{ev:?}");
@@ -147,5 +178,19 @@ mod tests {
             }
             _ => panic!("expected VideoFrame"),
         }
+    }
+
+    #[test]
+    fn compute_pcm_level_handles_silence_and_full_scale() {
+        assert_eq!(compute_pcm_level(&[]), (0.0, 0.0));
+        assert_eq!(compute_pcm_level(&[0, 0, 0, 0]), (0.0, 0.0));
+
+        let (rms, peak) = compute_pcm_level(&[i16::MIN, i16::MAX]);
+        assert!((peak - 1.0).abs() < 1e-3, "peak={peak}");
+        assert!((rms - 1.0).abs() < 1e-3, "rms={rms}");
+
+        let (rms_half, peak_half) = compute_pcm_level(&[16384, -16384]);
+        assert!((peak_half - 0.5).abs() < 1e-3, "peak={peak_half}");
+        assert!((rms_half - 0.5).abs() < 1e-3, "rms={rms_half}");
     }
 }
