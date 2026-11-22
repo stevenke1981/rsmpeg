@@ -420,6 +420,130 @@ impl InputFormat for MP4Demuxer {
 
 // ── Sample index builder ─────────────────────────────────────────────
 
+/// Expand the run-length `stsc` table into one samples-per-chunk value per
+/// chunk, or `None` when the entries cannot prove a complete, contiguous
+/// mapping of chunks `0..chunk_count`.
+///
+/// Two shapes are legitimate:
+///
+/// * `stsc` starts at `first_chunk == 1` and its ranges cover every chunk.
+/// * `stsc` starts at `first_chunk == 1` and its last range runs past the last
+///   chunk (the tail is simply larger than the table, which is how most muxers
+///   write it) — covered by clamping the last range to `chunk_count`.
+///
+/// Anything else leaves a *leading* chunk (the reviewer's reproduction: 2
+/// chunks, `first_chunk == 2`) or an interior chunk without a mapping. Those
+/// chunks would silently receive `0` samples, so the samples they should have
+/// carried would be looked for in the *next* chunk — with this sample's
+/// `stsz` size and this sample's `stts` DTS. That is exactly the truncated
+/// `BBB`／DTS 0 packet the review caught, so refuse the track instead of
+/// returning a shifted index.
+fn expand_stsc(
+    t: &TrackTables,
+    chunk_count: usize,
+    sample_count: usize,
+) -> Option<Vec<u32>> {
+    if chunk_count == 0 {
+        return Some(Vec::new());
+    }
+    if t.stsc.is_empty() {
+        // No `stsc` at all: `stco` names chunks but says nothing about how many
+        // samples each holds, so only the single-chunk case is unambiguous.
+        if chunk_count == 1 {
+            return Some(vec![u32::try_from(sample_count).ok()?]);
+        }
+        tracing::warn!(
+            "MP4: no stsc table for {chunk_count} chunk(s); the chunk→sample \
+             mapping is unknown"
+        );
+        return None;
+    }
+
+    // The first entry must start at chunk 1. A later start means the chunks
+    // before it have no declared contents — the case this guard exists for.
+    if t.stsc[0].0 != 1 {
+        tracing::warn!(
+            "MP4: stsc starts at first_chunk {} instead of 1; the earlier chunk(s) \
+             have no sample mapping",
+            t.stsc[0].0
+        );
+        return None;
+    }
+
+    let mut samples_per_chunk = vec![0u32; chunk_count];
+    let mut filled_through = 0usize; // exclusive end of the covered chunk run
+    for (ei, entry) in t.stsc.iter().enumerate() {
+        let first_chunk = entry.0;
+        let next_first = t.stsc.get(ei + 1).map(|e| e.0);
+
+        // `first_chunk` is attacker-controlled and 1-based. A zero is invalid
+        // (the spec allows 1..), and the table must be strictly increasing;
+        // either error would otherwise be "repaired" into a wrong ordinal.
+        if first_chunk == 0 || next_first.is_some_and(|next| next <= first_chunk) {
+            tracing::warn!(
+                "MP4: stsc entry {ei} has first_chunk {first_chunk} (next {:?}); the \
+                 table must be strictly increasing from 1",
+                next_first
+            );
+            return None;
+        }
+
+        let start = first_chunk as usize - 1;
+        // A gap (start > filled_through) leaves chunks without a mapping.
+        if start > filled_through {
+            tracing::warn!(
+                "MP4: stsc leaves chunk(s) {}..{} of {chunk_count} unmapped",
+                filled_through + 1,
+                start
+            );
+            return None;
+        }
+        // Starts past the chunk table: the real chunks above are all mapped by
+        // earlier entries, so this only strands its own samples (a tail). Keep
+        // the provable prefix rather than discarding the track.
+        if start >= chunk_count {
+            tracing::warn!(
+                "MP4: stsc entry {ei} starts at chunk {first_chunk}, beyond the \
+                 {chunk_count} chunk(s) in stco; its samples have no chunk"
+            );
+            continue;
+        }
+
+        let end = next_first
+            .map(|next| next as usize - 1)
+            .unwrap_or(chunk_count)
+            .min(chunk_count);
+        if end < start {
+            tracing::warn!("MP4: stsc entry {ei} has an inverted chunk range");
+            return None;
+        }
+        for slot in &mut samples_per_chunk[start..end] {
+            *slot = entry.1;
+        }
+        filled_through = end;
+    }
+
+    // Every chunk must now have a declared sample count. A tail left at 0 means
+    // the table stopped early, which is only acceptable when the sample tables
+    // are exhausted too (a genuinely short tail); otherwise those chunks are
+    // unmapped and would shift ordinals.
+    let declared: u64 = samples_per_chunk.iter().map(|&c| u64::from(c)).sum();
+    if declared == 0 {
+        tracing::warn!("MP4: stsc declares no sample for any of {chunk_count} chunk(s)");
+        return None;
+    }
+    if declared < sample_count as u64 {
+        // The remaining samples have no chunk of their own. That is a missing
+        // *tail*, and the caller keeps the locatable prefix — but only because
+        // the mapping above is contiguous from chunk 1, which was just checked.
+        tracing::warn!(
+            "MP4: stsc addresses {declared} of {sample_count} samples; the rest have \
+             no chunk mapping"
+        );
+    }
+    Some(samples_per_chunk)
+}
+
 fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
     if t.stco.is_empty() {
         return Vec::new();
@@ -485,37 +609,18 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
     // Chunk → samples via stsc
     // stsc entries: first_chunk (1-based), samples_per_chunk, sample_description_index
     let chunk_count = t.stco.len();
-    let mut samples_per_chunk = vec![0u32; chunk_count];
-    if t.stsc.is_empty() {
-        // Fallback: put all samples in first chunk
-        if chunk_count > 0 {
-            samples_per_chunk[0] = sample_count as u32;
-        }
-    } else {
-        for (ei, entry) in t.stsc.iter().enumerate() {
-            let first = entry.0.max(1) as usize - 1;
-            let next_first = t
-                .stsc
-                .get(ei + 1)
-                .map(|e| e.0.max(1) as usize - 1)
-                .unwrap_or(chunk_count);
-            // `first_chunk` is attacker-controlled: clamp both ends and bail out
-            // when the range is inverted instead of panicking on a slice index.
-            let end = next_first.min(chunk_count);
-            let Some(range) = samples_per_chunk.get_mut(first..end) else {
-                tracing::warn!(
-                    "MP4: stsc entry {} has out-of-range first_chunk {} (chunks={})",
-                    ei,
-                    entry.0,
-                    chunk_count
-                );
-                continue;
-            };
-            for slot in range {
-                *slot = entry.1;
-            }
-        }
-    }
+    let Some(samples_per_chunk) = expand_stsc(t, chunk_count, sample_count) else {
+        // The sample tables are indexed by ordinal, so a chunk that `stsc`
+        // cannot map is not "one missing packet" — every sample after it would
+        // inherit another chunk's bytes with the wrong size and DTS. Refuse the
+        // whole track instead of emitting a shifted index.
+        tracing::warn!(
+            "MP4: stsc cannot prove the sample→chunk mapping (chunks={chunk_count}, \
+             entries={}); dropping all samples of this track",
+            t.stsc.len()
+        );
+        return Vec::new();
+    };
 
     // Assign file offsets
     let mut offsets = Vec::with_capacity(sample_count);
@@ -568,8 +673,12 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
     // offset 0 would make `read_frame` return file-header bytes dressed up as
     // a media packet (the review caught exactly this), so drop such samples
     // instead: a shorter DTS-ordered index is safe, bogus packets are not.
-    // Lower-index samples are always addressed first, so the truncation keeps
-    // the temporally earliest part of the track.
+    //
+    // The truncation is only sound because `expand_stsc` proved that chunks are
+    // mapped contiguously from the first one, so the addressed samples are
+    // exactly ordinals `0..offsets.len()` and the shortfall is a *tail*. A
+    // leading or middle gap makes `expand_stsc` refuse the whole track, since
+    // then the surviving samples would keep the DTS of a different ordinal.
     if offsets.len() < sample_count {
         tracing::warn!(
             "MP4: {} of {} samples have no chunk mapping (stsc/stco/stsz disagree); \
@@ -1503,9 +1612,12 @@ mod tests {
     }
 
     #[test]
-    fn stsc_inverted_range_drops_only_the_unmapped_samples() {
-        // Second entry claims an *earlier* chunk than the first, producing an
-        // inverted range (start > end).
+    fn stsc_non_monotonic_table_drops_the_whole_track() {
+        // Second entry claims an *earlier* chunk than the first. The old code
+        // patched the slice bounds and silently dropped chunk 0's samples, so
+        // the two survivors carried ordinals 0/1 while sitting at chunk 1 —
+        // i.e. the wrong size and DTS. A table that cannot be walked in
+        // increasing order proves nothing, so the track must be refused.
         let tables = TrackTables {
             timescale: 1000,
             stts: vec![(3, 10)],
@@ -1516,17 +1628,9 @@ mod tests {
             ..Default::default()
         };
         let samples = build_sample_index(&tables);
-        // The inverted entry covers nothing, so chunk 0 keeps `samples_per_chunk`
-        // 0 from the fallback and only chunk 1 supplies a sample. What matters
-        // is that no surviving entry is unaddressable (offset/size 0).
-        assert_eq!(samples.len(), 2, "got {samples:?}");
         assert!(
-            samples.iter().all(sample_is_readable),
-            "every surviving sample must be readable: {samples:?}"
-        );
-        assert!(
-            samples.iter().all(|s| s.offset >= 100),
-            "no sample may point at the file header: {samples:?}"
+            samples.is_empty(),
+            "a non-monotonic stsc must not shift sample ordinals: {samples:?}"
         );
     }
 
@@ -1800,6 +1904,181 @@ mod tests {
         assert_eq!(packets.len(), 1, "got {:?}", packets.len());
         assert_eq!(packets[0].data.as_ref(), b"AAA");
         assert_eq!(packets[0].dts, Some(0));
+    }
+
+    /// Build the reviewer's two-chunk fixture: `mdat` holds `AAA` then `BBBB`,
+    /// `stts` ticks by 1000 per sample, and `stsc` is supplied verbatim as
+    /// `(first_chunk, samples_per_chunk)` runs.
+    ///
+    /// Mirrors `focused-probe/make_fixtures.py`, where
+    /// `first_chunk = 2` produced the failing case: chunk 1 has no declared
+    /// samples, so the old expansion put "BBBB" at ordinal 0 and emitted the
+    /// truncated packet `BBB` with DTS 0.
+    fn build_two_chunk_mp4(stsc_runs: &[(u32, u32)]) -> Vec<u8> {
+        build_mp4_with_chunks(&[b"AAA", b"BBBB"], stsc_runs)
+    }
+
+    /// Same fixture, but with an arbitrary chunk layout, so chunk runs can be
+    /// made to skip a chunk in the middle.
+    fn build_mp4_with_chunks(chunks: &[&[u8]], stsc_runs: &[(u32, u32)]) -> Vec<u8> {
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\0\0isom");
+        let payload: Vec<u8> = chunks.concat();
+        let mdat = box_bytes(b"mdat", &payload);
+        let media = (ftyp.len() + 8) as u32;
+
+        let mut audio_entry = vec![0u8; 28];
+        audio_entry[16..18].copy_from_slice(&be16(2));
+        audio_entry[18..20].copy_from_slice(&be16(16));
+        audio_entry[24..28].copy_from_slice(&be32(48_000 << 16));
+        let mut stsd_rest = be32(1).to_vec();
+        stsd_rest.extend_from_slice(&box_bytes(b"mp4a", &audio_entry));
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = be32(1).to_vec();
+        stts_rest.extend_from_slice(&be32(chunks.len() as u32));
+        stts_rest.extend_from_slice(&be32(1000));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = be32(stsc_runs.len() as u32).to_vec();
+        for &(first_chunk, per_chunk) in stsc_runs {
+            stsc_rest.extend_from_slice(&be32(first_chunk));
+            stsc_rest.extend_from_slice(&be32(per_chunk));
+            stsc_rest.extend_from_slice(&be32(1));
+        }
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = be32(0).to_vec();
+        stsz_rest.extend_from_slice(&be32(chunks.len() as u32));
+        for chunk in chunks {
+            stsz_rest.extend_from_slice(&be32(chunk.len() as u32));
+        }
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let mut stco_rest = be32(chunks.len() as u32).to_vec();
+        let mut next = media;
+        for chunk in chunks {
+            stco_rest.extend_from_slice(&be32(next));
+            next += chunk.len() as u32;
+        }
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut mdhd_rest = be32(0).to_vec();
+        mdhd_rest.extend_from_slice(&be32(0));
+        mdhd_rest.extend_from_slice(&be32(1000));
+        mdhd_rest.extend_from_slice(&be32(1000 * chunks.len() as u32));
+        mdhd_rest.extend_from_slice(&be16(0x55c4));
+        mdhd_rest.extend_from_slice(&be16(0));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_rest));
+
+        let mut hdlr_rest = be32(0).to_vec();
+        hdlr_rest.extend_from_slice(b"soun");
+        hdlr_rest.extend_from_slice(&[0u8; 13]);
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_rest));
+
+        let stbl = box_bytes(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+        let minf = box_bytes(b"minf", &stbl);
+        let mdia = box_bytes(b"mdia", &[mdhd, hdlr, minf].concat());
+        let moov = box_bytes(b"moov", &box_bytes(b"trak", &mdia));
+        [ftyp, mdat, moov].concat()
+    }
+
+    #[test]
+    fn review_control_two_chunks_keep_verbatim_payloads_and_dts() {
+        // Baseline for the two cases below: a complete mapping must still be
+        // decoded verbatim, with the DTS coming from the sample table.
+        let mut ctx = ctx_from(build_two_chunk_mp4(&[(1, 1)]));
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        let got: Vec<(Option<i64>, &[u8])> = packets
+            .iter()
+            .map(|p| (p.dts, p.data.as_ref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(Some(0), b"AAA".as_slice()), (Some(1000), b"BBBB".as_slice())],
+            "a complete stsc mapping must be decoded as-is"
+        );
+    }
+
+    #[test]
+    fn review_missing_first_chunk_mapping_emits_nothing() {
+        // Review P1 reproduction: `stsc.first_chunk == 2` with two chunks, so
+        // chunk 1 has no declared sample count. Previously the surviving
+        // samples slid down one ordinal each and the demuxer returned `BBB`
+        // (a truncation of "BBBB" sized by sample 0) stamped with DTS 0.
+        //
+        // A chunk with no mapping cannot be proven to hold *these* samples, so
+        // neither the shifted packet nor a "guess" may be emitted. Dropping
+        // every sample leaves the only track unplayable, and `read_header`
+        // reports the file instead of publishing an empty stream.
+        let mut ctx = ctx_from(build_two_chunk_mp4(&[(2, 1)]));
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        let rendered: Vec<(Option<i64>, Vec<u8>)> = packets
+            .iter()
+            .map(|p| (p.dts, p.data.to_vec()))
+            .collect();
+        assert!(
+            rendered.is_empty(),
+            "no packet may be emitted from an unprovable chunk mapping: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn review_chunk_run_starting_at_zero_emits_nothing() {
+        // Same class of bug through a different door: `stsc.first_chunk` is
+        // 1-based, so an entry claiming chunk 0 cannot be honoured (subtracting
+        // one wraps, and clamping to zero silently mis-assigns the run). The
+        // mapping is unprovable, so no packet may be emitted.
+        let data = build_two_chunk_mp4(&[(0, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "a zero-based chunk run must not shift ordinals: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn review_multi_run_mapping_still_decodes_in_order() {
+        // The complement of the rejections above: a two-run `stsc`
+        // (`first_chunk` 1 → 1 sample each, then 2 → 1 sample each) must keep
+        // working, so the guards do not over-reject legitimate files.
+        let data = build_mp4_with_chunks(
+            &[b"AAA", b"BBBB", b"CC", b"DDDD"],
+            &[(1, 1), (3, 1)],
+        );
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        let got: Vec<(Option<i64>, &[u8])> = packets
+            .iter()
+            .map(|p| (p.dts, p.data.as_ref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(0), b"AAA".as_slice()),
+                (Some(1000), b"BBBB".as_slice()),
+                (Some(2000), b"CC".as_slice()),
+                (Some(3000), b"DDDD".as_slice()),
+            ],
+            "a contiguous multi-run mapping must decode verbatim, in order"
+        );
     }
 
     #[test]
