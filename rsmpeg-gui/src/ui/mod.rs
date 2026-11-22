@@ -147,15 +147,20 @@ impl PlayerView {
         match self.state.status {
             PlaybackStatus::Playing | PlaybackStatus::Opening => {
                 if let Some(p) = self.player.as_mut() {
-                    let _ = p.pause();
+                    if let Err(err) = p.pause() {
+                        self.state.report_command_error(&err);
+                    }
+                    cx.notify();
+                } else {
+                    self.state.status = PlaybackStatus::Paused;
+                    cx.notify();
                 }
-                self.state.status = PlaybackStatus::Paused;
-                cx.notify();
             }
             PlaybackStatus::Paused | PlaybackStatus::Seeking => {
                 if let Some(p) = self.player.as_mut() {
-                    let _ = p.play();
-                    self.state.status = PlaybackStatus::Playing;
+                    if let Err(err) = p.play() {
+                        self.state.report_command_error(&err);
+                    }
                     cx.notify();
                 } else if let Some(item) = self.state.playlist.current_item().cloned() {
                     let resume_at = if self.state.position.is_zero() {
@@ -215,10 +220,11 @@ impl PlayerView {
         } else {
             target
         };
-        self.state.position = clamped;
 
         if let Some(p) = self.player.as_mut() {
-            let _ = p.seek(clamped);
+            if let Err(err) = p.seek(clamped) {
+                self.state.report_command_error(&err);
+            }
             cx.notify();
         } else if let Some(item) = self.state.playlist.current_item().cloned() {
             let autoplay = self.state.status == PlaybackStatus::Playing;
@@ -289,45 +295,70 @@ impl PlayerView {
             f32::from(bounds.origin.x),
             f32::from(bounds.size.width),
         );
-        let eff = self.state.set_volume(frac as f32);
+        let intent = self.state.preview_volume(frac as f32);
         if let Some(p) = self.player.as_mut() {
-            let _ = p.set_volume(eff);
+            match p.set_volume(intent.effective) {
+                Ok(()) => self.state.queue_volume_intent(intent),
+                Err(err) => self.state.report_command_error(&err),
+            }
+        } else {
+            self.state.apply_volume_intent(intent);
         }
         cx.notify();
     }
 
     pub(crate) fn adjust_volume(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let eff = self.state.adjust_volume(delta);
+        let intent = self.state.preview_adjust_volume(delta);
         if let Some(p) = self.player.as_mut() {
-            let _ = p.set_volume(eff);
+            match p.set_volume(intent.effective) {
+                Ok(()) => self.state.queue_volume_intent(intent),
+                Err(err) => self.state.report_command_error(&err),
+            }
+        } else {
+            self.state.apply_volume_intent(intent);
         }
         cx.notify();
     }
 
     pub(crate) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
-        let eff = self.state.toggle_mute();
+        let intent = self.state.preview_toggle_mute();
         if let Some(p) = self.player.as_mut() {
-            let _ = p.set_volume(eff);
+            match p.set_volume(intent.effective) {
+                Ok(()) => self.state.queue_volume_intent(intent),
+                Err(err) => self.state.report_command_error(&err),
+            }
+        } else {
+            self.state.apply_volume_intent(intent);
         }
         cx.notify();
     }
 
     pub(crate) fn cycle_playback_rate(&mut self, cx: &mut Context<Self>) {
-        let rate = self.state.cycle_rate();
+        let rate = self.state.next_cycle_rate();
         if let Some(p) = self.player.as_mut() {
-            let _ = p.set_playback_rate(rate);
+            match p.set_playback_rate(rate) {
+                Ok(()) => self.state.queue_playback_rate(rate),
+                Err(err) => self.state.report_command_error(&err),
+            }
+        } else {
+            self.state.playback_rate = rate;
         }
         cx.notify();
     }
 
     pub(crate) fn step_playback_rate(&mut self, up: bool, cx: &mut Context<Self>) {
         let rate = if up {
-            self.state.step_rate_up()
+            self.state.next_step_rate_up()
         } else {
-            self.state.step_rate_down()
+            self.state.next_step_rate_down()
         };
         if let Some(p) = self.player.as_mut() {
-            let _ = p.set_playback_rate(rate);
+            match p.set_playback_rate(rate) {
+                Ok(()) => self.state.queue_playback_rate(rate),
+                Err(err) => self.state.report_command_error(&err),
+            }
+        } else {
+            self.state.playback_rate = rate;
         }
         cx.notify();
     }
@@ -368,19 +399,20 @@ impl PlayerView {
 
     pub(crate) fn select_audio_track(&mut self, index: usize, cx: &mut Context<Self>) {
         self.state.open_track_menu = TrackMenu::None;
-        self.state.active_audio_track = Some(index);
         if let Some(p) = self.player.as_mut() {
-            let _ = p.select_audio_track(index);
+            if let Err(err) = p.select_audio_track(index) {
+                self.state.report_command_error(&err);
+            }
         }
         cx.notify();
     }
 
     pub(crate) fn select_video_track(&mut self, index: usize, cx: &mut Context<Self>) {
         self.state.open_track_menu = TrackMenu::None;
-        self.state.active_video_track = Some(index);
-        self.state.video_unsupported = false;
         if let Some(p) = self.player.as_mut() {
-            let _ = p.select_video_track(index);
+            if let Err(err) = p.select_video_track(index) {
+                self.state.report_command_error(&err);
+            }
         }
         cx.notify();
     }
@@ -425,6 +457,7 @@ impl PlayerView {
         self.state.video_resolution = None;
         self.state.media_info = None;
         self.state.open_track_menu = TrackMenu::None;
+        self.state.clear_pending_controls();
         self.state.video_tracks.clear();
         self.state.audio_tracks.clear();
         self.state.active_video_track = None;
@@ -652,7 +685,9 @@ impl PlayerView {
         {
             Ok(mut player) => {
                 if let Some(target) = initial_seek {
-                    let _ = player.seek(target);
+                    if let Err(err) = player.seek(target) {
+                        self.state.report_command_error(&err);
+                    }
                 }
                 self.state.status = if autoplay {
                     PlaybackStatus::Opening

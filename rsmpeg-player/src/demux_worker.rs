@@ -16,7 +16,7 @@ use crate::codec_detect::{
 use crate::command::PlayerCommand;
 use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
 use crate::h264_bitstream::extract_avcc_streaming;
-use crate::player::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
+use crate::player::{EventSender, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
 #[cfg(all(
@@ -82,9 +82,25 @@ pub fn spawn_worker(
     cmd_rx: Receiver<PlayerCommand>,
     event_tx: SyncSender<PlayerEvent>,
 ) -> thread::JoinHandle<()> {
+    spawn_worker_with_sender(
+        path,
+        volume,
+        prefer_native,
+        cmd_rx,
+        EventSender::single(event_tx),
+    )
+}
+
+pub(crate) fn spawn_worker_with_sender(
+    path: PathBuf,
+    volume: f32,
+    prefer_native: bool,
+    cmd_rx: Receiver<PlayerCommand>,
+    event_tx: EventSender,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         if let Err(e) = run_worker(path, volume, prefer_native, cmd_rx, event_tx.clone()) {
-            let _ = event_tx.try_send(PlayerEvent::Error {
+            event_tx.send(PlayerEvent::Error {
                 message: e.to_string(),
                 generation: 0,
             });
@@ -92,8 +108,8 @@ pub fn spawn_worker(
     })
 }
 
-fn emit(tx: &SyncSender<PlayerEvent>, ev: PlayerEvent) {
-    let _ = tx.try_send(ev);
+fn emit(tx: &EventSender, ev: PlayerEvent) {
+    tx.send(ev);
 }
 
 fn snap(
@@ -327,7 +343,7 @@ type FallbackAudioBundle = (
 fn open_fallback_audio(
     at: &symphonia::core::formats::Track,
     generation: u64,
-    event_tx: &SyncSender<PlayerEvent>,
+    event_tx: &EventSender,
 ) -> FallbackAudioBundle {
     use crate::backend::SymphoniaAudioDecoder;
     use symphonia::core::codecs::DecoderOptions;
@@ -402,7 +418,7 @@ fn run_worker(
     mut volume: f32,
     prefer_native: bool,
     cmd_rx: Receiver<PlayerCommand>,
-    event_tx: SyncSender<PlayerEvent>,
+    event_tx: EventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rodio::{OutputStream, Sink};
     use rsmpeg_codec::{DecodeStatus, Decoder};
@@ -421,7 +437,8 @@ fn run_worker(
     use crate::video_convert::yuv420p_frame_to_rgba_cached;
 
     if prefer_native {
-        match crate::native_pipeline::try_run_native(&path, volume, &cmd_rx, &event_tx) {
+        match crate::native_pipeline::try_run_native_with_sender(&path, volume, &cmd_rx, &event_tx)
+        {
             Ok(()) => return Ok(()),
             Err(reason) => {
                 emit(
@@ -1401,7 +1418,7 @@ fn run_worker(
     _volume: f32,
     _prefer_native: bool,
     _cmd_rx: Receiver<PlayerCommand>,
-    event_tx: SyncSender<PlayerEvent>,
+    event_tx: EventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     emit(
         &event_tx,

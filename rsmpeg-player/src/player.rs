@@ -15,6 +15,48 @@ use crate::event::{PlayerEvent, PlayerSnapshot};
 
 const CMD_CAPACITY: usize = 64;
 const EVT_CAPACITY: usize = 128;
+const TERMINAL_EVT_CAPACITY: usize = 8;
+
+/// Bounded event sender with a dedicated non-droppable terminal lane for
+/// [`PlayerEvent::Ended`] and [`PlayerEvent::Error`].
+#[derive(Clone)]
+pub(crate) struct EventSender {
+    normal: mpsc::SyncSender<PlayerEvent>,
+    terminal: Option<mpsc::SyncSender<PlayerEvent>>,
+}
+
+impl EventSender {
+    pub(crate) fn new(
+        normal: mpsc::SyncSender<PlayerEvent>,
+        terminal: mpsc::SyncSender<PlayerEvent>,
+    ) -> Self {
+        Self {
+            normal,
+            terminal: Some(terminal),
+        }
+    }
+
+    pub(crate) fn single(normal: mpsc::SyncSender<PlayerEvent>) -> Self {
+        Self {
+            normal,
+            terminal: None,
+        }
+    }
+
+    /// Non-blocking emit. Streaming events drop cleanly when `normal` is full,
+    /// while terminal lifecycle events (`Ended`, `Error`) fall back to the
+    /// dedicated `terminal` lane so frames can never evict them.
+    pub(crate) fn send(&self, ev: PlayerEvent) {
+        let is_terminal = matches!(ev, PlayerEvent::Ended { .. } | PlayerEvent::Error { .. });
+        if let Err(mpsc::TrySendError::Full(ev)) = self.normal.try_send(ev) {
+            if is_terminal {
+                if let Some(ref terminal) = self.terminal {
+                    let _ = terminal.try_send(ev);
+                }
+            }
+        }
+    }
+}
 
 /// Minimum supported playback speed multiplier.
 pub const MIN_PLAYBACK_RATE: f64 = 0.25;
@@ -128,6 +170,7 @@ pub struct Player {
     playing: bool,
     cmd_tx: mpsc::SyncSender<PlayerCommand>,
     event_rx: mpsc::Receiver<PlayerEvent>,
+    terminal_rx: mpsc::Receiver<PlayerEvent>,
     handle: Option<thread::JoinHandle<()>>,
     shut_down: bool,
     last_error: Option<String>,
@@ -143,9 +186,15 @@ impl Player {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(TERMINAL_EVT_CAPACITY);
         let rate = clamp_playback_rate(playback_rate);
-        let handle =
-            demux_worker::spawn_worker(path.clone(), volume, prefer_native, cmd_rx, event_tx);
+        let handle = demux_worker::spawn_worker_with_sender(
+            path.clone(),
+            volume,
+            prefer_native,
+            cmd_rx,
+            EventSender::new(event_tx, terminal_tx),
+        );
 
         let player = Self {
             path,
@@ -159,6 +208,7 @@ impl Player {
             playing: autoplay,
             cmd_tx,
             event_rx,
+            terminal_rx,
             handle: Some(handle),
             shut_down: false,
             last_error: None,
@@ -218,8 +268,15 @@ impl Player {
         self.generation.load(Ordering::Relaxed)
     }
 
-    fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    /// Enqueue a command that advances `generation` ONLY if enqueue succeeds.
+    fn send_with_next_generation(
+        &mut self,
+        build: impl FnOnce(u64) -> PlayerCommand,
+    ) -> Result<u64, PlayerError> {
+        let next_g = self.generation() + 1;
+        self.send_command(build(next_g))?;
+        self.generation.store(next_g, Ordering::Relaxed);
+        Ok(next_g)
     }
 
     /// Enqueue a command (non-blocking).
@@ -227,9 +284,10 @@ impl Player {
         if self.shut_down {
             return Err(PlayerError::ShutDown);
         }
-        self.cmd_tx
-            .try_send(cmd)
-            .map_err(|_| PlayerError::CommandQueueFull)
+        self.cmd_tx.try_send(cmd).map_err(|err| match err {
+            mpsc::TrySendError::Full(_) => PlayerError::CommandQueueFull,
+            mpsc::TrySendError::Disconnected(_) => PlayerError::ShutDown,
+        })
     }
 
     pub fn play(&mut self) -> Result<(), PlayerError> {
@@ -258,8 +316,7 @@ impl Player {
     }
 
     pub fn seek(&mut self, position: Duration) -> Result<(), PlayerError> {
-        let g = self.next_generation();
-        self.send_command(PlayerCommand::Seek {
+        self.send_with_next_generation(|g| PlayerCommand::Seek {
             position,
             mode: SeekMode::Coarse,
             generation: g,
@@ -293,20 +350,20 @@ impl Player {
 
     /// Switch the active audio stream by track index.
     pub fn select_audio_track(&mut self, index: usize) -> Result<(), PlayerError> {
-        let g = self.next_generation();
-        self.send_command(PlayerCommand::SelectAudioTrack {
+        self.send_with_next_generation(|g| PlayerCommand::SelectAudioTrack {
             index,
             generation: g,
-        })
+        })?;
+        Ok(())
     }
 
     /// Switch the active video stream by track index.
     pub fn select_video_track(&mut self, index: usize) -> Result<(), PlayerError> {
-        let g = self.next_generation();
-        self.send_command(PlayerCommand::SelectVideoTrack {
+        self.send_with_next_generation(|g| PlayerCommand::SelectVideoTrack {
             index,
             generation: g,
-        })
+        })?;
+        Ok(())
     }
 
     pub fn shutdown(&mut self) -> Result<(), PlayerError> {
@@ -327,14 +384,17 @@ impl Player {
     }
 
     /// Poll one outbound event (non-blocking) and update local cache.
+    ///
+    /// Drains normal events first, then falls back to the dedicated terminal
+    /// lane so `Ended` / `Error` are always delivered after buffered frames.
     pub fn poll_event(&mut self) -> Option<PlayerEvent> {
-        match self.event_rx.try_recv() {
-            Ok(ev) => {
-                self.apply_event(&ev);
-                Some(ev)
-            }
-            Err(_) => None,
-        }
+        let ev = self
+            .event_rx
+            .try_recv()
+            .ok()
+            .or_else(|| self.terminal_rx.try_recv().ok())?;
+        self.apply_event(&ev);
+        Some(ev)
     }
 
     /// Drain all pending events; returns the latest video frame if any.
@@ -423,6 +483,33 @@ impl Drop for Player {
 mod tests {
     use super::*;
 
+    /// Construct a `Player` backed by caller-controlled channels (no background worker
+    /// racing to exit) so queue saturation, generation consistency, and event backpressure
+    /// can be verified deterministically.
+    fn make_channel_player() -> (Player, mpsc::Receiver<PlayerCommand>, EventSender) {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
+        let (terminal_tx, terminal_rx) = mpsc::sync_channel(TERMINAL_EVT_CAPACITY);
+        let player = Player {
+            path: PathBuf::from("synthetic.mp4"),
+            prefer_native: true,
+            state: PlayerState::Playing,
+            generation: AtomicU64::new(1),
+            volume: 0.8,
+            playback_rate: 1.0,
+            position: Duration::ZERO,
+            duration: Duration::from_secs(10),
+            playing: true,
+            cmd_tx,
+            event_rx,
+            terminal_rx,
+            handle: None,
+            shut_down: false,
+            last_error: None,
+        };
+        (player, cmd_rx, EventSender::new(event_tx, terminal_tx))
+    }
+
     #[test]
     fn builder_requires_input() {
         match Player::builder().build() {
@@ -455,62 +542,147 @@ mod tests {
 
     #[test]
     fn seek_bumps_generation() {
-        let mut p = Player::builder()
-            .input("definitely-missing-file-xyz.mp4")
-            .autoplay(false)
-            .build()
-            .unwrap();
+        let (mut p, _cmd_rx, _evt_tx) = make_channel_player();
         let g0 = p.generation();
-        let _ = p.seek(Duration::from_secs(10));
-        assert!(p.generation() > g0);
+        p.seek(Duration::from_secs(10)).unwrap();
+        assert_eq!(p.generation(), g0 + 1);
     }
 
     #[test]
     fn twenty_pause_resume_commands() {
-        let mut p = Player::builder()
-            .input("definitely-missing-file-xyz.mp4")
-            .autoplay(false)
-            .build()
-            .unwrap();
+        let (mut p, _cmd_rx, _evt_tx) = make_channel_player();
         for _ in 0..20 {
-            let _ = p.play();
-            let _ = p.pause();
+            p.play().unwrap();
+            p.pause().unwrap();
         }
         assert_eq!(p.state(), PlayerState::Paused);
     }
 
     #[test]
     fn set_playback_rate_clamps_and_stores() {
-        let mut p = Player::builder()
-            .input("definitely-missing-file-xyz.mp4")
-            .autoplay(false)
-            .playback_rate(1.5)
-            .build()
-            .unwrap();
+        let (mut p, _cmd_rx, _evt_tx) = make_channel_player();
+        p.set_playback_rate(1.5).unwrap();
         assert!((p.playback_rate() - 1.5).abs() < f64::EPSILON);
 
-        let _ = p.set_playback_rate(0.1);
+        p.set_playback_rate(0.1).unwrap();
         assert!((p.playback_rate() - MIN_PLAYBACK_RATE).abs() < f64::EPSILON);
 
-        let _ = p.set_playback_rate(10.0);
+        p.set_playback_rate(10.0).unwrap();
         assert!((p.playback_rate() - MAX_PLAYBACK_RATE).abs() < f64::EPSILON);
 
-        let _ = p.set_playback_rate(f64::NAN);
+        p.set_playback_rate(f64::NAN).unwrap();
         assert!((p.playback_rate() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn select_audio_and_video_track_bump_generation() {
-        let mut p = Player::builder()
-            .input("definitely-missing-file-xyz.mp4")
-            .autoplay(false)
-            .build()
-            .unwrap();
+        let (mut p, _cmd_rx, _evt_tx) = make_channel_player();
         let g0 = p.generation();
-        let _ = p.select_audio_track(1);
+        p.select_audio_track(1).unwrap();
         let g1 = p.generation();
-        assert!(g1 > g0);
-        let _ = p.select_video_track(0);
-        assert!(p.generation() > g1);
+        assert_eq!(g1, g0 + 1);
+        p.select_video_track(0).unwrap();
+        assert_eq!(p.generation(), g1 + 1);
+    }
+
+    #[test]
+    fn full_command_queue_does_not_bump_generation_or_mutate_state() {
+        let (mut p, _cmd_rx, _evt_tx) = make_channel_player();
+        // Saturate all 64 slots of the bounded command channel.
+        for _ in 0..CMD_CAPACITY {
+            p.set_volume(0.5).expect("enqueue within capacity");
+        }
+        let gen_before = p.generation();
+        let pos_before = p.position();
+        let state_before = p.state();
+        let rate_before = p.playback_rate();
+
+        assert!(matches!(
+            p.select_audio_track(3),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert_eq!(p.generation(), gen_before);
+
+        assert!(matches!(
+            p.select_video_track(1),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert_eq!(p.generation(), gen_before);
+
+        assert!(matches!(
+            p.seek(Duration::from_secs(4)),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert_eq!(p.generation(), gen_before);
+        assert_eq!(p.position(), pos_before);
+        assert_eq!(p.state(), state_before);
+
+        assert!(matches!(
+            p.set_playback_rate(2.0),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert!((p.playback_rate() - rate_before).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn disconnected_worker_reports_shutdown_and_preserves_generation() {
+        let (mut p, cmd_rx, _evt_tx) = make_channel_player();
+        drop(cmd_rx);
+        let gen_before = p.generation();
+
+        assert!(matches!(p.play(), Err(PlayerError::ShutDown)));
+        assert!(matches!(
+            p.select_audio_track(2),
+            Err(PlayerError::ShutDown)
+        ));
+        assert_eq!(p.generation(), gen_before);
+    }
+
+    #[test]
+    fn saturated_event_channel_still_delivers_ended_and_error_terminal_events() {
+        // Test Ended under full streaming backpressure.
+        let (mut p1, _rx1, evt_tx1) = make_channel_player();
+        for i in 0..(EVT_CAPACITY + 32) {
+            evt_tx1.send(PlayerEvent::PositionChanged {
+                position: Duration::from_millis(i as u64),
+                generation: 1,
+            });
+        }
+        evt_tx1.send(PlayerEvent::Ended { generation: 1 });
+
+        let mut count = 0usize;
+        let mut saw_ended = false;
+        while let Some(ev) = p1.poll_event() {
+            count += 1;
+            if matches!(ev, PlayerEvent::Ended { generation: 1 }) {
+                saw_ended = true;
+            }
+        }
+        assert_eq!(count, EVT_CAPACITY + 1);
+        assert!(saw_ended, "Ended must never be dropped by full event queue");
+        assert_eq!(p1.state(), PlayerState::Ended);
+
+        // Test Error under full streaming backpressure.
+        let (mut p2, _rx2, evt_tx2) = make_channel_player();
+        for i in 0..EVT_CAPACITY {
+            evt_tx2.send(PlayerEvent::PositionChanged {
+                position: Duration::from_millis(i as u64),
+                generation: 1,
+            });
+        }
+        evt_tx2.send(PlayerEvent::Error {
+            message: "fatal decode failure".into(),
+            generation: 1,
+        });
+
+        let mut saw_error = false;
+        while let Some(ev) = p2.poll_event() {
+            if matches!(ev, PlayerEvent::Error { ref message, .. } if message == "fatal decode failure")
+            {
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "Error must never be dropped by full event queue");
+        assert_eq!(p2.state(), PlayerState::Error);
     }
 }

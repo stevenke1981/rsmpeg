@@ -6,7 +6,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use rsmpeg_player::{PlayerEvent, PlayerTrackInfo, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
+use rsmpeg_player::{
+    PlayerError, PlayerEvent, PlayerTrackInfo, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE,
+};
 
 use crate::format_time::{format_channels_for, format_sample_rate};
 use crate::i18n::Locale;
@@ -59,6 +61,15 @@ pub enum EventOutcome {
     AutoAdvanceNext,
 }
 
+/// Candidate volume/mute transition waiting for worker confirmation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeIntent {
+    pub volume: f32,
+    pub muted: bool,
+    pub pre_mute_volume: f32,
+    pub effective: f32,
+}
+
 /// Complete headless UI state for the media player.
 #[derive(Debug, Clone)]
 pub struct PlaybackUiState {
@@ -71,6 +82,8 @@ pub struct PlaybackUiState {
     pub muted: bool,
     pub pre_mute_volume: f32,
     pub playback_rate: f64,
+    pending_volume: Option<VolumeIntent>,
+    pending_playback_rate: Option<f64>,
     pub scrubbing: bool,
     pub scrub_fraction: f64,
     pub waveform: VecDeque<f32>,
@@ -112,6 +125,8 @@ impl PlaybackUiState {
             muted: false,
             pre_mute_volume: 0.8,
             playback_rate: 1.0,
+            pending_volume: None,
+            pending_playback_rate: None,
             scrubbing: false,
             scrub_fraction: 0.0,
             waveform: VecDeque::from(vec![0.0; WAVEFORM_BARS]),
@@ -153,6 +168,8 @@ impl PlaybackUiState {
         self.raw_warning_message = None;
         self.media_info = None;
         self.open_track_menu = TrackMenu::None;
+        self.pending_volume = None;
+        self.pending_playback_rate = None;
         self.video_tracks.clear();
         self.audio_tracks.clear();
         self.active_video_track = None;
@@ -190,83 +207,180 @@ impl PlaybackUiState {
         }
     }
 
-    /// Set volume (`0.0..=1.0`), automatically unmuting if non-zero.
-    /// Returns the effective volume to forward to the player core.
-    pub fn set_volume(&mut self, volume: f32) -> f32 {
+    /// Compute a candidate volume transition without mutating displayed UI state yet.
+    pub fn preview_volume(&self, volume: f32) -> VolumeIntent {
+        let base_vol = self.pending_volume.map_or(self.volume, |p| p.volume);
+        let base_pre = self
+            .pending_volume
+            .map_or(self.pre_mute_volume, |p| p.pre_mute_volume);
         let v = if volume.is_finite() {
             volume.clamp(0.0, 1.0)
         } else {
-            self.volume
+            base_vol
         };
-        self.volume = v;
-        if v > 0.0 {
-            self.muted = false;
-            self.pre_mute_volume = v;
+        let (muted, pre_mute_volume) = if v > 0.0 {
+            (false, v)
         } else {
-            self.muted = true;
+            (true, base_pre)
+        };
+        VolumeIntent {
+            volume: v,
+            muted,
+            pre_mute_volume,
+            effective: if muted { 0.0 } else { v },
         }
+    }
+
+    /// Compute a relative volume adjustment without mutating displayed UI state yet.
+    pub fn preview_adjust_volume(&self, delta: f32) -> VolumeIntent {
+        let (cur_vol, cur_muted) = self
+            .pending_volume
+            .map_or((self.volume, self.muted), |p| (p.volume, p.muted));
+        let base = if cur_muted { 0.0 } else { cur_vol };
+        self.preview_volume(base + delta)
+    }
+
+    /// Compute a mute toggle without mutating displayed UI state yet.
+    pub fn preview_toggle_mute(&self) -> VolumeIntent {
+        let (cur_vol, cur_muted, cur_pre) = self
+            .pending_volume
+            .map_or((self.volume, self.muted, self.pre_mute_volume), |p| {
+                (p.volume, p.muted, p.pre_mute_volume)
+            });
+        if cur_muted {
+            let restored = if cur_vol <= 0.001 {
+                if cur_pre > 0.001 {
+                    cur_pre
+                } else {
+                    0.5
+                }
+            } else {
+                cur_vol
+            };
+            VolumeIntent {
+                volume: restored,
+                muted: false,
+                pre_mute_volume: cur_pre,
+                effective: restored.clamp(0.0, 1.0),
+            }
+        } else {
+            let saved_pre = if cur_vol > 0.001 { cur_vol } else { cur_pre };
+            VolumeIntent {
+                volume: cur_vol,
+                muted: true,
+                pre_mute_volume: saved_pre,
+                effective: 0.0,
+            }
+        }
+    }
+
+    /// Commit a volume/mute transition (either offline without a player or after worker confirmation).
+    pub fn apply_volume_intent(&mut self, intent: VolumeIntent) {
+        self.volume = intent.volume.clamp(0.0, 1.0);
+        self.muted = intent.muted;
+        self.pre_mute_volume = intent.pre_mute_volume.clamp(0.0, 1.0);
+    }
+
+    /// Record a volume/mute intent after the command was accepted by `Player::set_volume`.
+    pub fn queue_volume_intent(&mut self, intent: VolumeIntent) {
+        self.pending_volume = Some(intent);
+    }
+
+    /// Set volume (`0.0..=1.0`), automatically unmuting if non-zero.
+    /// Returns the effective volume to forward to the player core.
+    pub fn set_volume(&mut self, volume: f32) -> f32 {
+        let intent = self.preview_volume(volume);
+        self.apply_volume_intent(intent);
         self.effective_volume()
     }
 
     /// Adjust volume by `delta` (e.g. `+0.05` / `-0.05`).
     pub fn adjust_volume(&mut self, delta: f32) -> f32 {
-        let base = if self.muted { 0.0 } else { self.volume };
-        self.set_volume(base + delta)
+        let intent = self.preview_adjust_volume(delta);
+        self.apply_volume_intent(intent);
+        self.effective_volume()
     }
 
     /// Toggle mute while remembering the previous non-zero volume.
     pub fn toggle_mute(&mut self) -> f32 {
-        if self.muted {
-            self.muted = false;
-            if self.volume <= 0.001 {
-                self.volume = if self.pre_mute_volume > 0.001 {
-                    self.pre_mute_volume
-                } else {
-                    0.5
-                };
-            }
-        } else {
-            if self.volume > 0.001 {
-                self.pre_mute_volume = self.volume;
-            }
-            self.muted = true;
-        }
+        let intent = self.preview_toggle_mute();
+        self.apply_volume_intent(intent);
         self.effective_volume()
+    }
+
+    /// Compute the next cycled playback rate without mutating displayed state yet.
+    pub fn next_cycle_rate(&self) -> f64 {
+        let current = self.pending_playback_rate.unwrap_or(self.playback_rate);
+        let next_idx = PLAYBACK_RATES
+            .iter()
+            .position(|&r| r > current + 0.01)
+            .unwrap_or(0);
+        PLAYBACK_RATES[next_idx]
+    }
+
+    /// Compute the next higher preset playback rate without mutating displayed state yet.
+    pub fn next_step_rate_up(&self) -> f64 {
+        let current = self.pending_playback_rate.unwrap_or(self.playback_rate);
+        PLAYBACK_RATES
+            .iter()
+            .copied()
+            .find(|&r| r > current + 0.01)
+            .unwrap_or(current)
+            .clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
+    }
+
+    /// Compute the next lower preset playback rate without mutating displayed state yet.
+    pub fn next_step_rate_down(&self) -> f64 {
+        let current = self.pending_playback_rate.unwrap_or(self.playback_rate);
+        PLAYBACK_RATES
+            .iter()
+            .rev()
+            .copied()
+            .find(|&r| r < current - 0.01)
+            .unwrap_or(current)
+            .clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
+    }
+
+    /// Record a playback-rate change after `Player::set_playback_rate` succeeded.
+    pub fn queue_playback_rate(&mut self, rate: f64) {
+        self.pending_playback_rate = Some(rate.clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE));
+    }
+
+    /// Clear any unconfirmed control intents (e.g. when resetting to idle).
+    pub fn clear_pending_controls(&mut self) {
+        self.pending_volume = None;
+        self.pending_playback_rate = None;
+    }
+
+    /// Surface a failed player command as a localized warning banner without altering playback state.
+    pub fn report_command_error(&mut self, err: &PlayerError) {
+        let raw = err.to_string();
+        self.warning_message = Some(localize_player_warning_for(self.locale, &raw));
+        self.raw_warning_message = Some(raw);
     }
 
     /// Cycle through [`PLAYBACK_RATES`] (e.g. `1.0 -> 1.25 -> ... -> 2.0 -> 0.5`).
     pub fn cycle_rate(&mut self) -> f64 {
-        let next_idx = PLAYBACK_RATES
-            .iter()
-            .position(|&r| r > self.playback_rate + 0.01)
-            .unwrap_or(0);
-        self.playback_rate = PLAYBACK_RATES[next_idx];
+        let next = self.next_cycle_rate();
+        self.playback_rate = next;
+        self.pending_playback_rate = None;
         self.playback_rate
     }
 
     /// Step playback rate up to the next preset in [`PLAYBACK_RATES`].
     pub fn step_rate_up(&mut self) -> f64 {
-        if let Some(&higher) = PLAYBACK_RATES
-            .iter()
-            .find(|&&r| r > self.playback_rate + 0.01)
-        {
-            self.playback_rate = higher;
-        }
+        let next = self.next_step_rate_up();
+        self.playback_rate = next;
+        self.pending_playback_rate = None;
         self.playback_rate
-            .clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
     }
 
     /// Step playback rate down to the previous preset in [`PLAYBACK_RATES`].
     pub fn step_rate_down(&mut self) -> f64 {
-        if let Some(&lower) = PLAYBACK_RATES
-            .iter()
-            .rev()
-            .find(|&&r| r < self.playback_rate - 0.01)
-        {
-            self.playback_rate = lower;
-        }
+        let next = self.next_step_rate_down();
+        self.playback_rate = next;
+        self.pending_playback_rate = None;
         self.playback_rate
-            .clamp(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
     }
 
     /// Compute clamped target position for a relative seek (`+/- delta_secs`).
@@ -374,9 +488,24 @@ impl PlaybackUiState {
                 if !self.scrubbing {
                     self.position = snap.position;
                 }
+                if snap.status == "rate" {
+                    if let Some(rate) = self.pending_playback_rate.take() {
+                        self.playback_rate = rate;
+                    }
+                }
+                if snap.status == "volume" {
+                    if let Some(intent) = self.pending_volume.take() {
+                        self.apply_volume_intent(intent);
+                        if !self.muted {
+                            self.volume = snap.volume.clamp(0.0, 1.0);
+                        }
+                    } else if !self.muted {
+                        self.volume = snap.volume.clamp(0.0, 1.0);
+                    }
+                }
                 if snap.playing {
                     self.status = PlaybackStatus::Playing;
-                } else if snap.status == "paused" {
+                } else if snap.status == "paused" || snap.status == "seeked" {
                     self.status = PlaybackStatus::Paused;
                 } else if snap.status == "stopped" {
                     self.status = PlaybackStatus::Stopped;
@@ -460,6 +589,11 @@ impl PlaybackUiState {
                 self.audio_tracks = audio_tracks.clone();
                 self.active_video_track = *active_video;
                 self.active_audio_track = *active_audio;
+                if let Some(idx) = *active_video {
+                    if video_tracks.iter().any(|t| t.index == idx && t.supported) {
+                        self.video_unsupported = false;
+                    }
+                }
                 EventOutcome::None
             }
         }
@@ -557,6 +691,10 @@ pub fn localize_player_warning_for(locale: Locale, raw: &str) -> String {
                 format!("音訊解碼初始化失敗，目前僅播放視訊（{raw}）")
             } else if raw.contains("audio muted") {
                 format!("音訊解碼器不可用，將以靜音模式播放（{raw}）")
+            } else if raw.contains("command queue full") {
+                format!("播放器指令佇列已滿，請稍後再試（{raw}）")
+            } else if raw.contains("player already shut down") {
+                format!("播放工作執行緒已停止，無法套用指令（{raw}）")
             } else {
                 raw.to_string()
             }
@@ -568,6 +706,10 @@ pub fn localize_player_warning_for(locale: Locale, raw: &str) -> String {
                 format!("Audio decoder failed to initialize; playing video only ({raw})")
             } else if raw.contains("audio muted") {
                 format!("No audio decoder available; playing muted ({raw})")
+            } else if raw.contains("command queue full") {
+                format!("Player command queue is full; please try again ({raw})")
+            } else if raw.contains("player already shut down") {
+                format!("Playback worker has stopped; command could not be applied ({raw})")
             } else {
                 raw.to_string()
             }
@@ -926,5 +1068,64 @@ mod tests {
         assert!(st.error_message.as_deref().unwrap().contains("corrupted"));
         assert_eq!(st.toggle_locale(), Locale::ZhTw);
         assert!(st.error_message.as_deref().unwrap().contains("損毀"));
+    }
+
+    #[test]
+    fn command_errors_preserve_control_state_and_worker_replies_confirm_updates() {
+        let mut st = PlaybackUiState::new();
+        st.status = PlaybackStatus::Playing;
+        st.position = Duration::from_secs(3);
+        st.active_audio_track = Some(2);
+        st.active_video_track = Some(0);
+        st.playback_rate = 1.0;
+
+        // Failed command (CommandQueueFull) surfaces localized warning and does NOT mutate state.
+        st.report_command_error(&PlayerError::CommandQueueFull);
+        assert!(st
+            .warning_message
+            .as_deref()
+            .is_some_and(|w| w.contains("佇列已滿")));
+        assert_eq!(st.active_audio_track, Some(2));
+        assert_eq!(st.position, Duration::from_secs(3));
+        assert!((st.playback_rate - 1.0).abs() < 1e-6);
+
+        // Switching locale re-localizes the command error banner.
+        st.toggle_locale();
+        assert!(st
+            .warning_message
+            .as_deref()
+            .is_some_and(|w| w.contains("command queue is full")));
+
+        // Queued rate / volume changes stay pending until worker replies with Snapshot.
+        let next_rate = st.next_cycle_rate();
+        assert!((next_rate - 1.25).abs() < 1e-6);
+        st.queue_playback_rate(next_rate);
+        assert!(
+            (st.playback_rate - 1.0).abs() < 1e-6,
+            "rate must not change before worker reply"
+        );
+        st.apply_player_event(&PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: true,
+            position: Duration::from_secs(3),
+            duration: Duration::from_secs(10),
+            volume: 0.8,
+            generation: 1,
+            status: "rate".into(),
+        }));
+        assert!((st.playback_rate - 1.25).abs() < 1e-6);
+
+        let mute_intent = st.preview_toggle_mute();
+        assert!(mute_intent.muted);
+        st.queue_volume_intent(mute_intent);
+        assert!(!st.muted, "mute must not change before worker reply");
+        st.apply_player_event(&PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: true,
+            position: Duration::from_secs(3),
+            duration: Duration::from_secs(10),
+            volume: 0.0,
+            generation: 1,
+            status: "volume".into(),
+        }));
+        assert!(st.muted);
     }
 }

@@ -15,7 +15,7 @@ use rsmpeg_util::MediaType;
 use crate::clock::{MasterClock, PlaybackClock};
 use crate::command::PlayerCommand;
 use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
-use crate::player::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
+use crate::player::{EventSender, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
 use crate::video_scheduler::{ScheduleAction, VideoScheduler};
 
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
@@ -23,8 +23,8 @@ const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
 const AUDIO_LEVEL_INTERVAL: Duration = Duration::from_millis(40);
 const AUDIO_ONLY_LEAD_LIMIT: Duration = Duration::from_millis(250);
 
-fn emit(tx: &SyncSender<PlayerEvent>, ev: PlayerEvent) {
-    let _ = tx.try_send(ev);
+fn emit(tx: &EventSender, ev: PlayerEvent) {
+    tx.send(ev);
 }
 
 fn snap(
@@ -96,7 +96,7 @@ fn open_native_video_decoder(
     ctx: &FormatContext,
     stream_idx: usize,
     generation: u64,
-    event_tx: &SyncSender<PlayerEvent>,
+    event_tx: &EventSender,
 ) -> Option<crate::backend::OpenH264Decoder> {
     let stream = ctx.streams.get(stream_idx)?;
     if stream.codec_id != CodecId::H264 {
@@ -136,7 +136,7 @@ fn open_native_audio_decoder(
     ctx: &FormatContext,
     stream_idx: usize,
     generation: u64,
-    event_tx: &SyncSender<PlayerEvent>,
+    event_tx: &EventSender,
 ) -> (
     Option<crate::backend::symphonia_audio::SymphoniaAudioDecoder>,
     u16,
@@ -188,6 +188,16 @@ pub fn try_run_native(
     cmd_rx: &Receiver<PlayerCommand>,
     event_tx: &SyncSender<PlayerEvent>,
 ) -> Result<(), String> {
+    let sender = EventSender::single(event_tx.clone());
+    try_run_native_with_sender(path, volume, cmd_rx, &sender)
+}
+
+pub(crate) fn try_run_native_with_sender(
+    path: &std::path::Path,
+    volume: f32,
+    cmd_rx: &Receiver<PlayerCommand>,
+    event_tx: &EventSender,
+) -> Result<(), String> {
     #[cfg(not(all(
         feature = "backend-symphonia",
         feature = "backend-openh264",
@@ -217,7 +227,7 @@ fn run_native_inner(
     path: &std::path::Path,
     mut volume: f32,
     cmd_rx: &Receiver<PlayerCommand>,
-    event_tx: &SyncSender<PlayerEvent>,
+    event_tx: &EventSender,
 ) -> Result<(), String> {
     use rodio::{OutputStream, Sink};
     use rsmpeg_codec::{DecodeStatus, Decoder};

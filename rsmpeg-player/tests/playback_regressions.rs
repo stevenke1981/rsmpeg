@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsmpeg_player::{Player, PlayerEvent};
+use rsmpeg_player::{Player, PlayerError, PlayerEvent, PlayerState};
 
 /// Single valid 48 kHz mono AAC-LC raw frame (non-silent tone, 1024 samples / ~21.33 ms).
 const AAC_MONO_48K_FRAME: &[u8] = &[
@@ -672,5 +672,88 @@ fn initial_seek_with_autoplay_false_preserves_media_time_origin() {
     );
 
     let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// P1-04 regression (end-to-end):
+/// 1. Saturating the 64-slot command queue causes `select_audio_track` to return
+///    `Err(CommandQueueFull)` WITHOUT incrementing `player.generation()`.
+/// 2. Letting a fast-playing video saturate the 128-slot event queue without polling
+///    still reliably delivers `PlayerEvent::Ended` once drained, and subsequent
+///    commands return `Err(PlayerError::ShutDown)` instead of `CommandQueueFull`.
+#[test]
+fn queue_saturation_and_event_backpressure_preserve_generation_and_ended() {
+    // 160 keyframes × 10 ms = 1.6 s at 1× (~400 ms at 4×) -> produces >320 VideoFrame + PositionChanged events!
+    let path = unique_temp_path("p1_04_backpressure", "mp4");
+    std::fs::write(&path, build_h264_mp4(160, 10)).expect("write high-event h264 fixture");
+
+    // Part A: Command queue saturation must not advance generation.
+    {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(true)
+            .volume(0.0)
+            .build()
+            .expect("build player");
+
+        let sent = (0..256)
+            .take_while(|_| player.set_volume(0.0).is_ok())
+            .count();
+        assert!(sent < 256, "command queue should saturate within 256 tries");
+        let gen_before = player.generation();
+        let res = player.select_audio_track(1);
+        assert!(
+            matches!(
+                res,
+                Err(PlayerError::CommandQueueFull) | Err(PlayerError::ShutDown)
+            ),
+            "expected queue error, got {res:?}"
+        );
+        assert_eq!(
+            player.generation(),
+            gen_before,
+            "failed track switch must not advance generation"
+        );
+        let _ = player.shutdown();
+    }
+
+    // Part B: Unpolled 4× playback saturates the 128-slot streaming channel; Ended must still arrive.
+    {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(true)
+            .playback_rate(4.0)
+            .volume(0.0)
+            .build()
+            .expect("build 4x player");
+
+        // Wait well past the ~400 ms 4× runtime without polling a single event.
+        thread::sleep(Duration::from_millis(1200));
+
+        let mut received = 0usize;
+        let mut saw_ended = false;
+        while let Some(ev) = player.poll_event() {
+            received += 1;
+            if matches!(ev, PlayerEvent::Ended { .. }) {
+                saw_ended = true;
+            }
+        }
+        assert!(
+            received > 128,
+            "expected >128 events (128 buffered + terminal Ended), got {received}"
+        );
+        assert!(
+            saw_ended,
+            "Ended must be delivered even after 128-slot event queue saturated"
+        );
+        assert_eq!(player.state(), PlayerState::Ended);
+
+        let after_play = player.play();
+        assert!(
+            matches!(after_play, Err(PlayerError::ShutDown)),
+            "finished worker must report ShutDown rather than CommandQueueFull, got {after_play:?}"
+        );
+    }
+
     let _ = std::fs::remove_file(&path);
 }
