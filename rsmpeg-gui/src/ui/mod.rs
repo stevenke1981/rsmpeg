@@ -1,6 +1,7 @@
 //! Main GPUI view hosting the `rsmpeg-player` session, polling loop, and UI composition.
 
 pub mod controls;
+pub mod panels;
 pub mod stage;
 pub mod theme;
 
@@ -19,7 +20,7 @@ use rsmpeg_player::{Player, PlayerEvent};
 
 use crate::i18n::{strings, Locale, UiStrings};
 use crate::media_info::probe_file;
-use crate::playlist::{is_supported_media_extension, MEDIA_EXTENSIONS};
+use crate::playlist::{is_supported_media_extension, RemoveOutcome, MEDIA_EXTENSIONS};
 use crate::shortcuts::{map_key_to_action, KeyInput, ShortcutAction, SEEK_STEP_SECS, VOLUME_STEP};
 use crate::state::{
     fraction_from_pointer, EventOutcome, PlaybackStatus, PlaybackUiState, SidePanel,
@@ -318,6 +319,62 @@ impl PlayerView {
         if let Some(item) = self.state.playlist.step_prev().cloned() {
             self.load_path(item.path, true, None, window, cx);
         }
+    }
+
+    pub(crate) fn toggle_panel(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
+        self.state.toggle_panel(panel);
+        cx.notify();
+    }
+
+    pub(crate) fn close_side_panel(&mut self, cx: &mut Context<Self>) {
+        self.state.active_panel = SidePanel::None;
+        cx.notify();
+    }
+
+    pub(crate) fn remove_playlist_item(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.state.playlist.remove(index) {
+            RemoveOutcome::ActiveUnchanged => cx.notify(),
+            RemoveOutcome::ActiveReplaced(Some(next_path)) => {
+                self.load_path(next_path, true, None, window, cx);
+            }
+            RemoveOutcome::ActiveReplaced(None) => {
+                self.reset_to_idle(window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn clear_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.playlist.clear();
+        self.reset_to_idle(window, cx);
+    }
+
+    fn reset_to_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(mut p) = self.player.take() {
+            let _ = p.stop();
+            let _ = p.shutdown();
+        }
+        if let Some(old_img) = self.current_frame.take() {
+            let _ = window.drop_image(old_img);
+        }
+        self.load_nonce = self.load_nonce.wrapping_add(1);
+        self.probe_task = None;
+        self.state.status = PlaybackStatus::Idle;
+        self.state.position = Duration::ZERO;
+        self.state.duration = Duration::ZERO;
+        self.state.has_video_frame = false;
+        self.state.video_resolution = None;
+        self.state.media_info = None;
+        self.state.error_message = None;
+        self.state.warning_message = None;
+        self.state.is_probing = false;
+        self.state.reset_waveform();
+        window.set_window_title(self.strings().app_title);
+        cx.notify();
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -707,6 +764,72 @@ impl PlayerView {
                     )
                     .child(
                         div()
+                            .id("topbar-info-btn")
+                            .px_2p5()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if self.state.active_panel == SidePanel::MediaInfo {
+                                theme::accent_soft()
+                            } else {
+                                theme::bg_elevated()
+                            })
+                            .hover(|st| st.bg(theme::bg_hover()))
+                            .border_1()
+                            .border_color(if self.state.active_panel == SidePanel::MediaInfo {
+                                theme::accent()
+                            } else {
+                                theme::border_subtle()
+                            })
+                            .text_xs()
+                            .text_color(if self.state.active_panel == SidePanel::MediaInfo {
+                                theme::accent()
+                            } else {
+                                theme::text_primary()
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.focus_root(window);
+                                this.toggle_panel(SidePanel::MediaInfo, cx);
+                            }))
+                            .child(s.info_panel_btn),
+                    )
+                    .child(
+                        div()
+                            .id("topbar-playlist-btn")
+                            .px_2p5()
+                            .py_1()
+                            .rounded_md()
+                            .bg(if self.state.active_panel == SidePanel::Playlist {
+                                theme::accent_soft()
+                            } else {
+                                theme::bg_elevated()
+                            })
+                            .hover(|st| st.bg(theme::bg_hover()))
+                            .border_1()
+                            .border_color(if self.state.active_panel == SidePanel::Playlist {
+                                theme::accent()
+                            } else {
+                                theme::border_subtle()
+                            })
+                            .text_xs()
+                            .text_color(if self.state.active_panel == SidePanel::Playlist {
+                                theme::accent()
+                            } else {
+                                theme::text_primary()
+                            })
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.focus_root(window);
+                                this.toggle_panel(SidePanel::Playlist, cx);
+                            }))
+                            .child(format!(
+                                "{} ({})",
+                                s.playlist_panel_btn,
+                                self.state.playlist.len()
+                            )),
+                    )
+                    .child(
+                        div()
                             .id("topbar-open-btn")
                             .px_2p5()
                             .py_1()
@@ -731,6 +854,7 @@ impl Render for PlayerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let s = self.strings();
         let stage_el = stage::render_stage(&self.state, self.current_frame.as_ref(), s, cx);
+        let side_panel = panels::render_side_panel(&self.state, s, cx);
         let controls_el = controls::render_controls(
             &self.state,
             self.seek_track_bounds.clone(),
@@ -790,7 +914,8 @@ impl Render for PlayerView {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .child(stage_el),
+                    .child(stage_el)
+                    .when_some(side_panel, |el, panel| el.child(panel)),
             )
             .child(controls_el)
     }
