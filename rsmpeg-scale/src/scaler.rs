@@ -206,6 +206,90 @@ impl Scaler {
     /// Returns the plane references and strides on success. Extra padding in `linesize`
     /// is tolerated; short buffers are reported as [`RsError::InvalidData`] instead of
     /// panicking later on an out-of-bounds index.
+    /// Check that `frame` really is a `expected`-format frame before its planes are
+    /// interpreted with that format's layout.
+    ///
+    /// The scaler's configuration alone is not evidence: passing a `Bgr24` frame to a
+    /// scaler configured for `Rgb24` produced valid-looking (but red/blue swapped)
+    /// output. Rejecting the mismatch is the only safe answer, since the two layouts
+    /// are indistinguishable from the byte counts alone.
+    fn require_source_format(frame: &Frame, expected: PixelFormat) -> RsResult<()> {
+        if frame.pixel_format != expected {
+            return Err(RsError::InvalidData(
+                format!(
+                    "scaler configured for {:?} source but got a {:?} frame",
+                    expected, frame.pixel_format
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate one plane's stride and buffer length for `width × height` samples.
+    ///
+    /// A stride shorter than the pixel row makes consecutive rows overlap, which
+    /// silently shifts pixels (`linesize = 3` for a 2-pixel RGB24 row produced a
+    /// sheared image). `bytes_per_sample` is 1 for 8-bit planes and 3/4 for the
+    /// packed RGB layouts.
+    fn validate_plane(
+        plane: &[u8],
+        linesize: usize,
+        width: usize,
+        height: usize,
+        bytes_per_sample: usize,
+        what: &str,
+    ) -> RsResult<()> {
+        let row_bytes = width
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| RsError::InvalidData(format!("{what}: row size overflow").into()))?;
+        if linesize < row_bytes {
+            return Err(RsError::InvalidData(
+                format!(
+                    "{what}: linesize {linesize} is smaller than one pixel row ({row_bytes} \
+                     bytes); rows would overlap"
+                )
+                .into(),
+            ));
+        }
+        let need = if height == 0 {
+            0
+        } else {
+            linesize
+                .checked_mul(height - 1)
+                .and_then(|o| o.checked_add(row_bytes))
+                .ok_or_else(|| RsError::InvalidData(format!("{what}: size overflow").into()))?
+        };
+        if plane.len() < need {
+            return Err(RsError::InvalidData(
+                format!(
+                    "{what}: plane buffer is too small (have {} bytes, need {need} for \
+                     {width}x{height} with linesize {linesize})",
+                    plane.len()
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check that the destination frame of `width × height × bytes_per_sample` can be
+    /// allocated without overflowing `usize`.
+    fn validate_output_size(width: usize, height: usize, bytes_per_pixel: usize) -> RsResult<()> {
+        width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(bytes_per_pixel))
+            .ok_or_else(|| {
+                RsError::InvalidData(
+                    format!(
+                        "scale: output size {width}x{height}x{bytes_per_pixel} bytes overflows"
+                    )
+                    .into(),
+                )
+            })
+            .map(|_| ())
+    }
+
     fn validate_yuv420p_planes<'a>(
         &self,
         frame: &'a Frame,
@@ -218,11 +302,31 @@ impl Scaler {
             ));
         }
 
+        // Explicit strides: the 4:2:0 layout is derived from `use_w`/`use_h`, so a
+        // declared `linesize` that does not match shifts every row.
+        let chroma_w = use_w.div_ceil(2);
+        let chroma_h = use_h.div_ceil(2);
+        Self::validate_plane(&frame.data[0], frame.linesize[0], use_w, use_h, 1, "YUV420P Y")?;
+        Self::validate_plane(
+            &frame.data[1],
+            frame.linesize[1],
+            chroma_w,
+            chroma_h,
+            1,
+            "YUV420P U",
+        )?;
+        Self::validate_plane(
+            &frame.data[2],
+            frame.linesize[2],
+            chroma_w,
+            chroma_h,
+            1,
+            "YUV420P V",
+        )?;
+
         let y_stride = frame.linesize[0];
         let u_stride = frame.linesize[1];
         let v_stride = frame.linesize[2];
-        let chroma_w = use_w.div_ceil(2);
-        let chroma_h = use_h.div_ceil(2);
 
         // Rows are `stride` apart, each row uses `width` bytes.
         let y_need = y_stride
@@ -250,6 +354,7 @@ impl Scaler {
     }
 
     fn scale_yuv420p_to_packed(&self, frame: &Frame, bpp: usize) -> RsResult<Frame> {
+        Self::require_source_format(frame, PixelFormat::Yuv420P)?;
         let src_w = self.source_width();
         let src_h = self.source_height();
         let dst_w = self.config.dst_width as usize;
@@ -273,6 +378,7 @@ impl Scaler {
         // but a different byte order.
         let bgr = bpp == 0;
         let bytes_per_pixel = if bgr { 3 } else { bpp };
+        Self::validate_output_size(dst_w, dst_h, bytes_per_pixel)?;
         let mut out = vec![0u8; dst_w * dst_h * bytes_per_pixel];
         let out_stride = dst_w * bytes_per_pixel;
         let src_w_safe = use_w.max(1);
@@ -402,15 +508,7 @@ impl Scaler {
         alpha: bool,
         interleaved_uv: bool,
     ) -> RsResult<Frame> {
-        if frame.pixel_format != expected {
-            return Err(RsError::InvalidData(
-                format!(
-                    "scaler configured for {:?} source but got a {:?} frame",
-                    expected, frame.pixel_format
-                )
-                .into(),
-            ));
-        }
+        Self::require_source_format(frame, expected)?;
         if frame.data.len() < planes || frame.linesize.len() < planes {
             return Err(RsError::InvalidData(
                 format!("{:?} frame requires {} planes", expected, planes).into(),
@@ -431,6 +529,34 @@ impl Scaler {
             use_h
         };
         let uv_bytes = if interleaved_uv { 2 } else { 1 };
+
+        let format_name = format!("{expected:?}");
+        Self::validate_plane(
+            &frame.data[0],
+            frame.linesize[0],
+            use_w,
+            use_h,
+            1,
+            &format!("{format_name} Y"),
+        )?;
+        Self::validate_plane(
+            &frame.data[1],
+            frame.linesize[1],
+            chroma_w,
+            chroma_h,
+            uv_bytes,
+            &format!("{format_name} UV"),
+        )?;
+        if !interleaved_uv {
+            Self::validate_plane(
+                &frame.data[2],
+                frame.linesize[2],
+                chroma_w,
+                chroma_h,
+                1,
+                &format!("{format_name} V"),
+            )?;
+        }
 
         let y_stride = frame.linesize[0];
         let uv_stride = frame.linesize[1];
@@ -518,6 +644,10 @@ impl Scaler {
 
     /// `Rgb24` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
     fn scale_rgb24_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
+        // Rejecting the mismatch matters: a `Bgr24` frame fed to an `Rgb24`
+        // scaler produced a perfectly plausible RGBA image with red and blue
+        // swapped, which no later stage can detect.
+        Self::require_source_format(frame, PixelFormat::Rgb24)?;
         let (use_w, use_h) = self.source_geometry(frame);
         if frame.data.is_empty() || frame.linesize.is_empty() {
             return Err(RsError::InvalidData("RGB24 frame has no plane data".into()));
@@ -529,6 +659,10 @@ impl Scaler {
 
         let src = &frame.data[0];
         let src_stride = frame.linesize[0];
+        // `linesize` must cover one full pixel row, otherwise consecutive rows
+        // overlap (a 3-byte stride for a 2-pixel RGB24 row duplicated pixels).
+        Self::validate_plane(src, src_stride, use_w, use_h, 3, "RGB24")?;
+        Self::validate_output_size(dst_w, dst_h, 4)?;
         let need = src_stride
             .checked_mul(use_h.saturating_sub(1))
             .and_then(|o| o.checked_add(use_w.checked_mul(3)?));
@@ -569,6 +703,7 @@ impl Scaler {
     /// so their target size is `ceil(dst/2)` and each source chroma sample is
     /// replicated over the corresponding 2×2 output block.
     fn scale_yuv420p_to_yuv420p(&self, frame: &Frame) -> RsResult<Frame> {
+        Self::require_source_format(frame, PixelFormat::Yuv420P)?;
         let (use_w, use_h) = self.source_geometry(frame);
         let use_w = use_w.max(1);
         let use_h = use_h.max(1);
@@ -581,6 +716,11 @@ impl Scaler {
         let dst_ch = dst_h.div_ceil(2);
         let src_cw = use_w.div_ceil(2);
         let src_ch = use_h.div_ceil(2);
+
+        // The configured destination size is caller-supplied: make sure the
+        // three output planes can actually be allocated before trying.
+        Self::validate_output_size(dst_w, dst_h, 1)?;
+        Self::validate_output_size(dst_cw, dst_ch, 1)?;
 
         // Allocations go through checked arithmetic so pathological sizes report
         // an error instead of aborting on allocation overflow.
@@ -1816,6 +1956,148 @@ mod tests {
         let mut no_linesize = make_rgb24_frame(8, 8, 1, 2, 3);
         no_linesize.linesize.clear();
         assert!(scaler.scale(&no_linesize).is_err());
+    }
+
+    #[test]
+    fn rgb24_scaler_rejects_a_bgr24_frame() {
+        // Review finding: a BGR red pixel (0,0,255) fed to an Rgb24→Rgba scaler
+        // came out as RGBA blue, because only the config was checked.
+        let mut bgr = Frame::new_video(1, 1, PixelFormat::Bgr24);
+        bgr.data = vec![vec![0, 0, 255]];
+        bgr.linesize = vec![3];
+        let scaler =
+            Scaler::new(ScalerConfig::new(1, 1, PixelFormat::Rgb24, 1, 1, PixelFormat::Rgba))
+                .unwrap();
+        let err = scaler
+            .scale(&bgr)
+            .expect_err("a Bgr24 frame must not be read as Rgb24");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+
+        // The correctly labelled frame still converts, with the colours intact.
+        let mut rgb = Frame::new_video(1, 1, PixelFormat::Rgb24);
+        rgb.data = vec![vec![255, 0, 0]];
+        rgb.linesize = vec![3];
+        let out = scaler.scale(&rgb).unwrap();
+        assert_eq!(out.data[0], vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rgb24_scaler_rejects_stride_shorter_than_a_pixel_row() {
+        // Review finding: 2x2 RGB24 with linesize 3 made row 1 start inside row
+        // 0, duplicating pixels (a 2-pixel row needs 6 bytes).
+        let mut overlap = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        overlap.data = vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9]];
+        overlap.linesize = vec![3];
+        let scaler =
+            Scaler::new(ScalerConfig::new(2, 2, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgba))
+                .unwrap();
+        let err = scaler
+            .scale(&overlap)
+            .expect_err("a stride shorter than the pixel row must be rejected");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+
+        // With a correct stride the same data converts and rows stay distinct.
+        overlap.data = vec![vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]];
+        overlap.linesize = vec![6];
+        let out = scaler.scale(&overlap).unwrap();
+        assert_eq!(out.data[0].len(), 2 * 2 * 4);
+        assert_eq!(&out.data[0][0..4], &[1, 2, 3, 255]);
+        assert_eq!(&out.data[0][4..8], &[4, 5, 6, 255]);
+        assert_eq!(&out.data[0][8..12], &[7, 8, 9, 255]);
+        assert_eq!(&out.data[0][12..16], &[10, 11, 12, 255]);
+    }
+
+    #[test]
+    fn planar_paths_reject_stride_shorter_than_a_plane_row() {
+        // YUV420P with linesize 2 for an 8-wide luma plane: rows would overlap.
+        let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 8, 4, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut frame = make_yuv420p_frame(8, 4, 16, 128, 128);
+        frame.linesize[0] = 2;
+        assert!(scaler.scale(&frame).is_err(), "luma stride must cover a row");
+
+        // Chroma stride smaller than the chroma row.
+        let mut frame = make_yuv420p_frame(8, 4, 16, 128, 128);
+        frame.linesize[1] = 1;
+        assert!(scaler.scale(&frame).is_err(), "chroma stride must cover a row");
+
+        // Same for the Yuv420P → Yuv420P path.
+        let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv420P, 4, 2, PixelFormat::Yuv420P);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut frame = make_yuv420p_frame(8, 4, 16, 128, 128);
+        frame.linesize[2] = 1;
+        assert!(scaler.scale(&frame).is_err());
+
+        // NV12 / Yuv422P paths.
+        let cfg = ScalerConfig::new(8, 4, PixelFormat::Nv12, 4, 2, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut nv12 = make_nv12_frame(8, 4, 16, 128, 128);
+        nv12.linesize[1] = 2; // needs 8 bytes for 4 interleaved chroma pairs
+        assert!(scaler.scale(&nv12).is_err());
+
+        let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv422P, 4, 2, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut yuv422 = make_yuv422p_frame(8, 4, 16, 128, 128);
+        yuv422.linesize[1] = 1;
+        assert!(scaler.scale(&yuv422).is_err());
+    }
+
+    #[test]
+    fn wrong_frame_format_is_rejected_on_every_source_path() {
+        // A frame carrying a different format than the config must never be
+        // reinterpreted with the configured layout.
+        let cases = [
+            (
+                ScalerConfig::new(4, 4, PixelFormat::Yuv420P, 4, 4, PixelFormat::Rgba),
+                make_nv12_frame(4, 4, 16, 128, 128),
+            ),
+            (
+                ScalerConfig::new(4, 4, PixelFormat::Nv12, 4, 4, PixelFormat::Rgba),
+                make_yuv420p_frame(4, 4, 16, 128, 128),
+            ),
+            (
+                ScalerConfig::new(4, 4, PixelFormat::Yuv422P, 4, 4, PixelFormat::Rgba),
+                make_yuv420p_frame(4, 4, 16, 128, 128),
+            ),
+        ];
+        for (cfg, frame) in cases {
+            let scaler = Scaler::new(cfg).unwrap();
+            let err = scaler
+                .scale(&frame)
+                .expect_err("mismatched frame format must be rejected");
+            assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        }
+
+        // Yuv420P → Yuv420P with a *different* size goes through the resampling
+        // path (a same-size pair is the documented no-op copy).
+        let scaler =
+            Scaler::new(ScalerConfig::new(4, 4, PixelFormat::Yuv420P, 2, 2, PixelFormat::Yuv420P))
+                .unwrap();
+        let nv12 = make_nv12_frame(4, 4, 16, 128, 128);
+        let err = scaler
+            .scale(&nv12)
+            .expect_err("mismatched frame format must be rejected when resizing");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn output_size_overflow_is_reported_not_allocated() {
+        // A gigantic destination must report an error instead of attempting an
+        // impossible allocation (usize overflow on 32-bit, OOM everywhere).
+        let cfg = ScalerConfig::new(
+            4,
+            4,
+            PixelFormat::Rgb24,
+            u32::MAX,
+            u32::MAX,
+            PixelFormat::Rgba,
+        );
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_rgb24_frame(4, 4, 1, 2, 3);
+        let err = scaler
+            .scale(&frame)
+            .expect_err("an unallocatable output size must be rejected");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
     }
 
 
