@@ -88,8 +88,10 @@ impl InputFormat for AVIDemuxer {
                     ctx.streams.push(stream);
                     stream_index += 1;
 
-                    // Skip remaining data (strh is typically 56 bytes, we read 48)
-                    let remaining = padded_size as i64 - 48;
+                    // Skip remaining data (strh is typically 56 bytes, we read 48).
+                    // Saturating: a truncated/hostile chunk_size < 48 must not
+                    // underflow (panic in debug) or seek backwards.
+                    let remaining = (padded_size.saturating_sub(48)) as i64;
                     if remaining > 0 {
                         io.seek(SeekFrom::Current(remaining))?;
                     }
@@ -110,7 +112,8 @@ impl InputFormat for AVIDemuxer {
                     let mut list_type = [0u8; 4];
                     if io.read_exact(&mut list_type).is_ok() {
                         // Subtract the 4 bytes we just read from remaining
-                        let list_remaining = padded_size - 4;
+                        // (saturating: padded_size may legitimately be < 4).
+                        let list_remaining = padded_size.saturating_sub(4);
                         if list_remaining > 0 {
                             io.seek(SeekFrom::Current(list_remaining as i64))?;
                         }

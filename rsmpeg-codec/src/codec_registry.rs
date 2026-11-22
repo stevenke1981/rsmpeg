@@ -58,9 +58,23 @@ pub fn register_builtin_codecs() {
     use crate::codec_impls::*;
     use rsmpeg_util::SampleFormat;
 
-    let mut registry = global_codec_registry()
-        .write()
-        .expect("codec registry lock poisoned");
+    // Never panic during start-up registration: if the lock is poisoned the
+    // registry is unusable anyway, so recover the guard and log instead of
+    // aborting the process.
+    let mut registry = match global_codec_registry().write() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!("codec registry lock poisoned; recovering to finish registration");
+            poisoned.into_inner()
+        }
+    };
+
+    // Registration is idempotent by construction (fresh registry per process),
+    // but guard against a second call adding duplicates.
+    if !registry.is_empty() {
+        tracing::debug!("built-in codecs already registered; skipping");
+        return;
+    }
 
     // Register raw video codec
     registry.register(Box::new(RawVideoCodec));

@@ -38,8 +38,15 @@ impl CropFilter {
         if w == 0 || h == 0 {
             return;
         }
-        let src = &frame.data[0];
         let stride = 4usize;
+        // Refuse to read outside the packed RGBA plane: a missing or truncated
+        // plane leaves the frame unchanged instead of panicking.
+        let Some(src) = frame.data.first() else {
+            return;
+        };
+        if src.len() < sw * sh * stride {
+            return;
+        }
         let mut out = vec![0u8; w * h * stride];
         for row in 0..h {
             let s_row = (y + row) * sw * stride + x * stride;

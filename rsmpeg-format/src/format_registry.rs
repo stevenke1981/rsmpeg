@@ -75,9 +75,21 @@ pub fn global_format_registry() -> &'static RwLock<FormatRegistry> {
 
 pub fn register_builtin_formats() {
     use crate::demuxers::*;
-    let mut registry = global_format_registry()
-        .write()
-        .expect("format registry lock poisoned");
+    // Recover from a poisoned lock (another thread panicked while holding it)
+    // instead of aborting start-up.
+    let mut registry = match global_format_registry().write() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!("format registry lock poisoned; recovering to finish registration");
+            poisoned.into_inner()
+        }
+    };
+
+    // Make repeated calls harmless instead of stacking duplicate demuxers.
+    if !registry.demuxers().is_empty() {
+        tracing::debug!("built-in formats already registered; skipping");
+        return;
+    }
 
     registry.register_demuxer(Box::new(MP4Demuxer::default()));
     registry.register_demuxer(Box::new(MKVDemuxer));

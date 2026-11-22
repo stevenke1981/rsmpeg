@@ -122,7 +122,13 @@ fn cmd_probe(input: &str, json: bool, verbose: bool) {
                     "bit_rate": ctx.bit_rate,
                     "streams": streams,
                 });
-                println!("{}", serde_json::to_string_pretty(&info).unwrap());
+                match serde_json::to_string_pretty(&info) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("Error serialising media info to JSON: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 println!();
                 println!("═══ Media Info ═══");
@@ -166,26 +172,24 @@ fn cmd_probe(input: &str, json: bool, verbose: bool) {
                             stream.duration,
                             stream.duration_seconds()
                         );
-                        if stream.codec_params.bit_rate.unwrap_or(0) > 0 {
-                            println!(
-                                "     Bitrate:   {} bps",
-                                stream.codec_params.bit_rate.unwrap()
-                            );
+                        // `if let` + shadowed value: the previous
+                        // `unwrap_or(0) > 0` guard followed by `unwrap()` was
+                        // correct but easy to break when the guard changed.
+                        if let Some(bit_rate) = stream.codec_params.bit_rate.filter(|b| *b > 0) {
+                            println!("     Bitrate:   {} bps", bit_rate);
                         }
-                        if stream.codec_params.width.unwrap_or(0) > 0 {
-                            println!("     Width:     {}", stream.codec_params.width.unwrap());
+                        if let Some(width) = stream.codec_params.width.filter(|w| *w > 0) {
+                            println!("     Width:     {}", width);
                         }
-                        if stream.codec_params.height.unwrap_or(0) > 0 {
-                            println!("     Height:    {}", stream.codec_params.height.unwrap());
+                        if let Some(height) = stream.codec_params.height.filter(|h| *h > 0) {
+                            println!("     Height:    {}", height);
                         }
-                        if stream.codec_params.sample_rate.unwrap_or(0) > 0 {
-                            println!(
-                                "     SampleRate: {} Hz",
-                                stream.codec_params.sample_rate.unwrap()
-                            );
+                        if let Some(sample_rate) = stream.codec_params.sample_rate.filter(|s| *s > 0)
+                        {
+                            println!("     SampleRate: {} Hz", sample_rate);
                         }
-                        if stream.codec_params.channels.unwrap_or(0) > 0 {
-                            println!("     Channels:  {}", stream.codec_params.channels.unwrap());
+                        if let Some(channels) = stream.codec_params.channels.filter(|c| *c > 0) {
+                            println!("     Channels:  {}", channels);
                         }
                         if let Some(fmt) = stream.codec_params.sample_format {
                             println!("     SampleFmt: {:?}", fmt);

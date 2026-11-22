@@ -25,23 +25,34 @@ impl FramePool {
 
     /// Acquire a buffer with at least `capacity` bytes. Reuses a pooled buffer
     /// when one with sufficient capacity is available; otherwise allocates.
+    ///
+    /// A poisoned mutex must not take down the decode thread: the pool is a
+    /// pure cache, so on poisoning we simply hand out a fresh buffer.
     pub fn get(&self, capacity: usize) -> Vec<u8> {
-        let mut g = self.pool.lock().unwrap();
-        if let Some(mut buf) = g.pop_front() {
-            buf.clear();
-            if buf.capacity() >= capacity {
-                return buf;
+        match self.pool.lock() {
+            Ok(mut g) => {
+                while let Some(mut buf) = g.pop_front() {
+                    buf.clear();
+                    if buf.capacity() >= capacity {
+                        return buf;
+                    }
+                }
+                Vec::with_capacity(capacity)
             }
+            Err(_) => Vec::with_capacity(capacity),
         }
-        Vec::with_capacity(capacity)
     }
 
     /// Return a buffer to the pool (if under the memory budget).
+    ///
+    /// Silently drops the buffer when the pool lock is poisoned.
     pub fn recycle(&self, mut buf: Vec<u8>) {
         let used = buf.capacity();
-        let mut g = self.pool.lock().unwrap();
+        let Ok(mut g) = self.pool.lock() else {
+            return;
+        };
         let total: usize = g.iter().map(|b| b.capacity()).sum();
-        if total + used <= self.max_bytes {
+        if total.saturating_add(used) <= self.max_bytes {
             buf.clear();
             g.push_back(buf);
         }

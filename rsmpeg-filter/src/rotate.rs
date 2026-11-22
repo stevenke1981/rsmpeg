@@ -30,8 +30,15 @@ impl RotateFilter {
         }
         let dw = sh;
         let dh = sw;
-        let src = &frame.data[0];
         let stride = 4usize;
+        // Bail out on a missing or truncated packed RGBA plane rather than
+        // indexing past its end.
+        let Some(src) = frame.data.first() else {
+            return;
+        };
+        if src.len() < sw * sh * stride {
+            return;
+        }
         let mut out = vec![0u8; dw * dh * stride];
         for dy in 0..dh {
             for dx in 0..dw {

@@ -19,7 +19,10 @@ impl GrayscaleFilter {
     /// the alpha channel is left untouched. For RGBA, `frame.data[0]` is a single
     /// tightly-packed plane with a 4-byte stride (R, G, B, A).
     pub fn apply(&self, frame: &mut Frame) {
-        let buf = &mut frame.data[0];
+        // A frame with no plane is a no-op (previously panicked).
+        let Some(buf) = frame.data.first_mut() else {
+            return;
+        };
         let mut i = 0usize;
         while i + 3 < buf.len() {
             let r = buf[i] as f32;

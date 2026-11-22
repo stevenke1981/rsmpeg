@@ -37,20 +37,24 @@ pub fn yuv420p_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
     // borrow — `scale` returns an owned `Frame`, so no borrow conflict arises.
     let out = CACHE.with(|c| -> RsResult<Frame> {
         let mut guard = c.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(e) = guard.entry(key) {
-            let config = ScalerConfig::new(
-                frame.width as u32,
-                frame.height as u32,
-                PixelFormat::Yuv420P,
-                frame.width as u32,
-                frame.height as u32,
-                PixelFormat::Rgba,
-            );
-            let scaler = Scaler::new(config)?;
-            e.insert(scaler);
+        // Build once per resolution, then reuse. `Scaler::new` can fail, so we
+        // cannot use `or_insert_with`; the entry is created only on the vacant
+        // path and the borrow below never needs an `expect`/`unwrap`.
+        match guard.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut().scale(frame),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let config = ScalerConfig::new(
+                    frame.width as u32,
+                    frame.height as u32,
+                    PixelFormat::Yuv420P,
+                    frame.width as u32,
+                    frame.height as u32,
+                    PixelFormat::Rgba,
+                );
+                let scaler = Scaler::new(config)?;
+                e.insert(scaler).scale(frame)
+            }
         }
-        let scaler = guard.get(&key).expect("scaler just inserted for key");
-        scaler.scale(frame)
     })?;
 
     out.data

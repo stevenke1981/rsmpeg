@@ -61,8 +61,9 @@ impl InputFormat for WAVDemuxer {
         let block_align = io.read_u16_le()?;
         let bits_per_sample = io.read_u16_le()?;
 
-        // Skip remaining fmt chunk data (if any)
-        let fmt_data_size = chunk_size as u64 - 16;
+        // Skip remaining fmt chunk data (if any). A malformed `chunk_size < 16`
+        // must not underflow (which panics in debug builds).
+        let fmt_data_size = (chunk_size as u64).saturating_sub(16);
         if fmt_data_size > 0 {
             io.seek(SeekFrom::Current(fmt_data_size as i64))?;
         }
@@ -90,7 +91,10 @@ impl InputFormat for WAVDemuxer {
         let frame_size = bytes_per_sample * channels as u64;
 
         let duration_ms = if sample_rate > 0 && frame_size > 0 {
-            (data_size * 1000 / (sample_rate as u64 * frame_size)) as i64
+            // `data_size * 1000` can overflow u64 for multi-exabyte claims; use a
+            // widening multiply and clamp into the i64 the API exposes.
+            let ms = (data_size as u128 * 1000) / (sample_rate as u128 * frame_size as u128);
+            ms.min(i64::MAX as u128) as i64
         } else {
             0
         };
@@ -148,15 +152,17 @@ impl InputFormat for WAVDemuxer {
             .as_mut()
             .ok_or_else(|| RsError::InvalidData("No IO context".into()))?;
 
-        let to_read = (self.packet_bytes as u64).min(self.data_remaining) as usize;
-        // Align to block boundary
-        let to_read = (to_read / self.block_align as usize * self.block_align as usize).max(
-            if self.data_remaining as usize >= self.block_align as usize {
-                self.block_align as usize
-            } else {
-                self.data_remaining as usize
-            },
-        );
+        let align = self.block_align.max(1) as u64;
+        let to_read = (self.packet_bytes as u64).min(self.data_remaining);
+        // Whole blocks only, but always make progress: if a partial block is all
+        // that is left, hand it out so the caller reaches EOF.
+        let aligned = to_read / align * align;
+        let floor = if self.data_remaining >= align {
+            align
+        } else {
+            self.data_remaining
+        };
+        let to_read = aligned.max(floor) as usize;
         if to_read == 0 {
             self.data_remaining = 0;
             return Ok(None);

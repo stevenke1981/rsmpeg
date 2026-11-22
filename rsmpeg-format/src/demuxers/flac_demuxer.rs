@@ -67,7 +67,14 @@ impl InputFormat for FLACDemuxer {
         }
 
         // --- Read STREAMINFO block (34 bytes) ---
+        // A short STREAMINFO block is malformed: report it instead of indexing
+        // past the end of the buffer below.
         let info = io.read_bytes(34)?;
+        if info.len() < 34 {
+            return Err(RsError::InvalidData(
+                "FLAC: STREAMINFO block is truncated".into(),
+            ));
+        }
 
         // Sample rate: 20 bits spanning bytes 10, 11, upper nibble of byte 12
         //   byte[10] = bits 19-12

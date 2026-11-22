@@ -11,8 +11,13 @@ pub fn samples_to_duration(samples: u64, timescale: u64) -> Duration {
     }
     let secs = samples / timescale;
     let rem = samples % timescale;
-    // sub-second remainder as nanoseconds (always < 1_000_000_000, fits u32)
-    let nanos = u32::try_from((rem as u128 * 1_000_000_000 / timescale as u128) as u64).unwrap();
+    // Sub-second remainder as nanoseconds. The 128-bit intermediate prevents the
+    // overflow that `rem * 1_000_000_000` would hit for large timescales, and the
+    // result is always < 1e9 so the `u32` conversion cannot fail — saturate
+    // instead of `unwrap()` so a pathological input can never panic.
+    let nanos = u32::try_from(rem as u128 * 1_000_000_000 / timescale as u128)
+        .unwrap_or(u32::MAX)
+        .min(999_999_999);
     Duration::new(secs, nanos)
 }
 

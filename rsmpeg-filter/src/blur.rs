@@ -29,8 +29,16 @@ impl BoxBlurFilter {
         if w == 0 || h == 0 {
             return;
         }
-        let src = &frame.data[0];
         let stride = 4usize;
+        // A frame without a packed RGBA plane (or with a plane shorter than the
+        // declared geometry) cannot be blurred; leave it untouched instead of
+        // panicking on the index.
+        let Some(src) = frame.data.first() else {
+            return;
+        };
+        if src.len() < w * h * stride {
+            return;
+        }
         let mut out = vec![0u8; w * h * stride];
         for y in 0..h {
             for x in 0..w {

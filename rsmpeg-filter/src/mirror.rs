@@ -25,8 +25,15 @@ impl MirrorFilter {
         if w == 0 || h == 0 {
             return;
         }
-        let buf = &mut frame.data[0];
         let stride = 4usize;
+        // Guard against a frame with no plane / a truncated plane so a malformed
+        // input cannot panic the playback thread.
+        let Some(buf) = frame.data.first_mut() else {
+            return;
+        };
+        if buf.len() < w * h * stride {
+            return;
+        }
         for y in 0..h {
             let row = y * w * stride;
             for x in 0..w / 2 {
