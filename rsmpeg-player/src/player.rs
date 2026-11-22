@@ -3,9 +3,10 @@
 //! Hosts only send commands and poll events.  Demux/decode never run on the
 //! calling thread.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -15,43 +16,89 @@ use crate::event::{PlayerEvent, PlayerSnapshot};
 
 const CMD_CAPACITY: usize = 64;
 const EVT_CAPACITY: usize = 128;
+const CONTROL_EVT_CAPACITY: usize = 256;
 const TERMINAL_EVT_CAPACITY: usize = 8;
 
-/// Bounded event sender with a dedicated non-droppable terminal lane for
-/// [`PlayerEvent::Ended`] and [`PlayerEvent::Error`].
+/// Multi-lane non-blocking event sender with global sequence ordering.
+///
+/// - `stream` (`EVT_CAPACITY = 128`): high-frequency telemetry (`VideoFrame`,
+///   `PositionChanged`, `AudioLevel`, `Warning`) that drops cleanly under
+///   backpressure.
+/// - `control` (`CONTROL_EVT_CAPACITY = 256`, drop-oldest): control replies
+///   (`Snapshot`, `SeekCompleted`, `Tracks`) isolated from frame floods so
+///   host/GUI state never desynchronizes when polling lags.
+/// - `terminal` (`TERMINAL_EVT_CAPACITY = 8`): terminal lifecycle events
+///   (`Ended`, `Error`) that can never be evicted by frames or control replies.
 #[derive(Clone)]
-pub(crate) struct EventSender {
-    normal: mpsc::SyncSender<PlayerEvent>,
-    terminal: Option<mpsc::SyncSender<PlayerEvent>>,
+pub(crate) enum EventSender {
+    Multi {
+        next_seq: Arc<AtomicU64>,
+        stream: mpsc::SyncSender<(u64, PlayerEvent)>,
+        control: Arc<Mutex<VecDeque<(u64, PlayerEvent)>>>,
+        terminal: mpsc::SyncSender<(u64, PlayerEvent)>,
+    },
+    Single(mpsc::SyncSender<PlayerEvent>),
 }
 
 impl EventSender {
     pub(crate) fn new(
-        normal: mpsc::SyncSender<PlayerEvent>,
-        terminal: mpsc::SyncSender<PlayerEvent>,
+        stream: mpsc::SyncSender<(u64, PlayerEvent)>,
+        control: Arc<Mutex<VecDeque<(u64, PlayerEvent)>>>,
+        terminal: mpsc::SyncSender<(u64, PlayerEvent)>,
     ) -> Self {
-        Self {
-            normal,
-            terminal: Some(terminal),
+        Self::Multi {
+            next_seq: Arc::new(AtomicU64::new(0)),
+            stream,
+            control,
+            terminal,
         }
     }
 
     pub(crate) fn single(normal: mpsc::SyncSender<PlayerEvent>) -> Self {
-        Self {
-            normal,
-            terminal: None,
-        }
+        Self::Single(normal)
     }
 
-    /// Non-blocking emit. Streaming events drop cleanly when `normal` is full,
-    /// while terminal lifecycle events (`Ended`, `Error`) fall back to the
-    /// dedicated `terminal` lane so frames can never evict them.
+    /// Non-blocking emit preserving chronological order across lanes via `seq`.
     pub(crate) fn send(&self, ev: PlayerEvent) {
-        let is_terminal = matches!(ev, PlayerEvent::Ended { .. } | PlayerEvent::Error { .. });
-        if let Err(mpsc::TrySendError::Full(ev)) = self.normal.try_send(ev) {
-            if is_terminal {
-                if let Some(ref terminal) = self.terminal {
-                    let _ = terminal.try_send(ev);
+        match self {
+            Self::Single(tx) => {
+                let _ = tx.try_send(ev);
+            }
+            Self::Multi {
+                next_seq,
+                stream,
+                control,
+                terminal,
+            } => {
+                let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                match ev {
+                    PlayerEvent::Ended { .. } | PlayerEvent::Error { .. } => {
+                        let _ = terminal.try_send((seq, ev));
+                    }
+                    PlayerEvent::Snapshot(_)
+                    | PlayerEvent::SeekCompleted { .. }
+                    | PlayerEvent::Tracks { .. } => {
+                        if let Ok(mut q) = control.lock() {
+                            if q.len() >= CONTROL_EVT_CAPACITY {
+                                // Prefer evicting an older Snapshot before Tracks/SeekCompleted.
+                                if let Some(pos) = q
+                                    .iter()
+                                    .position(|(_, e)| matches!(e, PlayerEvent::Snapshot(_)))
+                                {
+                                    q.remove(pos);
+                                } else {
+                                    q.pop_front();
+                                }
+                            }
+                            q.push_back((seq, ev));
+                        }
+                    }
+                    PlayerEvent::VideoFrame { .. }
+                    | PlayerEvent::PositionChanged { .. }
+                    | PlayerEvent::AudioLevel { .. }
+                    | PlayerEvent::Warning { .. } => {
+                        let _ = stream.try_send((seq, ev));
+                    }
                 }
             }
         }
@@ -169,8 +216,12 @@ pub struct Player {
     duration: Duration,
     playing: bool,
     cmd_tx: mpsc::SyncSender<PlayerCommand>,
-    event_rx: mpsc::Receiver<PlayerEvent>,
-    terminal_rx: mpsc::Receiver<PlayerEvent>,
+    event_rx: mpsc::Receiver<(u64, PlayerEvent)>,
+    control_rx: Arc<Mutex<VecDeque<(u64, PlayerEvent)>>>,
+    terminal_rx: mpsc::Receiver<(u64, PlayerEvent)>,
+    peek_stream: Option<(u64, PlayerEvent)>,
+    peek_control: Option<(u64, PlayerEvent)>,
+    peek_terminal: Option<(u64, PlayerEvent)>,
     handle: Option<thread::JoinHandle<()>>,
     shut_down: bool,
     last_error: Option<String>,
@@ -186,6 +237,7 @@ impl Player {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
+        let control_queue = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
         let (terminal_tx, terminal_rx) = mpsc::sync_channel(TERMINAL_EVT_CAPACITY);
         let rate = clamp_playback_rate(playback_rate);
         let handle = demux_worker::spawn_worker_with_sender(
@@ -193,7 +245,7 @@ impl Player {
             volume,
             prefer_native,
             cmd_rx,
-            EventSender::new(event_tx, terminal_tx),
+            EventSender::new(event_tx, Arc::clone(&control_queue), terminal_tx),
         );
 
         let player = Self {
@@ -208,7 +260,11 @@ impl Player {
             playing: autoplay,
             cmd_tx,
             event_rx,
+            control_rx: control_queue,
             terminal_rx,
+            peek_stream: None,
+            peek_control: None,
+            peek_terminal: None,
             handle: Some(handle),
             shut_down: false,
             last_error: None,
@@ -383,16 +439,36 @@ impl Player {
         Ok(())
     }
 
-    /// Poll one outbound event (non-blocking) and update local cache.
-    ///
-    /// Drains normal events first, then falls back to the dedicated terminal
-    /// lane so `Ended` / `Error` are always delivered after buffered frames.
+    /// Poll one outbound event (non-blocking) in global chronological sequence
+    /// order across the streaming, control-reply, and terminal lanes.
     pub fn poll_event(&mut self) -> Option<PlayerEvent> {
-        let ev = self
-            .event_rx
-            .try_recv()
-            .ok()
-            .or_else(|| self.terminal_rx.try_recv().ok())?;
+        if self.peek_stream.is_none() {
+            self.peek_stream = self.event_rx.try_recv().ok();
+        }
+        if self.peek_control.is_none() {
+            if let Ok(mut q) = self.control_rx.lock() {
+                self.peek_control = q.pop_front();
+            }
+        }
+        if self.peek_terminal.is_none() {
+            self.peek_terminal = self.terminal_rx.try_recv().ok();
+        }
+
+        let winner = [
+            (0u8, self.peek_stream.as_ref().map(|(s, _)| *s)),
+            (1u8, self.peek_control.as_ref().map(|(s, _)| *s)),
+            (2u8, self.peek_terminal.as_ref().map(|(s, _)| *s)),
+        ]
+        .into_iter()
+        .filter_map(|(lane, seq)| seq.map(|s| (s, lane)))
+        .min_by_key(|(s, _)| *s)
+        .map(|(_, lane)| lane)?;
+
+        let (_, ev) = match winner {
+            0 => self.peek_stream.take()?,
+            1 => self.peek_control.take()?,
+            _ => self.peek_terminal.take()?,
+        };
         self.apply_event(&ev);
         Some(ev)
     }
@@ -489,6 +565,7 @@ mod tests {
     fn make_channel_player() -> (Player, mpsc::Receiver<PlayerCommand>, EventSender) {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVT_CAPACITY);
+        let control_queue = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
         let (terminal_tx, terminal_rx) = mpsc::sync_channel(TERMINAL_EVT_CAPACITY);
         let player = Player {
             path: PathBuf::from("synthetic.mp4"),
@@ -502,12 +579,20 @@ mod tests {
             playing: true,
             cmd_tx,
             event_rx,
+            control_rx: Arc::clone(&control_queue),
             terminal_rx,
+            peek_stream: None,
+            peek_control: None,
+            peek_terminal: None,
             handle: None,
             shut_down: false,
             last_error: None,
         };
-        (player, cmd_rx, EventSender::new(event_tx, terminal_tx))
+        (
+            player,
+            cmd_rx,
+            EventSender::new(event_tx, control_queue, terminal_tx),
+        )
     }
 
     #[test]
@@ -684,5 +769,82 @@ mod tests {
         }
         assert!(saw_error, "Error must never be dropped by full event queue");
         assert_eq!(p2.state(), PlayerState::Error);
+    }
+
+    #[test]
+    fn saturated_stream_still_delivers_all_control_replies_in_chronological_order() {
+        let (mut p, _rx, evt_tx) = make_channel_player();
+        // Saturate the 128-slot streaming lane with stale frames/positions.
+        for i in 0..(EVT_CAPACITY + 64) {
+            evt_tx.send(PlayerEvent::PositionChanged {
+                position: Duration::from_millis(i as u64),
+                generation: 1,
+            });
+        }
+        // Emit control replies after stream saturation (pause, seek, track switch, rate, volume).
+        evt_tx.send(PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: false,
+            position: Duration::from_secs(1),
+            duration: Duration::from_secs(10),
+            volume: 0.8,
+            generation: 1,
+            status: "paused".into(),
+        }));
+        evt_tx.send(PlayerEvent::SeekCompleted {
+            position: Duration::from_secs(7),
+            generation: 2,
+        });
+        evt_tx.send(PlayerEvent::Tracks {
+            video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            active_video: None,
+            active_audio: Some(3),
+            generation: 3,
+        });
+        evt_tx.send(PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: false,
+            position: Duration::from_secs(7),
+            duration: Duration::from_secs(10),
+            volume: 0.8,
+            generation: 3,
+            status: "rate".into(),
+        }));
+        evt_tx.send(PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: false,
+            position: Duration::from_secs(7),
+            duration: Duration::from_secs(10),
+            volume: 0.25,
+            generation: 3,
+            status: "volume".into(),
+        }));
+
+        let mut drained = Vec::new();
+        while let Some(ev) = p.poll_event() {
+            drained.push(ev);
+        }
+        assert_eq!(drained.len(), EVT_CAPACITY + 5);
+        // The 5 control replies must arrive strictly AFTER the 128 older streaming events
+        // and in exact chronological order.
+        let tail = &drained[EVT_CAPACITY..];
+        assert!(matches!(&tail[0], PlayerEvent::Snapshot(s) if s.status == "paused"));
+        assert!(matches!(
+            &tail[1],
+            PlayerEvent::SeekCompleted { position, generation: 2 } if *position == Duration::from_secs(7)
+        ));
+        assert!(matches!(
+            &tail[2],
+            PlayerEvent::Tracks {
+                active_audio: Some(3),
+                generation: 3,
+                ..
+            }
+        ));
+        assert!(matches!(&tail[3], PlayerEvent::Snapshot(s) if s.status == "rate"));
+        assert!(
+            matches!(&tail[4], PlayerEvent::Snapshot(s) if s.status == "volume" && (s.volume - 0.25).abs() < 1e-6)
+        );
+        assert!(!p.is_playing());
+        assert_eq!(p.position(), Duration::from_secs(7));
+        assert!((p.volume() - 0.25).abs() < 1e-6);
     }
 }

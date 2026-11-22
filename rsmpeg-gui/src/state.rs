@@ -102,6 +102,7 @@ pub struct PlaybackUiState {
     pub audio_tracks: Vec<PlayerTrackInfo>,
     pub active_video_track: Option<usize>,
     pub active_audio_track: Option<usize>,
+    last_event_generation: u64,
     pub is_fullscreen: bool,
     pub is_probing: bool,
     pub playlist: Playlist,
@@ -145,6 +146,7 @@ impl PlaybackUiState {
             audio_tracks: Vec::new(),
             active_video_track: None,
             active_audio_track: None,
+            last_event_generation: 0,
             is_fullscreen: false,
             is_probing: false,
             playlist: Playlist::new(),
@@ -174,6 +176,7 @@ impl PlaybackUiState {
         self.audio_tracks.clear();
         self.active_video_track = None;
         self.active_audio_track = None;
+        self.last_event_generation = 0;
         self.is_probing = true;
         self.reset_waveform();
     }
@@ -350,6 +353,12 @@ impl PlaybackUiState {
     pub fn clear_pending_controls(&mut self) {
         self.pending_volume = None;
         self.pending_playback_rate = None;
+        self.last_event_generation = 0;
+    }
+
+    /// Whether an event generation is current (not older than an already-applied control reply).
+    pub fn is_fresh_generation(&self, generation: u64) -> bool {
+        generation == 0 || generation >= self.last_event_generation
     }
 
     /// Surface a failed player command as a localized warning banner without altering playback state.
@@ -477,6 +486,12 @@ impl PlaybackUiState {
 
     /// Apply a [`PlayerEvent`] emitted by `rsmpeg-player`.
     pub fn apply_player_event(&mut self, ev: &PlayerEvent) -> EventOutcome {
+        let ev_gen = ev.generation();
+        let is_stale = ev_gen > 0 && ev_gen < self.last_event_generation;
+        if ev_gen > self.last_event_generation {
+            self.last_event_generation = ev_gen;
+        }
+
         match ev {
             PlayerEvent::Snapshot(snap) => {
                 if !snap.duration.is_zero() {
@@ -485,7 +500,7 @@ impl PlaybackUiState {
                         info.update_duration_if_missing(snap.duration);
                     }
                 }
-                if !self.scrubbing {
+                if !self.scrubbing && !is_stale {
                     self.position = snap.position;
                 }
                 if snap.status == "rate" {
@@ -505,7 +520,10 @@ impl PlaybackUiState {
                 }
                 if snap.playing {
                     self.status = PlaybackStatus::Playing;
-                } else if snap.status == "paused" || snap.status == "seeked" {
+                } else if matches!(
+                    snap.status.as_str(),
+                    "paused" | "seeked" | "rate" | "volume" | "audio-track" | "video-track"
+                ) {
                     self.status = PlaybackStatus::Paused;
                 } else if snap.status == "stopped" {
                     self.status = PlaybackStatus::Stopped;
@@ -515,7 +533,7 @@ impl PlaybackUiState {
                 EventOutcome::None
             }
             PlayerEvent::PositionChanged { position, .. } => {
-                if !self.scrubbing {
+                if !self.scrubbing && !is_stale {
                     self.position = *position;
                 }
                 EventOutcome::None
@@ -523,6 +541,9 @@ impl PlaybackUiState {
             PlayerEvent::VideoFrame {
                 width, height, pts, ..
             } => {
+                if is_stale {
+                    return EventOutcome::None;
+                }
                 self.has_video_frame = true;
                 self.video_resolution = Some((*width, *height));
                 if !self.scrubbing {
@@ -1127,5 +1148,38 @@ mod tests {
             status: "volume".into(),
         }));
         assert!(st.muted);
+
+        // Stale-generation VideoFrame applied after newer SeekCompleted/Snapshot must NOT
+        // overwrite confirmed position or status.
+        st.apply_player_event(&PlayerEvent::SeekCompleted {
+            position: Duration::from_secs(7),
+            generation: 2,
+        });
+        st.apply_player_event(&PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: false,
+            position: Duration::from_secs(7),
+            duration: Duration::from_secs(10),
+            volume: 0.25,
+            generation: 3,
+            status: "volume".into(),
+        }));
+        assert_eq!(st.status, PlaybackStatus::Paused);
+        assert_eq!(st.position, Duration::from_secs(7));
+        assert!(!st.is_fresh_generation(1));
+        assert!(st.is_fresh_generation(3));
+
+        st.apply_player_event(&PlayerEvent::VideoFrame {
+            width: 1280,
+            height: 720,
+            rgba: Arc::new(vec![0; 4]),
+            pts: Duration::from_millis(1875),
+            generation: 1,
+        });
+        assert_eq!(
+            st.position,
+            Duration::from_secs(7),
+            "stale pre-seek VideoFrame must not revert confirmed seek position"
+        );
+        assert_eq!(st.status, PlaybackStatus::Paused);
     }
 }

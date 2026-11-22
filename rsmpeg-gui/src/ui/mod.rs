@@ -736,18 +736,20 @@ impl PlayerView {
             }
 
             if let Some(frame_ev) = latest_frame {
-                changed = true;
-                self.state.apply_player_event(&frame_ev);
-                if let PlayerEvent::VideoFrame {
-                    width,
-                    height,
-                    rgba,
-                    ..
-                } = frame_ev
-                {
-                    if let Some(next_img) = build_render_image(width, height, &rgba) {
-                        if let Some(old_img) = self.current_frame.replace(next_img) {
-                            let _ = window.drop_image(old_img);
+                if self.state.is_fresh_generation(frame_ev.generation()) {
+                    changed = true;
+                    self.state.apply_player_event(&frame_ev);
+                    if let PlayerEvent::VideoFrame {
+                        width,
+                        height,
+                        rgba,
+                        ..
+                    } = frame_ev
+                    {
+                        if let Some(next_img) = build_render_image(width, height, &rgba) {
+                            if let Some(old_img) = self.current_frame.replace(next_img) {
+                                let _ = window.drop_image(old_img);
+                            }
                         }
                     }
                 }

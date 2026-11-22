@@ -848,3 +848,109 @@ fn paused_wav_seek_then_resume_does_not_count_pause_duration() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// P1-04 adjacent regression: saturating the 128-slot streaming event channel by
+/// pausing polling during playback must NOT drop subsequent control replies
+/// (`Pause`, `Seek`, `SelectAudioTrack`, `SetPlaybackRate`, `SetVolume`) in either
+/// the native pipeline or the Symphonia fallback worker.
+#[test]
+fn saturated_stream_delivers_all_control_replies_in_native_and_fallback() {
+    // 450 frames × 21.33 ms ≈ 9.6 s dual-AAC MP4 -> saturates 128-slot stream channel easily.
+    let path = unique_temp_path("p1_04_saturated_controls", "mp4");
+    std::fs::write(&path, build_dual_aac_mp4(450)).expect("write long dual-aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(true)
+            .volume(0.0)
+            .build()
+            .expect("build dual-aac player");
+
+        let mut next_audio = None;
+        let ready = watch(&mut player, Duration::from_secs(3), |ev| {
+            if let PlayerEvent::Tracks {
+                audio_tracks,
+                active_audio,
+                ..
+            } = ev
+            {
+                next_audio = audio_tracks
+                    .iter()
+                    .find(|t| Some(t.index) != active_audio)
+                    .map(|t| t.index);
+            }
+            next_audio.is_some()
+        });
+        assert!(ready, "native={prefer_native}: expected Tracks event");
+        let selected = next_audio.expect("second audio track");
+
+        // Stop polling long enough for streaming AudioLevel / PositionChanged events to saturate
+        // the 128-slot streaming channel.
+        thread::sleep(Duration::from_millis(1600));
+
+        player.pause().expect("pause");
+        let seek_target = Duration::from_secs(2);
+        player.seek(seek_target).expect("seek");
+        let seek_gen = player.generation();
+        player
+            .select_audio_track(selected)
+            .expect("select_audio_track");
+        let latest_gen = player.generation();
+        player.set_playback_rate(1.5).expect("set_playback_rate");
+        player.set_volume(0.25).expect("set_volume");
+
+        thread::sleep(Duration::from_millis(400));
+
+        let mut pause_ack = false;
+        let mut seek_ack = false;
+        let mut track_ack = false;
+        let mut rate_ack = false;
+        let mut volume_ack = false;
+        while let Some(ev) = player.poll_event() {
+            match ev {
+                PlayerEvent::SeekCompleted {
+                    position,
+                    generation,
+                } if generation == seek_gen => {
+                    seek_ack = position == seek_target;
+                }
+                PlayerEvent::Tracks {
+                    active_audio,
+                    generation,
+                    ..
+                } if generation == latest_gen => {
+                    track_ack = active_audio == Some(selected);
+                }
+                PlayerEvent::Snapshot(s) => {
+                    pause_ack |= s.status == "paused" && !s.playing;
+                    rate_ack |= s.status == "rate" && s.generation == latest_gen;
+                    volume_ack |= s.status == "volume"
+                        && s.generation == latest_gen
+                        && (s.volume - 0.25).abs() < 1e-4;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            pause_ack && seek_ack && track_ack && rate_ack && volume_ack,
+            "native={prefer_native}: missing control acks under stream saturation: \
+             pause={pause_ack} seek={seek_ack} track={track_ack} rate={rate_ack} volume={volume_ack}"
+        );
+        assert!(
+            !player.is_playing(),
+            "native={prefer_native}: player cache must reflect paused state"
+        );
+        assert!(
+            (player.volume() - 0.25).abs() < 1e-4,
+            "native={prefer_native}: player cache must reflect volume 0.25, got {}",
+            player.volume()
+        );
+
+        let _ = player.shutdown();
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
