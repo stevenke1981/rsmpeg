@@ -56,6 +56,9 @@ pub struct ScalerConfig {
     pub flags: ScalerFlags,
 }
 
+/// Borrowed YUV420P planes plus their strides (`Y`, `U`, `V`, `y_stride`, `u_stride`, `v_stride`).
+type Yuv420pPlanes<'a> = (&'a [u8], &'a [u8], &'a [u8], usize, usize, usize);
+
 impl ScalerConfig {
     pub fn new(
         src_width: u32,
@@ -141,7 +144,11 @@ impl Scaler {
     /// Scale a frame from source to destination format/dimensions.
     ///
     /// Currently implements real conversion for:
-    /// - `Yuv420P` → `Rgba` / `Rgb24` (BT.601 limited range by default)
+    /// - `Yuv420P` → `Rgba` / `Rgb24` / `Bgr24`
+    /// - `Nv12` → `Rgba` / `Rgb24`
+    /// - `Yuv422P` → `Rgba`
+    /// - `Rgb24` → `Rgba`
+    /// - same format → same format (with dimension scaling)
     ///
     /// Dimension changes use nearest-neighbor sampling of the source.
     /// Returns a new frame with correctly sized packed planes.
@@ -154,9 +161,26 @@ impl Scaler {
             self.config.dst_height,
         );
 
+        // Same format with a different size still needs a real resample, so the
+        // identity fast path below only covers the no-op case.
+        if self.config.src_format == PixelFormat::Yuv420P
+            && self.config.dst_format == PixelFormat::Yuv420P
+            && (self.config.src_width != self.config.dst_width
+                || self.config.src_height != self.config.dst_height)
+        {
+            return self.scale_yuv420p_to_yuv420p(frame);
+        }
+
         match (self.config.src_format, self.config.dst_format) {
             (PixelFormat::Yuv420P, PixelFormat::Rgba) => self.scale_yuv420p_to_packed(frame, 4),
             (PixelFormat::Yuv420P, PixelFormat::Rgb24) => self.scale_yuv420p_to_packed(frame, 3),
+            (PixelFormat::Yuv420P, PixelFormat::Bgr24) => {
+                self.scale_yuv420p_to_packed(frame, 0)
+            }
+            (PixelFormat::Nv12, PixelFormat::Rgba) => self.scale_nv12_to_rgba(frame),
+            (PixelFormat::Nv12, PixelFormat::Rgb24) => self.scale_nv12_to_rgb24(frame),
+            (PixelFormat::Yuv422P, PixelFormat::Rgba) => self.scale_yuv422p_to_rgba(frame),
+            (PixelFormat::Rgb24, PixelFormat::Rgba) => self.scale_rgb24_to_rgba(frame),
             (src, dst)
                 if src == dst
                     && self.config.src_width == self.config.dst_width
@@ -177,15 +201,57 @@ impl Scaler {
         }
     }
 
-    fn scale_yuv420p_to_packed(&self, frame: &Frame, bpp: usize) -> RsResult<Frame> {
+    /// Validate the three planes of a 4:2:0 planar frame against `use_w × use_h`.
+    ///
+    /// Returns the plane references and strides on success. Extra padding in `linesize`
+    /// is tolerated; short buffers are reported as [`RsError::InvalidData`] instead of
+    /// panicking later on an out-of-bounds index.
+    fn validate_yuv420p_planes<'a>(
+        &self,
+        frame: &'a Frame,
+        use_w: usize,
+        use_h: usize,
+    ) -> RsResult<Yuv420pPlanes<'a>> {
         if frame.data.len() < 3 || frame.linesize.len() < 3 {
             return Err(RsError::InvalidData(
                 "YUV420P frame requires 3 planes (Y, U, V)".into(),
             ));
         }
 
-        let src_w = self.config.src_width as usize;
-        let src_h = self.config.src_height as usize;
+        let y_stride = frame.linesize[0];
+        let u_stride = frame.linesize[1];
+        let v_stride = frame.linesize[2];
+        let chroma_w = use_w.div_ceil(2);
+        let chroma_h = use_h.div_ceil(2);
+
+        // Rows are `stride` apart, each row uses `width` bytes.
+        let y_need = y_stride
+            .checked_mul(use_h.saturating_sub(1))
+            .and_then(|o| o.checked_add(use_w));
+        let u_need = u_stride
+            .checked_mul(chroma_h.saturating_sub(1))
+            .and_then(|o| o.checked_add(chroma_w));
+        let v_need = v_stride
+            .checked_mul(chroma_h.saturating_sub(1))
+            .and_then(|o| o.checked_add(chroma_w));
+
+        let (y_plane, u_plane, v_plane) = (&frame.data[0], &frame.data[1], &frame.data[2]);
+        match (y_need, u_need, v_need) {
+            (Some(yn), Some(un), Some(vn))
+                if y_plane.len() >= yn && u_plane.len() >= un && v_plane.len() >= vn => {}
+            _ => {
+                return Err(RsError::InvalidData(
+                    "YUV420P plane buffers are too small for declared size/linesize".into(),
+                ));
+            }
+        }
+
+        Ok((y_plane, u_plane, v_plane, y_stride, u_stride, v_stride))
+    }
+
+    fn scale_yuv420p_to_packed(&self, frame: &Frame, bpp: usize) -> RsResult<Frame> {
+        let src_w = self.source_width();
+        let src_h = self.source_height();
         let dst_w = self.config.dst_width as usize;
         let dst_h = self.config.dst_height as usize;
 
@@ -199,59 +265,36 @@ impl Scaler {
             (src_w, src_h)
         };
 
-        let y_plane = &frame.data[0];
-        let u_plane = &frame.data[1];
-        let v_plane = &frame.data[2];
-        let y_stride = frame.linesize[0];
-        let u_stride = frame.linesize[1];
-        let v_stride = frame.linesize[2];
-
-        // Chroma dimensions for 4:2:0.
-        let chroma_w = use_w.div_ceil(2);
-        let chroma_h = use_h.div_ceil(2);
-
-        // Validate plane capacity (allow extra padding in linesize).
-        let y_need = y_stride
-            .checked_mul(use_h.saturating_sub(1))
-            .and_then(|o| o.checked_add(use_w));
-        let u_need = u_stride
-            .checked_mul(chroma_h.saturating_sub(1))
-            .and_then(|o| o.checked_add(chroma_w));
-        let v_need = v_stride
-            .checked_mul(chroma_h.saturating_sub(1))
-            .and_then(|o| o.checked_add(chroma_w));
-
-        match (y_need, u_need, v_need) {
-            (Some(yn), Some(un), Some(vn))
-                if y_plane.len() >= yn && u_plane.len() >= un && v_plane.len() >= vn => {}
-            _ => {
-                return Err(RsError::InvalidData(
-                    "YUV420P plane buffers are too small for declared size/linesize".into(),
-                ));
-            }
-        }
+        let (y_plane, u_plane, v_plane, y_stride, u_stride, v_stride) =
+            self.validate_yuv420p_planes(frame, use_w, use_h)?;
 
         let limited = self.color.src_range == ColorRange::Limited;
-        let mut out = vec![0u8; dst_w * dst_h * bpp];
-        let out_stride = dst_w * bpp;
+        // `bpp == 0` selects packed BGR24, which has the same 3-byte stride as RGB24
+        // but a different byte order.
+        let bgr = bpp == 0;
+        let bytes_per_pixel = if bgr { 3 } else { bpp };
+        let mut out = vec![0u8; dst_w * dst_h * bytes_per_pixel];
+        let out_stride = dst_w * bytes_per_pixel;
+        let src_w_safe = use_w.max(1);
+        let src_h_safe = use_h.max(1);
 
         // Nearest-neighbor map destination → source.
         for dy in 0..dst_h {
-            let sy = if dst_h == use_h {
+            let sy = if dst_h == src_h_safe {
                 dy
             } else {
-                (dy as u64 * use_h as u64 / dst_h as u64) as usize
+                (dy as u64 * src_h_safe as u64 / dst_h as u64) as usize
             };
-            let sy = sy.min(use_h - 1);
+            let sy = sy.min(src_h_safe - 1);
             let cy = sy / 2;
 
             for dx in 0..dst_w {
-                let sx = if dst_w == use_w {
+                let sx = if dst_w == src_w_safe {
                     dx
                 } else {
-                    (dx as u64 * use_w as u64 / dst_w as u64) as usize
+                    (dx as u64 * src_w_safe as u64 / dst_w as u64) as usize
                 };
-                let sx = sx.min(use_w - 1);
+                let sx = sx.min(src_w_safe - 1);
                 let cx = sx / 2;
 
                 let y = y_plane[sy * y_stride + sx];
@@ -259,33 +302,336 @@ impl Scaler {
                 let v = v_plane[cy * v_stride + cx];
 
                 let (r, g, b) = yuv_to_rgb_bt601(y, u, v, limited);
-                let off = dy * out_stride + dx * bpp;
-                out[off] = r;
+                let off = dy * out_stride + dx * bytes_per_pixel;
+                out[off] = if bgr { b } else { r };
                 out[off + 1] = g;
-                out[off + 2] = b;
-                if bpp == 4 {
+                out[off + 2] = if bgr { r } else { b };
+                if bytes_per_pixel == 4 {
                     out[off + 3] = 255;
                 }
             }
         }
 
+        Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h))
+    }
+
+    /// Source width from the config, saturating into `usize`.
+    #[inline]
+    fn source_width(&self) -> usize {
+        usize::try_from(self.config.src_width).unwrap_or(usize::MAX / 4)
+    }
+
+    /// Source height from the config, saturating into `usize`.
+    #[inline]
+    fn source_height(&self) -> usize {
+        usize::try_from(self.config.src_height).unwrap_or(usize::MAX / 4)
+    }
+
+    /// Resolve the usable source geometry for `frame`.
+    ///
+    /// The configured size is authoritative; a frame that carries its own non-zero
+    /// dimensions is accepted when it differs (matching the historical behaviour).
+    fn source_geometry(&self, frame: &Frame) -> (usize, usize) {
+        let src_w = self.source_width();
+        let src_h = self.source_height();
+        if frame.width == src_w && frame.height == src_h {
+            (src_w, src_h)
+        } else if frame.width > 0 && frame.height > 0 {
+            (frame.width, frame.height)
+        } else {
+            (src_w, src_h)
+        }
+    }
+
+    /// Build a packed (single-plane, 8-bit) video frame from an output buffer.
+    fn packed_video_frame(
+        &self,
+        src: &Frame,
+        out: Vec<u8>,
+        out_stride: usize,
+        dst_w: usize,
+        dst_h: usize,
+    ) -> Frame {
         let mut result = Frame {
             data: vec![out],
             linesize: vec![out_stride],
             width: dst_w,
             height: dst_h,
             pixel_format: self.config.dst_format,
-            sample_format: frame.sample_format,
+            sample_format: src.sample_format,
             sample_rate: 0,
             channels: 0,
             samples: 0,
-            pts: frame.pts,
-            duration: frame.duration,
-            time_base: frame.time_base,
-            key_frame: frame.key_frame,
-            pict_type: frame.pict_type,
+            pts: src.pts,
+            duration: src.duration,
+            time_base: src.time_base,
+            key_frame: src.key_frame,
+            pict_type: src.pict_type,
         };
         // Keep audio fields zeroed for video output; ensure time_base is valid.
+        if result.time_base.den == 0 {
+            result.time_base = Rational::new(1, 1000);
+        }
+        result
+    }
+
+    /// `Nv12` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
+    fn scale_nv12_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
+        self.scale_semi_planar_to_packed(frame, PixelFormat::Nv12, 2, true, true)
+    }
+
+    /// `Nv12` → `Rgb24`, optionally rescaling with nearest-neighbor sampling.
+    fn scale_nv12_to_rgb24(&self, frame: &Frame) -> RsResult<Frame> {
+        self.scale_semi_planar_to_packed(frame, PixelFormat::Nv12, 2, false, true)
+    }
+
+    /// `Yuv422P` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
+    fn scale_yuv422p_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
+        self.scale_semi_planar_to_packed(frame, PixelFormat::Yuv422P, 3, true, false)
+    }
+
+    /// Shared implementation for the `Nv12` / `Yuv422P` → packed RGB(A) paths.
+    ///
+    /// `alpha` selects 4 bytes/pixel RGBA versus 3 bytes/pixel RGB24; `interleaved_uv`
+    /// selects NV12 semi-planar chroma over planar 4:2:2 chroma.
+    fn scale_semi_planar_to_packed(
+        &self,
+        frame: &Frame,
+        expected: PixelFormat,
+        planes: usize,
+        alpha: bool,
+        interleaved_uv: bool,
+    ) -> RsResult<Frame> {
+        if frame.pixel_format != expected {
+            return Err(RsError::InvalidData(
+                format!(
+                    "scaler configured for {:?} source but got a {:?} frame",
+                    expected, frame.pixel_format
+                )
+                .into(),
+            ));
+        }
+        if frame.data.len() < planes || frame.linesize.len() < planes {
+            return Err(RsError::InvalidData(
+                format!("{:?} frame requires {} planes", expected, planes).into(),
+            ));
+        }
+
+        let (use_w, use_h) = self.source_geometry(frame);
+        let dst_w = self.config.dst_width as usize;
+        let dst_h = self.config.dst_height as usize;
+        let use_w = use_w.max(1);
+        let use_h = use_h.max(1);
+
+        let chroma_w = use_w.div_ceil(2);
+        // 4:2:0 halves chroma vertically, 4:2:2 keeps full height.
+        let chroma_h = if interleaved_uv {
+            use_h.div_ceil(2)
+        } else {
+            use_h
+        };
+        let uv_bytes = if interleaved_uv { 2 } else { 1 };
+
+        let y_stride = frame.linesize[0];
+        let uv_stride = frame.linesize[1];
+        let y_need = y_stride
+            .checked_mul(use_h.saturating_sub(1))
+            .and_then(|o| o.checked_add(use_w));
+        let uv_need = uv_stride
+            .checked_mul(chroma_h.saturating_sub(1))
+            .and_then(|o| o.checked_add(chroma_w.checked_mul(uv_bytes)?));
+        let v_need = if interleaved_uv {
+            Some(0)
+        } else {
+            let v_stride = frame.linesize[2];
+            v_stride
+                .checked_mul(use_h.saturating_sub(1))
+                .and_then(|o| o.checked_add(chroma_w))
+        };
+
+        let y_plane = &frame.data[0];
+        let uv_plane = &frame.data[1];
+        match (y_need, uv_need, v_need) {
+            (Some(yn), Some(uvn), Some(vn))
+                if y_plane.len() >= yn
+                    && uv_plane.len() >= uvn
+                    && (interleaved_uv || frame.data[2].len() >= vn) => {}
+            _ => {
+                return Err(RsError::InvalidData(
+                    format!(
+                        "{:?} plane buffers are too small for declared size/linesize",
+                        expected
+                    )
+                    .into(),
+                ));
+            }
+        }
+        let v_plane: &[u8] = if interleaved_uv {
+            &[]
+        } else {
+            &frame.data[2]
+        };
+        let v_stride = if interleaved_uv {
+            0
+        } else {
+            frame.linesize[2]
+        };
+
+        // BT.601 limited range, matching the Yuv420P paths.
+        let limited = self.color.src_range == ColorRange::Limited;
+        let bpp = if alpha { 4 } else { 3 };
+        let out_stride = dst_w * bpp;
+        let mut out = vec![0u8; out_stride * dst_h];
+
+        for dy in 0..dst_h {
+            let sy = (dy as u64 * use_h as u64 / dst_h as u64) as usize;
+            let sy = sy.min(use_h - 1);
+            let cy = if interleaved_uv { sy / 2 } else { sy };
+            for dx in 0..dst_w {
+                let sx = (dx as u64 * use_w as u64 / dst_w as u64) as usize;
+                let sx = sx.min(use_w - 1);
+                let cx = sx / 2;
+
+                let yv = y_plane[sy * y_stride + sx];
+                let (u, v) = if interleaved_uv {
+                    (
+                        uv_plane[cy * uv_stride + cx * 2],
+                        uv_plane[cy * uv_stride + cx * 2 + 1],
+                    )
+                } else {
+                    (uv_plane[cy * uv_stride + cx], v_plane[cy * v_stride + cx])
+                };
+
+                let (r, g, b) = yuv_to_rgb_bt601(yv, u, v, limited);
+                let off = dy * out_stride + dx * bpp;
+                out[off] = r;
+                out[off + 1] = g;
+                out[off + 2] = b;
+                if alpha {
+                    out[off + 3] = 255;
+                }
+            }
+        }
+
+        Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h))
+    }
+
+    /// `Rgb24` → `Rgba`, optionally rescaling with nearest-neighbor sampling.
+    fn scale_rgb24_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
+        let (use_w, use_h) = self.source_geometry(frame);
+        if frame.data.is_empty() || frame.linesize.is_empty() {
+            return Err(RsError::InvalidData("RGB24 frame has no plane data".into()));
+        }
+        let dst_w = self.config.dst_width as usize;
+        let dst_h = self.config.dst_height as usize;
+        let use_w = use_w.max(1);
+        let use_h = use_h.max(1);
+
+        let src = &frame.data[0];
+        let src_stride = frame.linesize[0];
+        let need = src_stride
+            .checked_mul(use_h.saturating_sub(1))
+            .and_then(|o| o.checked_add(use_w.checked_mul(3)?));
+        match need {
+            Some(n) if src.len() >= n => {}
+            _ => {
+                return Err(RsError::InvalidData(
+                    "RGB24 plane buffer is too small for declared size/linesize".into(),
+                ));
+            }
+        }
+
+        let out_stride = dst_w * 4;
+        let mut out = vec![0u8; out_stride * dst_h];
+        for dy in 0..dst_h {
+            let sy = (dy as u64 * use_h as u64 / dst_h as u64) as usize;
+            let sy = sy.min(use_h - 1);
+            for dx in 0..dst_w {
+                let sx = (dx as u64 * use_w as u64 / dst_w as u64) as usize;
+                let sx = sx.min(use_w - 1);
+                let s = sy * src_stride + sx * 3;
+                let d = dy * out_stride + dx * 4;
+                out[d] = src[s];
+                out[d + 1] = src[s + 1];
+                out[d + 2] = src[s + 2];
+                out[d + 3] = 255;
+            }
+        }
+
+        Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h))
+    }
+
+    /// `Yuv420P` → `Yuv420P` with nearest-neighbor resampling of all three planes.
+    ///
+    /// Previously this returned [`RsError::Unsupported`], so any pipeline that
+    /// scaled luma-resolution video in place (for example the bundled
+    /// `pipeline` example) failed. Chroma planes are halved in both directions,
+    /// so their target size is `ceil(dst/2)` and each source chroma sample is
+    /// replicated over the corresponding 2×2 output block.
+    fn scale_yuv420p_to_yuv420p(&self, frame: &Frame) -> RsResult<Frame> {
+        let (use_w, use_h) = self.source_geometry(frame);
+        let use_w = use_w.max(1);
+        let use_h = use_h.max(1);
+        let (y_plane, u_plane, v_plane, y_stride, u_stride, v_stride) =
+            self.validate_yuv420p_planes(frame, use_w, use_h)?;
+
+        let dst_w = self.config.dst_width as usize;
+        let dst_h = self.config.dst_height as usize;
+        let dst_cw = dst_w.div_ceil(2);
+        let dst_ch = dst_h.div_ceil(2);
+        let src_cw = use_w.div_ceil(2);
+        let src_ch = use_h.div_ceil(2);
+
+        // Allocations go through checked arithmetic so pathological sizes report
+        // an error instead of aborting on allocation overflow.
+        let y_len = dst_w
+            .checked_mul(dst_h)
+            .ok_or_else(|| RsError::InvalidData("YUV420P luma plane size overflow".into()))?;
+        let c_len = dst_cw
+            .checked_mul(dst_ch)
+            .ok_or_else(|| RsError::InvalidData("YUV420P chroma plane size overflow".into()))?;
+        let mut y_out = vec![0u8; y_len];
+        let mut u_out = vec![0u8; c_len];
+        let mut v_out = vec![0u8; c_len];
+
+        // Precompute the source-column mapping once; it is shared by every row
+        // and by both chroma planes.
+        let x_map: Vec<usize> = (0..dst_w)
+            .map(|dx| ((dx as u64 * use_w as u64 / dst_w as u64) as usize).min(use_w - 1))
+            .collect();
+        let cx_map: Vec<usize> = (0..dst_cw)
+            .map(|dx| ((dx as u64 * src_cw as u64 / dst_cw as u64) as usize).min(src_cw - 1))
+            .collect();
+
+        for dy in 0..dst_h {
+            let sy = ((dy as u64 * use_h as u64 / dst_h as u64) as usize).min(use_h - 1);
+            let src_row = sy * y_stride;
+            let dst_row = dy * dst_w;
+            for (dx, &sx) in x_map.iter().enumerate() {
+                y_out[dst_row + dx] = y_plane[src_row + sx];
+            }
+        }
+
+        for dy in 0..dst_ch {
+            let sy = ((dy as u64 * src_ch as u64 / dst_ch as u64) as usize).min(src_ch - 1);
+            let u_row = sy * u_stride;
+            let v_row = sy * v_stride;
+            let dst_row = dy * dst_cw;
+            for (dx, &cx) in cx_map.iter().enumerate() {
+                u_out[dst_row + dx] = u_plane[u_row + cx];
+                v_out[dst_row + dx] = v_plane[v_row + cx];
+            }
+        }
+
+        let mut result = clone_frame_metadata(frame, vec![y_out, u_out, v_out], vec![
+            dst_w, dst_cw, dst_cw,
+        ]);
+        result.width = dst_w;
+        result.height = dst_h;
+        result.pixel_format = PixelFormat::Yuv420P;
+        result.sample_rate = 0;
+        result.channels = 0;
+        result.samples = 0;
         if result.time_base.den == 0 {
             result.time_base = Rational::new(1, 1000);
         }
@@ -1338,6 +1684,140 @@ mod tests {
         assert_eq!(out.width, 4);
         assert_eq!(out.height, 4);
     }
+
+    #[test]
+    fn scale_yuv420p_same_format_downscales_planes() {
+        // Regression: `Yuv420P -> Yuv420P` used to return Unsupported, which made
+        // `rsmpeg/examples/pipeline.rs` panic. It must now resample every plane.
+        let cfg = ScalerConfig::new(8, 6, PixelFormat::Yuv420P, 4, 3, PixelFormat::Yuv420P);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_yuv420p_frame(8, 6, 16, 128, 128);
+        let out = scaler.scale(&frame).expect("Yuv420P -> Yuv420P must be supported");
+        assert_eq!(out.width, 4);
+        assert_eq!(out.height, 3);
+        assert_eq!(out.pixel_format, PixelFormat::Yuv420P);
+        assert_eq!(out.data.len(), 3);
+        assert_eq!(out.data[0].len(), 4 * 3);
+        assert_eq!(out.data[1].len(), 2 * 2);
+        assert_eq!(out.data[2].len(), 2 * 2);
+        assert_eq!(out.linesize, vec![4, 2, 2]);
+        // Limited-range black stays black.
+        assert!(out.data[0].iter().all(|&v| v == 16));
+    }
+
+    #[test]
+    fn scale_yuv420p_to_yuv420p_keeps_every_plane_sized_consistently() {
+        // Every plane of the output must be large enough for its own linesize,
+        // otherwise a second scale() call on the result would see truncated planes.
+        let cfg = ScalerConfig::new(16, 8, PixelFormat::Yuv420P, 5, 5, PixelFormat::Yuv420P);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_yuv420p_frame(16, 8, 235, 128, 128);
+        let out = scaler.scale(&frame).unwrap();
+
+        let w = out.width;
+        let h = out.height;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        assert!(out.data[0].len() >= out.linesize[0] * (h - 1) + w);
+        assert!(out.data[1].len() >= out.linesize[1] * (ch - 1) + cw);
+        assert!(out.data[2].len() >= out.linesize[2] * (ch - 1) + cw);
+    }
+
+    #[test]
+    fn scale_yuv420p_to_bgr24_swaps_red_and_blue() {
+        let cfg = ScalerConfig::new(4, 2, PixelFormat::Yuv420P, 4, 2, PixelFormat::Bgr24);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_yuv420p_frame(4, 2, 81, 90, 240); // BT.601 limited red
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.pixel_format, PixelFormat::Bgr24);
+        assert_eq!(out.data[0].len(), 4 * 2 * 3);
+        let (b, g, r) = (out.data[0][0], out.data[0][1], out.data[0][2]);
+        assert!(r > 200, "BGR blue channel must be low, got B={b}");
+        assert!(g < 40, "BGR green channel must be low, got G={g}");
+        assert!(b < 40, "BGR red channel must be high, got R={b} (byte0={r})");
+    }
+
+    #[test]
+    fn scale_nv12_to_rgba_downscales() {
+        let cfg = ScalerConfig::new(8, 6, PixelFormat::Nv12, 4, 3, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_nv12_frame(8, 6, 16, 128, 128);
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.pixel_format, PixelFormat::Rgba);
+        assert_eq!(out.data[0].len(), 4 * 3 * 4);
+        assert!(out.data[0][0] <= 2);
+        assert_eq!(out.data[0][3], 255);
+    }
+
+    #[test]
+    fn scale_nv12_to_rgb24_downscales() {
+        let cfg = ScalerConfig::new(8, 6, PixelFormat::Nv12, 2, 2, PixelFormat::Rgb24);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_nv12_frame(8, 6, 81, 90, 240);
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.pixel_format, PixelFormat::Rgb24);
+        assert_eq!(out.data[0].len(), 2 * 2 * 3);
+        assert!(out.data[0][0] > 200, "R={}", out.data[0][0]);
+    }
+
+    #[test]
+    fn scale_yuv422p_to_rgba_uses_full_height_chroma() {
+        let cfg = ScalerConfig::new(8, 4, PixelFormat::Yuv422P, 8, 4, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_yuv422p_frame(8, 4, 16, 128, 128);
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.pixel_format, PixelFormat::Rgba);
+        assert_eq!(out.data[0].len(), 8 * 4 * 4);
+        assert!(out.data[0][0] <= 2);
+    }
+
+    #[test]
+    fn scale_rgb24_to_rgba_preserves_colors_and_adds_alpha() {
+        let cfg = ScalerConfig::new(4, 4, PixelFormat::Rgb24, 2, 2, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_rgb24_frame(4, 4, 10, 20, 30);
+        let out = scaler.scale(&frame).unwrap();
+        assert_eq!(out.pixel_format, PixelFormat::Rgba);
+        assert_eq!(out.data[0].len(), 2 * 2 * 4);
+        assert_eq!(&out.data[0][0..4], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn scale_rejects_frame_with_mismatched_pixel_format() {
+        // A scaler configured for Nv12 must not index a Yuv420P frame's planes as
+        // semi-planar; it reports InvalidData instead of reading garbage.
+        let cfg = ScalerConfig::new(4, 4, PixelFormat::Nv12, 4, 4, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let frame = make_yuv420p_frame(4, 4, 16, 128, 128);
+        let err = scaler.scale(&frame).unwrap_err();
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn scale_rejects_truncated_nv12_and_rgb24_planes() {
+        let cfg = ScalerConfig::new(8, 8, PixelFormat::Nv12, 8, 8, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut nv12 = make_nv12_frame(8, 8, 16, 128, 128);
+        nv12.data[1].truncate(2);
+        assert!(scaler.scale(&nv12).is_err());
+        // A frame missing the UV plane entirely must also error, not panic.
+        let mut missing = make_nv12_frame(8, 8, 16, 128, 128);
+        missing.data.truncate(1);
+        assert!(scaler.scale(&missing).is_err());
+
+        let cfg = ScalerConfig::new(8, 8, PixelFormat::Rgb24, 8, 8, PixelFormat::Rgba);
+        let scaler = Scaler::new(cfg).unwrap();
+        let mut rgb = make_rgb24_frame(8, 8, 1, 2, 3);
+        rgb.data[0].truncate(5);
+        assert!(scaler.scale(&rgb).is_err());
+        let mut no_planes = make_rgb24_frame(8, 8, 1, 2, 3);
+        no_planes.data.clear();
+        assert!(scaler.scale(&no_planes).is_err());
+        let mut no_linesize = make_rgb24_frame(8, 8, 1, 2, 3);
+        no_linesize.linesize.clear();
+        assert!(scaler.scale(&no_linesize).is_err());
+    }
+
 
     #[test]
     fn yuv420p_to_rgb24_rejects_truncated_planes() {
