@@ -449,7 +449,6 @@ fn run_worker(
     cmd_rx: Receiver<PlayerCommand>,
     event_tx: EventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use rodio::{OutputStream, Sink};
     use rsmpeg_codec::{DecodeStatus, Decoder};
     use rsmpeg_util::Rational;
     use symphonia::core::audio::SampleBuffer;
@@ -601,6 +600,7 @@ fn run_worker(
     let mut audio_target_samples: usize = 0;
     let mut audio_ring = PcmRingBuffer::new(0);
     let mut audio_play_start: Option<Instant> = None;
+    let mut audio_throttle_clock = crate::clock::AudioPlaybackClock::new();
     let mut audio_played_base: u64 = 0;
     let mut drop_until: Option<Duration> = None;
 
@@ -643,14 +643,11 @@ fn run_worker(
     let mut audio_dec_name =
         active_audio_decoder_name(audio_dec.as_ref(), audio_decoder_raw.as_deref());
 
-    let _rodio = OutputStream::try_default();
-    let sink = _rodio
-        .as_ref()
-        .ok()
-        .and_then(|(_, h)| Sink::try_new(h).ok());
-    if let Some(ref s) = sink {
-        s.set_volume(volume);
-    }
+    let mut sink = if has_audio {
+        crate::audio_output::try_open_sink(volume)
+    } else {
+        None
+    };
 
     let mut seek_track_id = video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
     let mut video_stream_index = video_track.as_ref().map(|t| t.id as usize).unwrap_or(0);
@@ -706,6 +703,7 @@ fn run_worker(
                                 } else {
                                     playback_clock.resume();
                                 }
+                                audio_throttle_clock.resume();
                                 if let Some(ref s) = sink {
                                     s.play();
                                 }
@@ -721,6 +719,7 @@ fn run_worker(
                             playing = false;
                             was_playing = false;
                             playback_clock.pause();
+                            audio_throttle_clock.pause();
                             if let Some(ref s) = sink {
                                 s.pause();
                             }
@@ -763,6 +762,7 @@ fn run_worker(
                             // while paused can never leave the ring permanently full.
                             audio_ring.clear();
                             audio_play_start = None;
+                            audio_throttle_clock.seek(Duration::ZERO);
                             audio_played_base = 0;
                             let _ = format.seek(
                                 SeekMode::Coarse,
@@ -834,6 +834,7 @@ fn run_worker(
                                 1.0
                             };
                             playback_clock.set_rate(playback_rate);
+                            audio_throttle_clock.set_rate(playback_rate);
                             if let Some(ref s) = sink {
                                 s.set_speed(playback_rate as f32);
                             }
@@ -847,6 +848,7 @@ fn run_worker(
                             playing = false;
                             was_playing = false;
                             playback_clock.pause();
+                            audio_throttle_clock.pause();
                             if let Some(ref s) = sink {
                                 s.pause();
                             }
@@ -878,6 +880,11 @@ fn run_worker(
                                 );
                                 audio_channels = ch;
                                 audio_rate = rate;
+                                if (audio_dec.is_some() || audio_decoder_raw.is_some())
+                                    && sink.is_none()
+                                {
+                                    sink = crate::audio_output::try_open_sink(volume);
+                                }
                                 audio_track_id = Some(at.id);
                                 audio_stream_index = at.id as usize;
                                 audio_time_base = at.codec_params.time_base.map(|tb| {
@@ -891,6 +898,7 @@ fn run_worker(
                                 audio_ring.clear();
                                 audio_target_samples = 0;
                                 audio_play_start = None;
+                                audio_throttle_clock.seek(Duration::ZERO);
                                 audio_played_base = 0;
                                 if eof_draining {
                                     let cur_secs = position.as_secs_f64().max(0.0);
@@ -1028,6 +1036,7 @@ fn run_worker(
                                 }
                                 audio_ring.clear();
                                 audio_play_start = None;
+                                audio_throttle_clock.seek(Duration::ZERO);
                                 audio_played_base = 0;
                                 if let Some(ref s) = sink {
                                     s.clear();
@@ -1109,20 +1118,19 @@ fn run_worker(
             continue;
         }
 
+        // Sample-based throttle works even on headless environments without an audio sink;
+        // `rodio` queue backpressure acts as an additional cap when a sink is present.
+        if audio_throttle_clock.is_output_active() && playing {
+            let played = (audio_throttle_clock.now().as_secs_f64() * audio_rate as f64) as u64
+                * audio_channels as u64;
+            audio_ring.consume(played.saturating_sub(audio_played_base) as usize);
+            audio_played_base = played;
+        }
+        if !audio_ring.is_empty() && audio_ring.len() >= audio_ring.capacity() {
+            thread::sleep(Duration::from_millis(4));
+            continue;
+        }
         if let Some(ref s) = sink {
-            // Sample-based throttle (approximate, rodio backstop below is authoritative).
-            if let Some(t0) = audio_play_start {
-                if playing {
-                    let played = (t0.elapsed().as_secs_f64() * audio_rate as f64) as u64
-                        * audio_channels as u64;
-                    audio_ring.consume(played.saturating_sub(audio_played_base) as usize);
-                    audio_played_base = played;
-                }
-            }
-            if !audio_ring.is_empty() && audio_ring.len() >= audio_ring.capacity() {
-                thread::sleep(Duration::from_millis(4));
-                continue;
-            }
             if s.len() >= MAX_AUDIO_QUEUE_SOURCES {
                 thread::sleep(Duration::from_millis(4));
                 continue;
@@ -1421,8 +1429,11 @@ fn run_worker(
                                             samples,
                                         ));
                                     }
-                                    if audio_play_start.is_none() && playing {
-                                        audio_play_start = Some(Instant::now());
+                                    if playing {
+                                        if audio_play_start.is_none() {
+                                            audio_play_start = Some(Instant::now());
+                                        }
+                                        audio_throttle_clock.start_output_at(Duration::ZERO);
                                     }
                                 }
                                 // Drive position from audio when no video.

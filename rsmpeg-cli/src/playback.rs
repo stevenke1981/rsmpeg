@@ -58,9 +58,6 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                         audio_decoder.as_deref().unwrap_or("none")
                     );
                 }
-                // Snapshot metadata is not needed by the legacy minifb `play`
-                // window; it is only reported for duration display in the GUI.
-                PlayerEvent::Snapshot(_s) => {}
                 _ => {}
             }
         }

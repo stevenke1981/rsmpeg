@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 pub mod audio_convert;
+#[cfg(feature = "audio-rodio")]
+mod audio_output;
 pub mod audio_ring_buffer;
 pub mod backend;
 pub mod clock;
@@ -24,7 +26,7 @@ pub mod video_convert;
 pub mod video_scheduler;
 
 pub use audio_convert::frame_to_s16_device;
-pub use clock::{MasterClock, PlaybackClock};
+pub use clock::{AudioPlaybackClock, MasterClock, PlaybackClock};
 pub use codec_detect::{
     classify_track, codec_from_fourcc, find_audio_track, find_h264_video_track,
     find_unsupported_video, DetectedVideoCodec, TrackKind,

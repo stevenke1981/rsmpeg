@@ -330,7 +330,7 @@ impl Resampler {
                 if any {
                     best.min(src_ch.saturating_sub(1))
                 } else {
-                    // No weight: downmix takes the first source channel.
+                    // No weight: downmix takes first channel, upmix duplicates it.
                     0
                 }
             }

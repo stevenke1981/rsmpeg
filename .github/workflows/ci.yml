@@ -22,6 +22,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-render0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan-dev \
+            libssl-dev
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,6 +53,9 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace
+
+      - name: Check workspace without default features
+        run: cargo check --workspace --no-default-features
 
   test-windows:
     name: test (windows, stable)
@@ -62,11 +86,32 @@ jobs:
         run: cargo test --workspace
 
   clippy:
-    name: clippy (ubuntu, soft)
+    name: clippy (ubuntu, required)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-render0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan-dev \
+            libssl-dev
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -74,5 +119,4 @@ jobs:
           components: clippy
 
       - name: Clippy workspace
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings

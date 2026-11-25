@@ -357,7 +357,6 @@ fn run_native_inner(
     cmd_rx: &Receiver<PlayerCommand>,
     event_tx: &EventSender,
 ) -> Result<(), String> {
-    use rodio::{OutputStream, Sink};
     use rsmpeg_codec::DecodeStatus;
 
     use crate::audio_convert::frame_to_s16_device;
@@ -471,14 +470,7 @@ fn run_native_inner(
         None => (None, None, 2u16, 44_100u32),
     };
 
-    let _rodio = OutputStream::try_default();
-    let sink = _rodio
-        .as_ref()
-        .ok()
-        .and_then(|(_, h)| Sink::try_new(h).ok());
-    if let Some(ref s) = sink {
-        s.set_volume(volume);
-    }
+    let mut sink = audio_si.and_then(|_| crate::audio_output::try_open_sink(volume));
 
     emit(
         event_tx,
@@ -715,6 +707,9 @@ fn run_native_inner(
                                 audio_dec_name = dec_name;
                                 audio_channels = ch;
                                 audio_rate = rate;
+                                if audio_dec.is_some() && sink.is_none() {
+                                    sink = crate::audio_output::try_open_sink(volume);
+                                }
                                 if eof_draining {
                                     let ts_ms = (position.as_secs_f64().max(0.0) * 1000.0) as i64;
                                     let _ = ctx.seek(ts_ms);

@@ -3,7 +3,7 @@ name = "rsmpeg-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.85"
 description = "rsmpeg command-line tools (probe, transcode, play)"
 
 [lints]
@@ -29,6 +29,17 @@ rodio = "0.20"
 openh264 = "0.9"
 minifb = "0.28"
 
-# GUI
-eframe = "0.28"
+# AcmeUI Native GUI, pinned so clean clones and CI use the reviewed image API.
+acme-core = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
+acme-layout = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
+acme-platform = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
+acme-render-wgpu = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
+acme-text = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
+acme-theme = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
+acme-ui = { git = "https://github.com/stevenke1981/AcmeUI-Native.git", rev = "f34a5a626bc09fbba89892777da5a9a155e9261f" }
 rfd = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+# `gpu-allocator 0.28` accepts multiple windows-rs lines. Keep its DX12 types
+# aligned with wgpu 29 instead of reusing rodio/cpal's older windows 0.54 lock.
+windows = "=0.62.2"
