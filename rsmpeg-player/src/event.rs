@@ -80,6 +80,13 @@ pub enum PlayerEvent {
         active_audio: Option<usize>,
         generation: u64,
     },
+    /// Active demuxer and decoder backend names.
+    DecoderInfo {
+        demuxer: String,
+        video_decoder: Option<String>,
+        audio_decoder: Option<String>,
+        generation: u64,
+    },
 }
 
 /// Compute normalized `(rms, peak)` levels in `0.0..=1.0` from signed 16-bit PCM samples.
@@ -112,7 +119,8 @@ impl PlayerEvent {
             | Self::Error { generation, .. }
             | Self::Warning { generation, .. }
             | Self::AudioLevel { generation, .. }
-            | Self::Tracks { generation, .. } => *generation,
+            | Self::Tracks { generation, .. }
+            | Self::DecoderInfo { generation, .. } => *generation,
         }
     }
 }
@@ -171,6 +179,12 @@ mod tests {
                 audio_tracks: Vec::new(),
                 active_video: None,
                 active_audio: None,
+                generation: 7,
+            },
+            PlayerEvent::DecoderInfo {
+                demuxer: "rsmpeg-format (mp4)".into(),
+                video_decoder: Some("OpenH264 (H.264)".into()),
+                audio_decoder: Some("Symphonia (AAC)".into()),
                 generation: 7,
             },
         ];

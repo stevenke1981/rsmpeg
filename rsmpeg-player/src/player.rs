@@ -30,7 +30,7 @@ enum EventClass {
     /// newer preview overwrites any unconsumed older preview so memory stays
     /// bounded to one preview frame.
     Preview,
-    /// Control acknowledgements (`Snapshot`, `SeekCompleted`, `Tracks`).
+    /// Control acknowledgements (`Snapshot`, `SeekCompleted`, `Tracks`, `DecoderInfo`).
     /// Isolated from `Stream` backpressure; bounded at `CONTROL_EVT_CAPACITY` (256),
     /// evicting an older `Snapshot` first if saturated.
     Control,
@@ -178,7 +178,8 @@ impl EventSender {
                     PlayerEvent::Ended { .. } | PlayerEvent::Error { .. } => EventClass::Terminal,
                     PlayerEvent::Snapshot(_)
                     | PlayerEvent::SeekCompleted { .. }
-                    | PlayerEvent::Tracks { .. } => EventClass::Control,
+                    | PlayerEvent::Tracks { .. }
+                    | PlayerEvent::DecoderInfo { .. } => EventClass::Control,
                     PlayerEvent::VideoFrame { .. }
                     | PlayerEvent::PositionChanged { .. }
                     | PlayerEvent::AudioLevel { .. }
@@ -467,6 +468,26 @@ impl Player {
         Ok(())
     }
 
+    /// Seek precisely to `position` (decodes forward from nearest keyframe and drops pre-target frames).
+    pub fn seek_precise(&mut self, position: Duration) -> Result<(), PlayerError> {
+        self.send_with_next_generation(|g| PlayerCommand::Seek {
+            position,
+            mode: SeekMode::Precise,
+            generation: g,
+        })?;
+        self.position = position;
+        self.state = PlayerState::Seeking;
+        Ok(())
+    }
+
+    /// Pause playback if playing and advance by one video frame.
+    pub fn step_forward(&mut self) -> Result<(), PlayerError> {
+        self.send_with_next_generation(|g| PlayerCommand::StepForward { generation: g })?;
+        self.playing = false;
+        self.state = PlayerState::Paused;
+        Ok(())
+    }
+
     pub fn set_volume(&mut self, volume: f32) -> Result<(), PlayerError> {
         let g = self.generation();
         let volume = volume.clamp(0.0, 1.0);
@@ -591,7 +612,8 @@ impl Player {
             }
             PlayerEvent::Warning { .. }
             | PlayerEvent::AudioLevel { .. }
-            | PlayerEvent::Tracks { .. } => {}
+            | PlayerEvent::Tracks { .. }
+            | PlayerEvent::DecoderInfo { .. } => {}
         }
     }
 
@@ -1031,5 +1053,103 @@ mod tests {
             other => panic!("expected VideoFrame, got {other:?}"),
         }
         assert_eq!(p.position(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn seek_precise_sends_precise_mode_and_bumps_generation() {
+        let (mut p, cmd_rx, _evt_tx) = make_channel_player();
+        let g0 = p.generation();
+        let target = Duration::from_millis(1250);
+        p.seek_precise(target).unwrap();
+        assert_eq!(p.generation(), g0 + 1);
+        assert_eq!(p.position(), target);
+        assert_eq!(p.state(), PlayerState::Seeking);
+        match cmd_rx.try_recv().unwrap() {
+            PlayerCommand::Seek {
+                position,
+                mode,
+                generation,
+            } => {
+                assert_eq!(position, target);
+                assert_eq!(mode, SeekMode::Precise);
+                assert_eq!(generation, g0 + 1);
+            }
+            other => panic!("expected Seek(Precise), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_forward_sends_command_bumps_generation_and_pauses() {
+        let (mut p, cmd_rx, _evt_tx) = make_channel_player();
+        let g0 = p.generation();
+        assert!(p.is_playing());
+        p.step_forward().unwrap();
+        assert_eq!(p.generation(), g0 + 1);
+        assert!(!p.is_playing());
+        assert_eq!(p.state(), PlayerState::Paused);
+        match cmd_rx.try_recv().unwrap() {
+            PlayerCommand::StepForward { generation } => {
+                assert_eq!(generation, g0 + 1);
+            }
+            other => panic!("expected StepForward, got {other:?}"),
+        }
+
+        // Full command queue must not bump generation or mutate state on seek_precise/step_forward.
+        for _ in 0..CMD_CAPACITY {
+            p.set_volume(0.5).unwrap();
+        }
+        let gen_before = p.generation();
+        let pos_before = p.position();
+        let state_before = p.state();
+        assert!(matches!(
+            p.seek_precise(Duration::from_secs(3)),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert!(matches!(
+            p.step_forward(),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert_eq!(p.generation(), gen_before);
+        assert_eq!(p.position(), pos_before);
+        assert_eq!(p.state(), state_before);
+    }
+
+    #[test]
+    fn saturated_stream_delivers_decoder_info_on_control_lane() {
+        let (mut p, _rx, evt_tx) = make_channel_player();
+        let state_before = p.state();
+        let pos_before = p.position();
+        let vol_before = p.volume();
+        for i in 0..(EVT_CAPACITY + 32) {
+            evt_tx.send(PlayerEvent::PositionChanged {
+                position: Duration::from_millis(i as u64),
+                generation: 1,
+            });
+        }
+        evt_tx.send(PlayerEvent::DecoderInfo {
+            demuxer: "rsmpeg-format (flac)".into(),
+            video_decoder: None,
+            audio_decoder: Some("rsmpeg-rust (FLAC)".into()),
+            generation: 1,
+        });
+
+        let mut drained = Vec::new();
+        while let Some(ev) = p.poll_event() {
+            drained.push(ev);
+        }
+        assert_eq!(drained.len(), EVT_CAPACITY + 1);
+        assert!(matches!(
+            drained.last(),
+            Some(PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder: None,
+                audio_decoder: Some(audio),
+                generation: 1,
+            }) if demuxer == "rsmpeg-format (flac)" && audio == "rsmpeg-rust (FLAC)"
+        ));
+        // DecoderInfo does not mutate cached Player fields (except earlier PositionChanged).
+        assert_eq!(p.state(), state_before);
+        assert!((p.volume() - vol_before).abs() < 1e-6);
+        assert!(p.position() >= pos_before);
     }
 }

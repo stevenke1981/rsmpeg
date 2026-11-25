@@ -344,6 +344,31 @@ type FallbackAudioBundle = (
     feature = "backend-openh264",
     feature = "audio-rodio"
 ))]
+fn active_audio_decoder_name(
+    audio_dec: Option<&crate::backend::SymphoniaAudioDecoder>,
+    audio_decoder_raw: Option<&dyn symphonia::core::codecs::Decoder>,
+) -> Option<String> {
+    use rsmpeg_codec::{CodecId, Decoder};
+    if let Some(dec) = audio_dec {
+        let name = match dec.codec_id() {
+            CodecId::Pcm => "rsmpeg-rust (PCM)",
+            CodecId::Aac => "Symphonia (AAC)",
+            CodecId::Mp3 => "Symphonia (MP3)",
+            _ => "Symphonia",
+        };
+        Some(name.into())
+    } else if audio_decoder_raw.is_some() {
+        Some("Symphonia".into())
+    } else {
+        None
+    }
+}
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
 fn open_fallback_audio(
     at: &symphonia::core::formats::Track,
     generation: u64,
@@ -615,6 +640,8 @@ fn run_worker(
             Some(at) => open_fallback_audio(at, generation, &event_tx),
             None => (None, None, 2, 44_100),
         };
+    let mut audio_dec_name =
+        active_audio_decoder_name(audio_dec.as_ref(), audio_decoder_raw.as_deref());
 
     let _rodio = OutputStream::try_default();
     let sink = _rodio
@@ -639,6 +666,15 @@ fn run_worker(
             audio_tracks: audio_tracks.clone(),
             active_video: video_track.as_ref().map(|t| t.id as usize),
             active_audio: audio_track.as_ref().map(|t| t.id as usize),
+            generation,
+        },
+    );
+    emit(
+        &event_tx,
+        PlayerEvent::DecoderInfo {
+            demuxer: "Symphonia".into(),
+            video_decoder: video_dec.as_ref().map(|_| "OpenH264 (H.264)".into()),
+            audio_decoder: audio_dec_name.clone(),
             generation,
         },
     );
@@ -806,6 +842,20 @@ fn run_worker(
                                 snap(playing, position, duration, volume, g, "rate"),
                             );
                         }
+                        PlayerCommand::StepForward { generation: g } => {
+                            generation = g;
+                            playing = false;
+                            was_playing = false;
+                            playback_clock.pause();
+                            if let Some(ref s) = sink {
+                                s.pause();
+                            }
+                            force_one_frame = video_dec.is_some();
+                            emit(
+                                &event_tx,
+                                snap(false, position, duration, volume, g, "paused"),
+                            );
+                        }
                         PlayerCommand::SelectAudioTrack {
                             index,
                             generation: g,
@@ -822,6 +872,10 @@ fn run_worker(
                                 let (dec, raw, ch, rate) = open_fallback_audio(&at, g, &event_tx);
                                 audio_dec = dec;
                                 audio_decoder_raw = raw;
+                                audio_dec_name = active_audio_decoder_name(
+                                    audio_dec.as_ref(),
+                                    audio_decoder_raw.as_deref(),
+                                );
                                 audio_channels = ch;
                                 audio_rate = rate;
                                 audio_track_id = Some(at.id);
@@ -866,6 +920,17 @@ fn run_worker(
                                         audio_tracks: audio_tracks.clone(),
                                         active_video: video_track.as_ref().map(|t| t.id as usize),
                                         active_audio: audio_track.as_ref().map(|t| t.id as usize),
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::DecoderInfo {
+                                        demuxer: "Symphonia".into(),
+                                        video_decoder: video_dec
+                                            .as_ref()
+                                            .map(|_| "OpenH264 (H.264)".into()),
+                                        audio_decoder: audio_dec_name.clone(),
                                         generation: g,
                                     },
                                 );
@@ -989,6 +1054,17 @@ fn run_worker(
                                         audio_tracks: audio_tracks.clone(),
                                         active_video: video_track.as_ref().map(|t| t.id as usize),
                                         active_audio: audio_track.as_ref().map(|t| t.id as usize),
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::DecoderInfo {
+                                        demuxer: "Symphonia".into(),
+                                        video_decoder: video_dec
+                                            .as_ref()
+                                            .map(|_| "OpenH264 (H.264)".into()),
+                                        audio_decoder: audio_dec_name.clone(),
                                         generation: g,
                                     },
                                 );
@@ -1259,6 +1335,9 @@ fn run_worker(
                                             };
                                             if force_one_frame {
                                                 emit_preview(&event_tx, ev.clone());
+                                                if !playing {
+                                                    playback_clock.seek(position);
+                                                }
                                             } else {
                                                 emit(&event_tx, ev.clone());
                                             }

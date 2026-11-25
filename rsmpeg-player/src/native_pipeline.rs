@@ -31,6 +31,41 @@ fn emit_preview(tx: &EventSender, ev: PlayerEvent) {
     tx.send_preview(ev);
 }
 
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn emit_native_video_frame(
+    event_tx: &EventSender,
+    frame: &rsmpeg_codec::Frame,
+    pts: Duration,
+    generation: u64,
+    is_preview: bool,
+) -> bool {
+    let w = frame.width;
+    let h = frame.height;
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let Ok(converted) = crate::video_convert::frame_to_rgba_cached(frame) else {
+        return false;
+    };
+    let ev = PlayerEvent::VideoFrame {
+        width: w,
+        height: h,
+        rgba: Arc::new(converted),
+        pts,
+        generation,
+    };
+    if is_preview {
+        emit_preview(event_tx, ev);
+    } else {
+        emit(event_tx, ev);
+    }
+    true
+}
+
 fn snap(
     playing: bool,
     position: Duration,
@@ -59,6 +94,10 @@ pub(crate) fn collect_native_tracks(
         let language = s.metadata.get("language").map(ToOwned::to_owned);
         match s.media_type {
             MediaType::Video => {
+                let supported = matches!(
+                    s.codec_id,
+                    CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo
+                );
                 video_tracks.push(PlayerTrackInfo {
                     index: s.index,
                     is_video: true,
@@ -68,11 +107,14 @@ pub(crate) fn collect_native_tracks(
                     sample_rate: None,
                     channels: None,
                     language,
-                    supported: s.codec_id == CodecId::H264,
+                    supported,
                 });
             }
             MediaType::Audio => {
-                let supported = matches!(s.codec_id, CodecId::Aac | CodecId::Pcm | CodecId::Mp3);
+                let supported = matches!(
+                    s.codec_id,
+                    CodecId::Flac | CodecId::Pcm | CodecId::Aac | CodecId::Mp3
+                );
                 audio_tracks.push(PlayerTrackInfo {
                     index: s.index,
                     is_video: false,
@@ -96,37 +138,78 @@ pub(crate) fn collect_native_tracks(
     feature = "backend-openh264",
     feature = "audio-rodio"
 ))]
+type NativeVideoDecoderBundle = (Option<Box<dyn rsmpeg_codec::Decoder>>, Option<String>);
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+type NativeAudioDecoderBundle = (
+    Option<Box<dyn rsmpeg_codec::Decoder>>,
+    Option<String>,
+    u16,
+    u32,
+);
+
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
 fn open_native_video_decoder(
     ctx: &FormatContext,
     stream_idx: usize,
     generation: u64,
     event_tx: &EventSender,
-) -> Option<crate::backend::OpenH264Decoder> {
-    let stream = ctx.streams.get(stream_idx)?;
-    if stream.codec_id != CodecId::H264 {
-        emit(
-            event_tx,
-            PlayerEvent::Warning {
-                message: format!(
-                    "Unsupported video codec '{}' — skipping video",
-                    stream.codec_id.name()
-                ),
-                generation,
-            },
-        );
-        return None;
-    }
-    match crate::backend::OpenH264Decoder::from_params(&stream.codec_params) {
-        Ok(d) => Some(d),
-        Err(e) => {
+) -> NativeVideoDecoderBundle {
+    let Some(stream) = ctx.streams.get(stream_idx) else {
+        return (None, None);
+    };
+    match stream.codec_id {
+        CodecId::Mjpeg => match rsmpeg_codec::MjpegDecoder::from_params(&stream.codec_params) {
+            Ok(d) => (Some(Box::new(d)), Some("rsmpeg-rust (MJPEG)".into())),
+            Err(e) => {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: format!("native path: failed to open MJPEG decoder: {e}"),
+                        generation,
+                    },
+                );
+                (None, None)
+            }
+        },
+        CodecId::RawVideo => {
+            let mut d = rsmpeg_codec::RawVideoDecoder::new();
+            d.set_parameters(stream.codec_params.clone());
+            (Some(Box::new(d)), Some("rsmpeg-rust (RawVideo)".into()))
+        }
+        CodecId::H264 => match crate::backend::OpenH264Decoder::from_params(&stream.codec_params) {
+            Ok(d) => (Some(Box::new(d)), Some("OpenH264 (H.264)".into())),
+            Err(e) => {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: format!("native path: failed to open OpenH264 decoder: {e}"),
+                        generation,
+                    },
+                );
+                (None, None)
+            }
+        },
+        other => {
             emit(
                 event_tx,
                 PlayerEvent::Warning {
-                    message: format!("native path: failed to open OpenH264 decoder: {e}"),
+                    message: format!(
+                        "Unsupported video codec '{}' — skipping video",
+                        other.name()
+                    ),
                     generation,
                 },
             );
-            None
+            (None, None)
         }
     }
 }
@@ -141,33 +224,61 @@ fn open_native_audio_decoder(
     stream_idx: usize,
     generation: u64,
     event_tx: &EventSender,
-) -> (
-    Option<crate::backend::symphonia_audio::SymphoniaAudioDecoder>,
-    u16,
-    u32,
-) {
+) -> NativeAudioDecoderBundle {
     use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
 
     let Some(stream) = ctx.streams.get(stream_idx) else {
-        return (None, 2, 44_100);
+        return (None, None, 2, 44_100);
     };
     let rate = stream.codec_params.sample_rate.unwrap_or(48_000);
     let ch = stream.codec_params.channels.unwrap_or(2);
-    if !SymphoniaAudioDecoder::supported(stream.codec_id) {
-        emit(
-            event_tx,
-            PlayerEvent::Warning {
-                message: format!(
-                    "native audio codec '{}' not wired — audio muted",
-                    stream.codec_id.name()
-                ),
-                generation,
-            },
-        );
-        (None, ch, rate)
-    } else {
-        match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
-            Ok(d) => (Some(d), ch, rate),
+    match stream.codec_id {
+        CodecId::Flac => match rsmpeg_codec::FlacDecoder::from_params(&stream.codec_params) {
+            Ok(d) => (
+                Some(Box::new(d)),
+                Some("rsmpeg-rust (FLAC)".into()),
+                ch,
+                rate,
+            ),
+            Err(e) => {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: format!("native path: failed to open FLAC decoder: {e}"),
+                        generation,
+                    },
+                );
+                (None, None, ch, rate)
+            }
+        },
+        CodecId::Pcm => match rsmpeg_codec::PCMAudioDecoder::from_params(&stream.codec_params) {
+            Ok(d) => (
+                Some(Box::new(d)),
+                Some("rsmpeg-rust (PCM)".into()),
+                ch,
+                rate,
+            ),
+            Err(e) => {
+                emit(
+                    event_tx,
+                    PlayerEvent::Warning {
+                        message: format!("native path: failed to open PCM decoder: {e}"),
+                        generation,
+                    },
+                );
+                (None, None, ch, rate)
+            }
+        },
+        CodecId::Aac | CodecId::Mp3 => match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
+            Ok(d) => (
+                Some(Box::new(d)),
+                Some(format!(
+                    "Symphonia ({})",
+                    stream.codec_id.name().to_ascii_uppercase()
+                )),
+                ch,
+                rate,
+            ),
             Err(e) => {
                 emit(
                     event_tx,
@@ -178,8 +289,21 @@ fn open_native_audio_decoder(
                         generation,
                     },
                 );
-                (None, ch, rate)
+                (None, None, ch, rate)
             }
+        },
+        other => {
+            emit(
+                event_tx,
+                PlayerEvent::Warning {
+                    message: format!(
+                        "native audio codec '{}' not wired — audio muted",
+                        other.name()
+                    ),
+                    generation,
+                },
+            );
+            (None, None, ch, rate)
         }
     }
 }
@@ -234,11 +358,9 @@ fn run_native_inner(
     event_tx: &EventSender,
 ) -> Result<(), String> {
     use rodio::{OutputStream, Sink};
-    use rsmpeg_codec::{DecodeStatus, Decoder};
+    use rsmpeg_codec::DecodeStatus;
 
     use crate::audio_convert::frame_to_s16_device;
-    use crate::backend::OpenH264Decoder;
-    use crate::video_convert::yuv420p_frame_to_rgba_cached;
 
     emit(
         event_tx,
@@ -256,7 +378,10 @@ fn run_native_inner(
     ctx.read_header().map_err(|e| e.to_string())?;
 
     let format_name = ctx.format_name.clone().unwrap_or_default();
-    let native_ok = matches!(format_name.as_str(), "mp4" | "mov" | "m4a" | "m4v" | "wav");
+    let native_ok = matches!(
+        format_name.as_str(),
+        "mp4" | "mov" | "m4a" | "m4v" | "wav" | "flac"
+    );
     if !native_ok {
         return Err(format!(
             "native demux not preferred for format '{format_name}'"
@@ -270,28 +395,33 @@ fn run_native_inner(
         .ok_or_else(|| "native demux produced no packets (fragmented or empty stbl)".to_string())?;
     let mut pending: Option<rsmpeg_codec::Packet> = Some(first);
 
-    let mut video_si = ctx
-        .streams
-        .iter()
-        .position(|s| s.media_type == MediaType::Video && s.codec_id == CodecId::H264);
+    let mut video_si = ctx.streams.iter().position(|s| {
+        s.media_type == MediaType::Video
+            && matches!(
+                s.codec_id,
+                CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo
+            )
+    });
     let mut audio_si = ctx.streams.iter().position(|s| {
         s.media_type == MediaType::Audio
             && matches!(
                 s.codec_id,
-                CodecId::Aac | CodecId::Pcm | CodecId::Mp3 | CodecId::Alac
+                CodecId::Flac | CodecId::Pcm | CodecId::Aac | CodecId::Mp3 | CodecId::Alac
             )
     });
 
     if video_si.is_none() && audio_si.is_none() {
-        return Err("native demux: no H.264 video or supported audio stream".into());
+        return Err("native demux: no supported video or audio stream".into());
     }
 
     let (video_tracks, audio_tracks) = collect_native_tracks(&ctx);
 
     if let Some(u) = ctx.streams.iter().find(|s| {
         s.media_type == MediaType::Video
-            && s.codec_id != CodecId::H264
-            && s.codec_id != CodecId::Unknown
+            && !matches!(
+                s.codec_id,
+                CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo | CodecId::Unknown
+            )
     }) {
         emit(
             event_tx,
@@ -326,15 +456,19 @@ fn run_native_inner(
     let assumed_frame_dur = 1.0 / 30.0;
     // ~50 ms late-drop threshold (VideoScheduler::new default).
     let mut video_scheduler = VideoScheduler::new();
+    let mut drop_until: Option<Duration> = None;
+    let mut last_dropped_frame: Option<(rsmpeg_codec::Frame, Duration)> = None;
 
-    // ── Video decoder (OpenH264 backend) ──
-    let mut video_dec: Option<OpenH264Decoder> =
-        video_si.and_then(|si| open_native_video_decoder(&ctx, si, generation, event_tx));
+    // ── Video decoder ──
+    let (mut video_dec, mut video_dec_name) = match video_si {
+        Some(si) => open_native_video_decoder(&ctx, si, generation, event_tx),
+        None => (None, None),
+    };
 
-    // ── Audio decoder (Symphonia packet-in backend) ──
-    let (mut audio_dec, mut audio_channels, mut audio_rate) = match audio_si {
+    // ── Audio decoder ──
+    let (mut audio_dec, mut audio_dec_name, mut audio_channels, mut audio_rate) = match audio_si {
         Some(si) => open_native_audio_decoder(&ctx, si, generation, event_tx),
-        None => (None, 2u16, 44_100u32),
+        None => (None, None, 2u16, 44_100u32),
     };
 
     let _rodio = OutputStream::try_default();
@@ -353,6 +487,15 @@ fn run_native_inner(
             audio_tracks: audio_tracks.clone(),
             active_video: video_si,
             active_audio: audio_si,
+            generation,
+        },
+    );
+    emit(
+        event_tx,
+        PlayerEvent::DecoderInfo {
+            demuxer: format!("rsmpeg-format ({format_name})"),
+            video_decoder: video_dec_name.clone(),
+            audio_decoder: audio_dec_name.clone(),
             generation,
         },
     );
@@ -440,8 +583,8 @@ fn run_native_inner(
                         }
                         PlayerCommand::Seek {
                             position: target,
+                            mode,
                             generation: g,
-                            ..
                         } => {
                             generation = g;
                             let capped = {
@@ -453,6 +596,9 @@ fn run_native_inner(
                                 }
                             };
                             position = Duration::from_secs_f64(capped);
+                            drop_until =
+                                (mode == crate::command::SeekMode::Precise).then_some(position);
+                            last_dropped_frame = None;
                             let ts_ms = (capped * 1000.0) as i64;
                             let _ = ctx.seek(ts_ms);
                             pending = ctx.read_frame().ok().flatten();
@@ -529,6 +675,21 @@ fn run_native_inner(
                                 snap(playing, position, duration, volume, g, "rate"),
                             );
                         }
+                        PlayerCommand::StepForward { generation: g } => {
+                            generation = g;
+                            playing = false;
+                            was_playing = false;
+                            playback_clock.pause();
+                            audio_master.pause();
+                            if let Some(ref s) = sink {
+                                s.pause();
+                            }
+                            force_one_frame = video_dec.is_some();
+                            emit(
+                                event_tx,
+                                snap(false, position, duration, volume, g, "paused"),
+                            );
+                        }
                         PlayerCommand::SelectAudioTrack {
                             index,
                             generation: g,
@@ -548,9 +709,10 @@ fn run_native_inner(
                                 );
                             } else {
                                 audio_si = Some(index);
-                                let (dec, ch, rate) =
+                                let (dec, dec_name, ch, rate) =
                                     open_native_audio_decoder(&ctx, index, g, event_tx);
                                 audio_dec = dec;
+                                audio_dec_name = dec_name;
                                 audio_channels = ch;
                                 audio_rate = rate;
                                 if eof_draining {
@@ -584,6 +746,15 @@ fn run_native_inner(
                                 );
                                 emit(
                                     event_tx,
+                                    PlayerEvent::DecoderInfo {
+                                        demuxer: format!("rsmpeg-format ({format_name})"),
+                                        video_decoder: video_dec_name.clone(),
+                                        audio_decoder: audio_dec_name.clone(),
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    event_tx,
                                     snap(playing, position, duration, volume, g, "audio-track"),
                                 );
                             }
@@ -607,7 +778,12 @@ fn run_native_inner(
                                 );
                             } else {
                                 video_si = Some(index);
-                                video_dec = open_native_video_decoder(&ctx, index, g, event_tx);
+                                let (dec, dec_name) =
+                                    open_native_video_decoder(&ctx, index, g, event_tx);
+                                video_dec = dec;
+                                video_dec_name = dec_name;
+                                drop_until = None;
+                                last_dropped_frame = None;
                                 video_time_base = Some({
                                     let tb = &ctx.streams[index].time_base;
                                     tb.num as f64 / tb.den.max(1) as f64
@@ -644,6 +820,15 @@ fn run_native_inner(
                                         audio_tracks: audio_tracks.clone(),
                                         active_video: video_si,
                                         active_audio: audio_si,
+                                        generation: g,
+                                    },
+                                );
+                                emit(
+                                    event_tx,
+                                    PlayerEvent::DecoderInfo {
+                                        demuxer: format!("rsmpeg-format ({format_name})"),
+                                        video_decoder: video_dec_name.clone(),
+                                        audio_decoder: audio_dec_name.clone(),
                                         generation: g,
                                     },
                                 );
@@ -731,25 +916,60 @@ fn run_native_inner(
                 Ok(Some(p)) => p,
                 Ok(None) | Err(_) => {
                     // Flush video decoder: send_packet(None) + drain remaining frames.
+                    let mut pending_flushed_preview: Option<(rsmpeg_codec::Frame, Duration)> = None;
                     if let Some(ref mut dec) = video_dec {
                         if dec.send_packet(None).is_ok() {
                             loop {
                                 match dec.receive_frame() {
                                     Ok(DecodeStatus::Frame(f)) => {
-                                        if let Ok(converted) = yuv420p_frame_to_rgba_cached(&f) {
-                                            let w = f.width;
-                                            let h = f.height;
-                                            if w > 0 && h > 0 {
-                                                emit(
-                                                    event_tx,
-                                                    PlayerEvent::VideoFrame {
-                                                        width: w,
-                                                        height: h,
-                                                        rgba: Arc::new(converted),
-                                                        pts: position,
-                                                        generation,
-                                                    },
-                                                );
+                                        let w = f.width;
+                                        let h = f.height;
+                                        if w > 0 && h > 0 {
+                                            let frame_pts = match (f.pts, video_time_base) {
+                                                (Some(pts), Some(spt))
+                                                    if spt > 0.0 && spt.is_finite() =>
+                                                {
+                                                    let base = *base_video_pts.get_or_insert(0);
+                                                    Duration::from_secs_f64(
+                                                        (pts.saturating_sub(base) as f64 * spt)
+                                                            .max(0.0),
+                                                    )
+                                                }
+                                                _ => position,
+                                            };
+                                            if let Some(t) = drop_until {
+                                                if video_scheduler.drop_before_seek(frame_pts, t) {
+                                                    if force_one_frame {
+                                                        pending_flushed_preview =
+                                                            Some((f, frame_pts));
+                                                    }
+                                                    continue;
+                                                }
+                                                drop_until = None;
+                                                last_dropped_frame = None;
+                                            }
+                                            if emit_native_video_frame(
+                                                event_tx,
+                                                &f,
+                                                frame_pts,
+                                                generation,
+                                                force_one_frame,
+                                            ) {
+                                                position = frame_pts;
+                                                if force_one_frame {
+                                                    if !playing {
+                                                        playback_clock.seek(position);
+                                                    }
+                                                    force_one_frame = false;
+                                                    emit(
+                                                        event_tx,
+                                                        PlayerEvent::PositionChanged {
+                                                            position,
+                                                            generation,
+                                                        },
+                                                    );
+                                                }
+                                                pending_flushed_preview = None;
                                             }
                                         }
                                     }
@@ -760,6 +980,27 @@ fn run_native_inner(
                             }
                         }
                     }
+                    if force_one_frame {
+                        if let Some((f, frame_pts)) =
+                            pending_flushed_preview.or_else(|| last_dropped_frame.take())
+                        {
+                            if emit_native_video_frame(event_tx, &f, frame_pts, generation, true) {
+                                position = frame_pts;
+                                if !playing {
+                                    playback_clock.seek(position);
+                                }
+                                emit(
+                                    event_tx,
+                                    PlayerEvent::PositionChanged {
+                                        position,
+                                        generation,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    drop_until = None;
+                    last_dropped_frame = None;
                     // Soft-flush audio decoder (append tail to sink, then drain inside main loop).
                     if let Some(ref mut dec) = audio_dec {
                         let _ = dec.send_packet(None);
@@ -817,7 +1058,18 @@ fn run_native_inner(
                                         _ => video_frame_index as f64 * assumed_frame_dur,
                                     };
                                     let frame_pts = Duration::from_secs_f64(abs_pos.max(0.0));
-                                    // Seek preview: always display without wait/drop.
+                                    if let Some(t) = drop_until {
+                                        if video_scheduler.drop_before_seek(frame_pts, t) {
+                                            video_frame_index += 1;
+                                            if force_one_frame {
+                                                last_dropped_frame = Some((f, frame_pts));
+                                            }
+                                            continue;
+                                        }
+                                        drop_until = None;
+                                        last_dropped_frame = None;
+                                    }
+                                    // Seek / step preview: always display without wait/drop.
                                     let mut present = true;
                                     if !force_one_frame {
                                         if !clock_started {
@@ -870,34 +1122,27 @@ fn run_native_inner(
                                         }
                                     }
                                     video_frame_index += 1;
-                                    position = frame_pts;
-                                    if present || force_one_frame {
-                                        if let Ok(converted) = yuv420p_frame_to_rgba_cached(&f) {
-                                            // Move the freshly converted plane straight into the
-                                            // event: wrapping it in an `Arc` makes later clones
-                                            // (e.g. duplicate-frame repeats) a refcount bump
-                                            // instead of a full-frame copy.
-                                            let frame_ev = PlayerEvent::VideoFrame {
-                                                width: w,
-                                                height: h,
-                                                rgba: Arc::new(converted),
-                                                pts: position,
-                                                generation,
-                                            };
-                                            if force_one_frame {
-                                                emit_preview(event_tx, frame_ev);
-                                            } else {
-                                                emit(event_tx, frame_ev);
-                                            }
-                                            force_one_frame = false;
-                                            emit(
-                                                event_tx,
-                                                PlayerEvent::PositionChanged {
-                                                    position,
-                                                    generation,
-                                                },
-                                            );
+                                    if (present || force_one_frame)
+                                        && emit_native_video_frame(
+                                            event_tx,
+                                            &f,
+                                            frame_pts,
+                                            generation,
+                                            force_one_frame,
+                                        )
+                                    {
+                                        position = frame_pts;
+                                        if force_one_frame && !playing {
+                                            playback_clock.seek(position);
                                         }
+                                        force_one_frame = false;
+                                        emit(
+                                            event_tx,
+                                            PlayerEvent::PositionChanged {
+                                                position,
+                                                generation,
+                                            },
+                                        );
                                     }
                                 }
                                 if stop || deferred_cmd.is_some() {
@@ -1067,5 +1312,41 @@ mod tests {
         assert_eq!(a[0].language.as_deref(), Some("eng"));
         assert_eq!(a[1].language.as_deref(), Some("zho"));
         assert!(a[0].supported);
+    }
+
+    #[test]
+    fn collect_native_tracks_marks_pure_rust_codecs_supported() {
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: None,
+            metadata: Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+
+        for (idx, codec) in [CodecId::Mjpeg, CodecId::RawVideo].into_iter().enumerate() {
+            let mut s = Stream::new(idx, codec);
+            s.media_type = MediaType::Video;
+            ctx.add_stream(s);
+        }
+        for (idx, codec) in [CodecId::Flac, CodecId::Pcm, CodecId::Opus]
+            .into_iter()
+            .enumerate()
+        {
+            let mut s = Stream::new(idx + 2, codec);
+            s.media_type = MediaType::Audio;
+            ctx.add_stream(s);
+        }
+
+        let (v, a) = collect_native_tracks(&ctx);
+        assert!(v[0].supported, "Mjpeg should be supported");
+        assert!(v[1].supported, "RawVideo should be supported");
+        assert!(a[0].supported, "Flac should be supported");
+        assert!(a[1].supported, "Pcm should be supported");
+        assert!(!a[2].supported, "Opus should remain unsupported");
     }
 }

@@ -45,6 +45,9 @@ pub enum PlayerCommand {
         rate: f64,
         generation: u64,
     },
+    StepForward {
+        generation: u64,
+    },
     Shutdown {
         generation: u64,
     },
@@ -61,6 +64,7 @@ impl PlayerCommand {
             | Self::SelectAudioTrack { generation, .. }
             | Self::SelectVideoTrack { generation, .. }
             | Self::SetPlaybackRate { generation, .. }
+            | Self::StepForward { generation }
             | Self::Shutdown { generation } => *generation,
         }
     }

@@ -40,5 +40,5 @@ pub use player::{
     Player, PlayerBuilder, PlayerError, PlayerState, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE,
 };
 pub use queue::BoundedQueue;
-pub use video_convert::yuv420p_frame_to_rgba;
+pub use video_convert::{frame_to_rgba_cached, yuv420p_frame_to_rgba};
 pub use video_scheduler::{ScheduleAction, VideoScheduler, VideoSchedulerStats};

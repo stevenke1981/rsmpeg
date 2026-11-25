@@ -1099,3 +1099,563 @@ fn saturated_stream_delivers_paused_seek_preview_frame() {
     let _ = player.shutdown();
     let _ = std::fs::remove_file(&path);
 }
+
+fn flac_crc8(data: &[u8]) -> u8 {
+    let mut crc = 0u8;
+    for &b in data {
+        crc ^= b;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn flac_crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc ^= u16::from(b) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Build a valid multi-frame 48 kHz mono 24-bit FLAC stream (`frame_count` × 4096 samples).
+fn build_24bit_mono_flac(frame_count: u64) -> Vec<u8> {
+    let blocksize: u16 = 4096;
+    let sample_rate: u32 = 48_000;
+    let channels: u16 = 1;
+    let bps: u16 = 24;
+    let total_samples = frame_count * u64::from(blocksize);
+
+    let mut si = vec![0u8; 34];
+    si[0..2].copy_from_slice(&blocksize.to_be_bytes());
+    si[2..4].copy_from_slice(&blocksize.to_be_bytes());
+    si[10] = (sample_rate >> 12) as u8;
+    si[11] = (sample_rate >> 4) as u8;
+    let ch_m1 = ((channels - 1) as u8) & 0x07;
+    let bps_m1 = ((bps - 1) as u8) & 0x1F;
+    si[12] = (((sample_rate & 0x0F) as u8) << 4) | (ch_m1 << 1) | (bps_m1 >> 4);
+    si[13] = ((bps_m1 & 0x0F) << 4) | (((total_samples >> 32) as u8) & 0x0F);
+    si[14..18].copy_from_slice(&(total_samples as u32).to_be_bytes());
+
+    let mut out = Vec::from(&b"fLaC"[..]);
+    out.push(0x80); // last metadata block, type 0 = STREAMINFO
+    out.push(0x00);
+    out.push(0x00);
+    out.push(34);
+    out.extend_from_slice(&si);
+
+    for frame_num in 0..frame_count {
+        assert!(frame_num < 0x80, "single-byte UTF-8 coded frame number");
+        let mut frame = vec![
+            0xFF,
+            0xF8,           // sync + fixed blocksize
+            (12 << 4) | 10, // bs_code=12 (4096), sr_code=10 (48000 Hz)
+            6 << 1,         // ch_code=0 (mono), bps_code=6 (24-bit), reserved=0
+            frame_num as u8,
+        ];
+        frame.push(flac_crc8(&frame));
+        // Subframe header: pad=0, CONSTANT=0, wasted=0
+        frame.push(0x00);
+        // Alternating 24-bit signed square-wave amplitude (+0x10_0000 / -0x10_0000)
+        let sample24: i32 = if frame_num % 2 == 0 {
+            0x10_0000
+        } else {
+            -0x10_0000
+        };
+        frame.push(((sample24 >> 16) & 0xFF) as u8);
+        frame.push(((sample24 >> 8) & 0xFF) as u8);
+        frame.push((sample24 & 0xFF) as u8);
+        let c16 = flac_crc16(&frame);
+        frame.extend_from_slice(&c16.to_be_bytes());
+        out.extend_from_slice(&frame);
+    }
+    out
+}
+
+/// Minimal valid 8×8 grayscale baseline JPEG (using Annex K default Huffman tables).
+fn build_synthetic_jpeg_8x8() -> Vec<u8> {
+    let mut out = Vec::new();
+    // SOI
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    // DQT: table 0, 8-bit, all ones
+    out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    out.extend_from_slice(&[1u8; 64]);
+    // SOF0: 8-bit, 8x8, 1 component (id=1, sampling=1x1, qt=0)
+    out.extend_from_slice(&[
+        0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, 0x01, 0x11, 0x00,
+    ]);
+    // SOS: 1 component (id=1, dc=0 ac=0), spectral 0..63
+    out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+    // Entropy scan: DC diff=0 ('00') + AC EOB ('1010') + padding '11' -> 0x2B (solid gray 128)
+    out.push(0x2B);
+    // EOI
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+/// Build a valid MJPEG-in-MP4 (`jpeg` sample entry) with `frame_count` frames.
+fn build_mjpeg_mp4(frame_count: u32, frame_duration_ms: u32) -> Vec<u8> {
+    let jpeg = build_synthetic_jpeg_8x8();
+    let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
+
+    let sample_size = jpeg.len() as u32;
+    let mut mdat_payload = Vec::with_capacity((sample_size * frame_count) as usize);
+    for _ in 0..frame_count {
+        mdat_payload.extend_from_slice(&jpeg);
+    }
+    let mdat = box_bytes(b"mdat", &mdat_payload);
+
+    let data_offset = (ftyp.len() + 8) as u32;
+    let duration_ms = frame_count * frame_duration_ms;
+
+    let mut mvhd_body = vec![0u8; 96];
+    mvhd_body[8..12].copy_from_slice(&be32(1000));
+    mvhd_body[12..16].copy_from_slice(&be32(duration_ms));
+    mvhd_body[16..20].copy_from_slice(&be32(0x0001_0000));
+    mvhd_body[20..22].copy_from_slice(&0x0100u16.to_be_bytes());
+    mvhd_body[32..36].copy_from_slice(&be32(0x0001_0000));
+    mvhd_body[48..52].copy_from_slice(&be32(0x0001_0000));
+    mvhd_body[64..68].copy_from_slice(&be32(0x4000_0000));
+    mvhd_body[92..96].copy_from_slice(&be32(2));
+    let mvhd = box_bytes(b"mvhd", &fullbox(0, 0, &mvhd_body));
+
+    let mut tkhd_body = vec![0u8; 80];
+    tkhd_body[8..12].copy_from_slice(&be32(1));
+    tkhd_body[16..20].copy_from_slice(&be32(duration_ms));
+    tkhd_body[36..40].copy_from_slice(&be32(0x0001_0000));
+    tkhd_body[52..56].copy_from_slice(&be32(0x0001_0000));
+    tkhd_body[68..72].copy_from_slice(&be32(0x4000_0000));
+    tkhd_body[72..76].copy_from_slice(&be32(8 << 16));
+    tkhd_body[76..80].copy_from_slice(&be32(8 << 16));
+    let tkhd = box_bytes(b"tkhd", &fullbox(0, 3, &tkhd_body));
+
+    let mut mdhd_body = vec![0u8; 20];
+    mdhd_body[8..12].copy_from_slice(&be32(1000));
+    mdhd_body[12..16].copy_from_slice(&be32(duration_ms));
+    let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+    let mut hdlr_body = vec![0u8; 21];
+    hdlr_body[4..8].copy_from_slice(b"vide");
+    let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+    let vmhd = box_bytes(b"vmhd", &fullbox(0, 1, &[0u8; 8]));
+    let url_box = box_bytes(b"url ", &fullbox(0, 1, &[]));
+    let mut dref_body = Vec::new();
+    dref_body.extend_from_slice(&be32(1));
+    dref_body.extend_from_slice(&url_box);
+    let dinf = box_bytes(b"dinf", &box_bytes(b"dref", &fullbox(0, 0, &dref_body)));
+
+    // stsd -> jpeg (78-byte VisualSampleEntry)
+    let mut jpeg_entry_body = vec![0u8; 78];
+    jpeg_entry_body[6..8].copy_from_slice(&1u16.to_be_bytes());
+    jpeg_entry_body[24..26].copy_from_slice(&8u16.to_be_bytes());
+    jpeg_entry_body[26..28].copy_from_slice(&8u16.to_be_bytes());
+    jpeg_entry_body[28..32].copy_from_slice(&be32(0x0048_0000));
+    jpeg_entry_body[32..36].copy_from_slice(&be32(0x0048_0000));
+    jpeg_entry_body[40..42].copy_from_slice(&1u16.to_be_bytes());
+    jpeg_entry_body[74..76].copy_from_slice(&24u16.to_be_bytes());
+    jpeg_entry_body[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    let jpeg_entry = box_bytes(b"jpeg", &jpeg_entry_body);
+
+    let mut stsd_body = Vec::new();
+    stsd_body.extend_from_slice(&be32(1));
+    stsd_body.extend_from_slice(&jpeg_entry);
+    let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_body));
+
+    let mut stts_body = Vec::new();
+    stts_body.extend_from_slice(&be32(1));
+    stts_body.extend_from_slice(&be32(frame_count));
+    stts_body.extend_from_slice(&be32(frame_duration_ms));
+    let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_body));
+
+    let mut stsc_body = Vec::new();
+    stsc_body.extend_from_slice(&be32(1));
+    stsc_body.extend_from_slice(&be32(1));
+    stsc_body.extend_from_slice(&be32(frame_count));
+    stsc_body.extend_from_slice(&be32(1));
+    let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_body));
+
+    let mut stsz_body = Vec::new();
+    stsz_body.extend_from_slice(&be32(sample_size));
+    stsz_body.extend_from_slice(&be32(frame_count));
+    let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_body));
+
+    let mut stco_body = Vec::new();
+    stco_body.extend_from_slice(&be32(1));
+    stco_body.extend_from_slice(&be32(data_offset));
+    let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_body));
+
+    let mut stss_body = Vec::new();
+    stss_body.extend_from_slice(&be32(frame_count));
+    for i in 1..=frame_count {
+        stss_body.extend_from_slice(&be32(i));
+    }
+    let stss = box_bytes(b"stss", &fullbox(0, 0, &stss_body));
+
+    let mut stbl_body = Vec::new();
+    for b in [&stsd, &stts, &stsc, &stsz, &stco, &stss] {
+        stbl_body.extend_from_slice(b);
+    }
+    let stbl = box_bytes(b"stbl", &stbl_body);
+
+    let mut minf_body = Vec::new();
+    minf_body.extend_from_slice(&vmhd);
+    minf_body.extend_from_slice(&dinf);
+    minf_body.extend_from_slice(&stbl);
+    let minf = box_bytes(b"minf", &minf_body);
+
+    let mut mdia_body = Vec::new();
+    mdia_body.extend_from_slice(&mdhd);
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = box_bytes(b"mdia", &mdia_body);
+
+    let mut trak_body = Vec::new();
+    trak_body.extend_from_slice(&tkhd);
+    trak_body.extend_from_slice(&mdia);
+    let trak = box_bytes(b"trak", &trak_body);
+
+    let mut moov_body = Vec::new();
+    moov_body.extend_from_slice(&mvhd);
+    moov_body.extend_from_slice(&trak);
+    let moov = box_bytes(b"moov", &moov_body);
+
+    let mut file = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&mdat);
+    file.extend_from_slice(&moov);
+    file
+}
+
+#[test]
+fn native_wav_emits_pure_rust_decoder_info() {
+    let path = unique_temp_path("native_wav_decoder_info", "wav");
+    std::fs::write(&path, build_pcm_wav(1)).expect("write wav fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .playback_rate(4.0)
+        .volume(0.0)
+        .build()
+        .expect("build wav player");
+
+    let mut info = None;
+    let mut saw_audio_level = false;
+    let mut saw_ended = false;
+    let done = watch(&mut player, Duration::from_secs(5), |ev| {
+        match ev {
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => {
+                info = Some((demuxer, video_decoder, audio_decoder));
+            }
+            PlayerEvent::AudioLevel { peak, .. } if peak > 0.0 => {
+                saw_audio_level = true;
+            }
+            PlayerEvent::Ended { .. } => {
+                saw_ended = true;
+            }
+            _ => {}
+        }
+        saw_ended
+    });
+
+    assert!(done, "expected WAV playback to finish with Ended");
+    assert_eq!(
+        info,
+        Some((
+            "rsmpeg-format (wav)".to_string(),
+            None,
+            Some("rsmpeg-rust (PCM)".to_string()),
+        ))
+    );
+    assert!(saw_audio_level, "expected non-zero AudioLevel from WAV PCM");
+    assert_eq!(player.state(), PlayerState::Ended);
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn native_flac_decodes_seeks_and_finishes() {
+    // 20 frames × 4096 samples @ 48 kHz ≈ 1.706 s
+    let path = unique_temp_path("native_flac_playback", "flac");
+    std::fs::write(&path, build_24bit_mono_flac(20)).expect("write flac fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .playback_rate(1.0)
+        .volume(0.0)
+        .build()
+        .expect("build flac player");
+
+    let mut info = None;
+    let mut saw_level = false;
+    let ready = watch(&mut player, Duration::from_secs(3), |ev| {
+        match ev {
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => {
+                info = Some((demuxer, video_decoder, audio_decoder));
+            }
+            PlayerEvent::AudioLevel { peak, .. } if peak > 0.0 => {
+                saw_level = true;
+            }
+            _ => {}
+        }
+        info.is_some() && saw_level
+    });
+    assert!(
+        ready,
+        "expected DecoderInfo and non-zero AudioLevel for FLAC"
+    );
+    assert_eq!(
+        info,
+        Some((
+            "rsmpeg-format (flac)".to_string(),
+            None,
+            Some("rsmpeg-rust (FLAC)".to_string()),
+        ))
+    );
+
+    let seek_target = Duration::from_millis(800);
+    player.seek(seek_target).expect("seek flac");
+    let seek_gen = player.generation();
+    player
+        .set_playback_rate(4.0)
+        .expect("speed up tail of flac");
+
+    let mut saw_seek = false;
+    let mut saw_ended = false;
+    let finished = watch(&mut player, Duration::from_secs(5), |ev| {
+        match ev {
+            PlayerEvent::SeekCompleted {
+                position,
+                generation,
+            } if generation == seek_gen => {
+                saw_seek = position == seek_target;
+            }
+            PlayerEvent::Ended { .. } => {
+                saw_ended = true;
+            }
+            _ => {}
+        }
+        saw_seek && saw_ended
+    });
+
+    assert!(saw_seek, "expected SeekCompleted for FLAC");
+    assert!(
+        finished && saw_ended,
+        "expected FLAC playback to reach Ended"
+    );
+    assert_eq!(player.state(), PlayerState::Ended);
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn native_mjpeg_mp4_decodes_frames_and_steps_forward() {
+    // 60 frames × 50 ms = 3.0 s @ 20 fps
+    let path = unique_temp_path("native_mjpeg_step", "mp4");
+    std::fs::write(&path, build_mjpeg_mp4(60, 50)).expect("write mjpeg mp4 fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(true)
+        .volume(0.0)
+        .build()
+        .expect("build mjpeg player");
+
+    let mut info = None;
+    let mut first_frame_ok = false;
+    let ready = watch(&mut player, Duration::from_secs(3), |ev| {
+        match ev {
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => {
+                info = Some((demuxer, video_decoder, audio_decoder));
+            }
+            PlayerEvent::VideoFrame {
+                width,
+                height,
+                rgba,
+                ..
+            } => {
+                first_frame_ok = width == 8
+                    && height == 8
+                    && rgba.len() == 8 * 8 * 4
+                    && rgba.iter().any(|&b| b != 0);
+            }
+            _ => {}
+        }
+        info.is_some() && first_frame_ok
+    });
+    assert!(ready, "expected DecoderInfo and non-zero MJPEG VideoFrame");
+    assert_eq!(
+        info,
+        Some((
+            "rsmpeg-format (mp4)".to_string(),
+            Some("rsmpeg-rust (MJPEG)".to_string()),
+            None,
+        ))
+    );
+
+    player.pause().expect("pause mjpeg");
+    let mut paused_pts = Duration::ZERO;
+    let mut saw_pause = false;
+    let paused = watch(&mut player, Duration::from_secs(2), |ev| {
+        match ev {
+            PlayerEvent::VideoFrame { pts, .. } => {
+                paused_pts = pts;
+            }
+            PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing => {
+                saw_pause = true;
+            }
+            _ => {}
+        }
+        saw_pause
+    });
+    assert!(paused, "expected paused snapshot");
+    // Drain any in-flight frames emitted just before Pause took effect.
+    thread::sleep(Duration::from_millis(40));
+    while let Some(ev) = player.poll_event() {
+        if let PlayerEvent::VideoFrame { pts, .. } = ev {
+            paused_pts = pts;
+        }
+    }
+
+    player.step_forward().expect("step forward");
+    let step_gen = player.generation();
+    assert!(!player.is_playing());
+    assert_eq!(player.state(), PlayerState::Paused);
+
+    let mut stepped_frame = None;
+    let got_step = watch(&mut player, Duration::from_secs(2), |ev| {
+        if let PlayerEvent::VideoFrame {
+            width,
+            height,
+            rgba,
+            pts,
+            generation,
+        } = ev
+        {
+            if generation == step_gen {
+                stepped_frame = Some((width, height, rgba, pts));
+                return true;
+            }
+        }
+        false
+    });
+    assert!(got_step, "expected stepped VideoFrame at gen={step_gen}");
+    let (sw, sh, srgba, spts) = stepped_frame.unwrap();
+    assert_eq!((sw, sh), (8, 8));
+    assert!(srgba.iter().any(|&b| b != 0));
+    assert!(
+        spts > paused_pts,
+        "step_forward must advance PTS past paused_pts ({paused_pts:?}), got {spts:?}"
+    );
+
+    // Ensure no extra frames emit while remaining paused.
+    thread::sleep(Duration::from_millis(120));
+    let mut extra_frames = 0usize;
+    while let Some(ev) = player.poll_event() {
+        if matches!(ev, PlayerEvent::VideoFrame { .. }) {
+            extra_frames += 1;
+        }
+    }
+    assert_eq!(
+        extra_frames, 0,
+        "step_forward must advance exactly one frame"
+    );
+    assert!(!player.is_playing());
+    assert_eq!(player.state(), PlayerState::Paused);
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn native_mjpeg_mp4_seek_precise_lands_at_target_while_paused() {
+    // 20 frames × 50 ms = 1.0 s (keyframes at 0, 50, 100, ..., 950 ms)
+    let path = unique_temp_path("native_mjpeg_seek_precise", "mp4");
+    std::fs::write(&path, build_mjpeg_mp4(20, 50)).expect("write mjpeg mp4 fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(false)
+        .volume(0.0)
+        .build()
+        .expect("build paused mjpeg player");
+
+    assert!(
+        watch(&mut player, Duration::from_secs(2), |ev| {
+            matches!(ev, PlayerEvent::Snapshot(s) if s.status == "paused")
+        }),
+        "expected initial paused snapshot"
+    );
+
+    let target = Duration::from_millis(450);
+    player.seek_precise(target).expect("seek_precise");
+    let seek_gen = player.generation();
+
+    let mut seek_ack = false;
+    let mut preview_pts = None;
+    let got = watch(&mut player, Duration::from_secs(2), |ev| {
+        match ev {
+            PlayerEvent::SeekCompleted {
+                position,
+                generation,
+            } if generation == seek_gen => {
+                seek_ack = position == target;
+            }
+            PlayerEvent::VideoFrame {
+                pts, generation, ..
+            } if generation == seek_gen => {
+                preview_pts = Some(pts);
+            }
+            _ => {}
+        }
+        seek_ack && preview_pts.is_some()
+    });
+    assert!(got, "expected SeekCompleted and preview VideoFrame");
+    let pts = preview_pts.unwrap();
+    assert!(
+        pts >= target,
+        "precise seek preview must drop pre-target frames and land >= {target:?}, got {pts:?}"
+    );
+    assert!(!player.is_playing());
+    assert!(
+        matches!(player.state(), PlayerState::Paused | PlayerState::Ready),
+        "unexpected state after paused precise seek: {:?}",
+        player.state()
+    );
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
