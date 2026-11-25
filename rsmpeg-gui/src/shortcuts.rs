@@ -3,6 +3,12 @@
 /// Seek step in seconds for `←` / `→` shortcuts.
 pub const SEEK_STEP_SECS: f64 = 5.0;
 
+/// Long seek step in seconds for `Shift+←` / `Shift+→` shortcuts.
+pub const SEEK_LONG_STEP_SECS: f64 = 30.0;
+
+/// Fine seek step in seconds for `Ctrl+←` / `Ctrl+→` shortcuts.
+pub const SEEK_FINE_STEP_SECS: f64 = 1.0;
+
 /// Volume step (`0.0..=1.0`) for `↑` / `↓` shortcuts.
 pub const VOLUME_STEP: f32 = 0.05;
 
@@ -12,6 +18,11 @@ pub enum ShortcutAction {
     TogglePlayPause,
     SeekBackward,
     SeekForward,
+    SeekBackwardLong,
+    SeekForwardLong,
+    SeekBackwardFine,
+    SeekForwardFine,
+    JumpToPercent(u8),
     VolumeUp,
     VolumeDown,
     ToggleFullscreen,
@@ -28,6 +39,18 @@ pub enum ShortcutAction {
     ToggleLocale,
     SpeedDown,
     SpeedUp,
+    ResetSpeed,
+    CycleRepeatMode,
+    RotateVideo,
+    ToggleShuffle,
+    CycleAbLoop,
+    StepFrameForward,
+    ToggleSubtitles,
+    LoadSubtitle,
+    CycleAspectMode,
+    ToggleToolsMenu,
+    TakeScreenshot,
+    ToggleShortcutsHelp,
 }
 
 /// Platform-agnostic key press snapshot for shortcut matching.
@@ -60,25 +83,52 @@ pub fn map_key_to_action(input: KeyInput<'_>) -> Option<ShortcutAction> {
 
     let key_lower = input.key.to_ascii_lowercase();
 
-    // Ctrl+O is a standard synonym for opening files.
+    // Ctrl shortcuts.
     if input.ctrl {
+        if input.shift {
+            return None;
+        }
         return match key_lower.as_str() {
             "o" => Some(ShortcutAction::OpenFile),
+            "left" | "arrowleft" => Some(ShortcutAction::SeekBackwardFine),
+            "right" | "arrowright" => Some(ShortcutAction::SeekForwardFine),
             _ => None,
         };
     }
 
     match key_lower.as_str() {
         "space" | " " => Some(ShortcutAction::TogglePlayPause),
-        "left" | "arrowleft" => Some(ShortcutAction::SeekBackward),
-        "right" | "arrowright" => Some(ShortcutAction::SeekForward),
+        "left" | "arrowleft" => Some(if input.shift {
+            ShortcutAction::SeekBackwardLong
+        } else {
+            ShortcutAction::SeekBackward
+        }),
+        "right" | "arrowright" => Some(if input.shift {
+            ShortcutAction::SeekForwardLong
+        } else {
+            ShortcutAction::SeekForward
+        }),
         "up" | "arrowup" => Some(ShortcutAction::VolumeUp),
         "down" | "arrowdown" => Some(ShortcutAction::VolumeDown),
         "f" => Some(ShortcutAction::ToggleFullscreen),
         "escape" | "esc" => Some(ShortcutAction::ExitFullscreen),
         "m" => Some(ShortcutAction::ToggleMute),
         "o" => Some(ShortcutAction::OpenFile),
-        "s" => Some(ShortcutAction::Stop),
+        "s" => Some(if input.shift {
+            ShortcutAction::TakeScreenshot
+        } else {
+            ShortcutAction::Stop
+        }),
+        "r" => Some(if input.shift {
+            ShortcutAction::RotateVideo
+        } else {
+            ShortcutAction::CycleRepeatMode
+        }),
+        "c" => Some(if input.shift {
+            ShortcutAction::LoadSubtitle
+        } else {
+            ShortcutAction::ToggleSubtitles
+        }),
         "n" | "pagedown" => Some(ShortcutAction::NextTrack),
         "p" | "pageup" => Some(ShortcutAction::PrevTrack),
         "i" => Some(ShortcutAction::ToggleInfoPanel),
@@ -88,6 +138,17 @@ pub fn map_key_to_action(input: KeyInput<'_>) -> Option<ShortcutAction> {
         "g" => Some(ShortcutAction::ToggleLocale),
         "[" => Some(ShortcutAction::SpeedDown),
         "]" => Some(ShortcutAction::SpeedUp),
+        "backspace" => Some(ShortcutAction::ResetSpeed),
+        "h" => Some(ShortcutAction::ToggleShuffle),
+        "b" => Some(ShortcutAction::CycleAbLoop),
+        "." => Some(ShortcutAction::StepFrameForward),
+        "d" => Some(ShortcutAction::CycleAspectMode),
+        "t" => Some(ShortcutAction::ToggleToolsMenu),
+        "?" | "f1" => Some(ShortcutAction::ToggleShortcutsHelp),
+        "/" if input.shift => Some(ShortcutAction::ToggleShortcutsHelp),
+        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => Some(
+            ShortcutAction::JumpToPercent(key_lower.as_bytes()[0] - b'0'),
+        ),
         _ => None,
     }
 }
@@ -213,5 +274,118 @@ mod tests {
             Some(ShortcutAction::SpeedUp)
         );
         assert_eq!(map_key_to_action(KeyInput::plain("z")), None);
+    }
+
+    #[test]
+    fn maps_extended_playback_video_subtitle_and_help_shortcuts() {
+        let shifted = |key| KeyInput {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: true,
+            meta: false,
+        };
+        let ctrled = |key| KeyInput {
+            key,
+            ctrl: true,
+            alt: false,
+            shift: false,
+            meta: false,
+        };
+
+        assert_eq!(
+            map_key_to_action(shifted("left")),
+            Some(ShortcutAction::SeekBackwardLong)
+        );
+        assert_eq!(
+            map_key_to_action(shifted("right")),
+            Some(ShortcutAction::SeekForwardLong)
+        );
+        assert_eq!(
+            map_key_to_action(ctrled("left")),
+            Some(ShortcutAction::SeekBackwardFine)
+        );
+        assert_eq!(
+            map_key_to_action(ctrled("right")),
+            Some(ShortcutAction::SeekForwardFine)
+        );
+
+        for digit in 0..=9u8 {
+            let s = digit.to_string();
+            assert_eq!(
+                map_key_to_action(KeyInput::plain(&s)),
+                Some(ShortcutAction::JumpToPercent(digit))
+            );
+        }
+
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("backspace")),
+            Some(ShortcutAction::ResetSpeed)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("r")),
+            Some(ShortcutAction::CycleRepeatMode)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("R")),
+            Some(ShortcutAction::CycleRepeatMode)
+        );
+        assert_eq!(
+            map_key_to_action(shifted("r")),
+            Some(ShortcutAction::RotateVideo)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("h")),
+            Some(ShortcutAction::ToggleShuffle)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("b")),
+            Some(ShortcutAction::CycleAbLoop)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain(".")),
+            Some(ShortcutAction::StepFrameForward)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("c")),
+            Some(ShortcutAction::ToggleSubtitles)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("C")),
+            Some(ShortcutAction::ToggleSubtitles)
+        );
+        assert_eq!(
+            map_key_to_action(shifted("c")),
+            Some(ShortcutAction::LoadSubtitle)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("d")),
+            Some(ShortcutAction::CycleAspectMode)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("t")),
+            Some(ShortcutAction::ToggleToolsMenu)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("s")),
+            Some(ShortcutAction::Stop)
+        );
+        assert_eq!(
+            map_key_to_action(shifted("s")),
+            Some(ShortcutAction::TakeScreenshot)
+        );
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("?")),
+            Some(ShortcutAction::ToggleShortcutsHelp)
+        );
+        assert_eq!(
+            map_key_to_action(shifted("/")),
+            Some(ShortcutAction::ToggleShortcutsHelp)
+        );
+        assert_eq!(map_key_to_action(KeyInput::plain("/")), None);
+        assert_eq!(
+            map_key_to_action(KeyInput::plain("f1")),
+            Some(ShortcutAction::ToggleShortcutsHelp)
+        );
     }
 }

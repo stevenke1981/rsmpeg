@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 rsmpeg = { path = "../rsmpeg" }
 rsmpeg-player = { path = "../rsmpeg-player" }
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
 smallvec = "1"
 rfd = "0.15"
 clap = { workspace = true, features = ["derive"] }

@@ -3,16 +3,16 @@
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, Context, InteractiveElement, IntoElement, MouseButton,
-    ObjectFit, ParentElement, RenderImage, Styled,
+    div, img, prelude::*, px, rgba, AnyElement, Context, InteractiveElement, IntoElement,
+    MouseButton, ObjectFit, ParentElement, RenderImage, ScrollWheelEvent, Styled,
 };
 
 use crate::format_time::{format_channels_for, format_sample_rate};
 use crate::i18n::UiStrings;
-use crate::state::{PlaybackStatus, PlaybackUiState};
+use crate::state::{AspectMode, PlaybackStatus, PlaybackUiState};
 use crate::ui::{theme, PlayerView};
 
-/// Render the central media viewport (video canvas, audio stage, welcome screen, or error view).
+/// Render the central media viewport (video canvas, audio stage, welcome screen, overlays, or error view).
 pub fn render_stage(
     state: &PlaybackUiState,
     current_frame: Option<&Arc<RenderImage>>,
@@ -20,11 +20,16 @@ pub fn render_stage(
     cx: &mut Context<PlayerView>,
 ) -> AnyElement {
     let has_loaded_item = state.playlist.current_item().is_some();
+    let object_fit = match state.aspect_mode {
+        AspectMode::Contain => ObjectFit::Contain,
+        AspectMode::Cover => ObjectFit::Cover,
+        AspectMode::Fill => ObjectFit::Fill,
+    };
 
     let body: AnyElement = if !has_loaded_item && state.error_message.is_none() {
         render_welcome(strings, cx)
     } else if let Some(frame) = current_frame {
-        render_video_canvas(frame.clone(), cx)
+        render_video_canvas(frame.clone(), object_fit, cx)
     } else if state.status == PlaybackStatus::Error {
         render_error_stage(state, strings, cx)
     } else if state.is_audio_only_stage() {
@@ -33,7 +38,18 @@ pub fn render_stage(
         render_loading_stage(state, strings)
     };
 
+    let subtitle_overlay = state
+        .active_subtitle_text()
+        .map(|text| render_subtitle_overlay(text, state.subtitle_size.font_px()));
+    let osd_toast = state.osd_message.clone().map(render_osd_toast);
+    let help_modal = if state.show_shortcuts_help {
+        Some(render_shortcuts_modal(strings, cx))
+    } else {
+        None
+    };
+
     div()
+        .id("media-stage")
         .flex()
         .flex_col()
         .flex_1()
@@ -41,6 +57,19 @@ pub fn render_stage(
         .min_h_0()
         .bg(theme::bg_canvas())
         .overflow_hidden()
+        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| {
+            this.handle_scroll_wheel(ev, cx);
+        }))
+        .on_mouse_move(
+            cx.listener(|this, _ev: &gpui::MouseMoveEvent, _window, cx| {
+                this.clear_seek_hover(cx);
+            }),
+        )
+        .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+            if !*hovered {
+                this.clear_seek_hover(cx);
+            }
+        }))
         .when(
             state.error_message.is_some() && current_frame.is_some(),
             |el| {
@@ -65,17 +94,25 @@ pub fn render_stage(
         })
         .child(
             div()
+                .relative()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_w_0()
                 .min_h_0()
-                .child(body),
+                .child(body)
+                .when_some(subtitle_overlay, |el, sub| el.child(sub))
+                .when_some(osd_toast, |el, toast| el.child(toast))
+                .when_some(help_modal, |el, modal| el.child(modal)),
         )
         .into_any_element()
 }
 
-fn render_video_canvas(frame: Arc<RenderImage>, cx: &mut Context<PlayerView>) -> AnyElement {
+fn render_video_canvas(
+    frame: Arc<RenderImage>,
+    object_fit: ObjectFit,
+    cx: &mut Context<PlayerView>,
+) -> AnyElement {
     div()
         .id("video-canvas")
         .flex()
@@ -93,7 +130,191 @@ fn render_video_canvas(frame: Arc<RenderImage>, cx: &mut Context<PlayerView>) ->
                 }
             }),
         )
-        .child(img(frame).size_full().object_fit(ObjectFit::Contain))
+        .child(img(frame).size_full().object_fit(object_fit))
+        .into_any_element()
+}
+
+fn render_subtitle_overlay(text: String, font_px: f32) -> AnyElement {
+    div()
+        .id("subtitle-overlay")
+        .absolute()
+        .bottom(px(22.0))
+        .left_6()
+        .right_6()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .max_w(px(780.0))
+                .px_4()
+                .py_1p5()
+                .rounded_lg()
+                .bg(rgba(0x090c11cc))
+                .border_1()
+                .border_color(rgba(0x36456180))
+                .text_size(px(font_px))
+                .text_color(theme::text_primary())
+                .text_center()
+                .child(text),
+        )
+        .into_any_element()
+}
+
+fn render_osd_toast(message: String) -> AnyElement {
+    div()
+        .id("osd-toast")
+        .absolute()
+        .top(px(16.0))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .px_3p5()
+                .py_1p5()
+                .rounded_full()
+                .bg(rgba(0x141923eb))
+                .border_1()
+                .border_color(theme::border_strong())
+                .shadow_md()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme::text_primary())
+                .child(message),
+        )
+        .into_any_element()
+}
+
+fn render_shortcuts_modal(strings: &UiStrings, cx: &mut Context<PlayerView>) -> AnyElement {
+    let rows = strings
+        .shortcuts_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, (key, desc))| {
+            div()
+                .id(("shortcut-row", idx))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .px_2p5()
+                .py_1p5()
+                .rounded_md()
+                .bg(if idx.is_multiple_of(2) {
+                    theme::bg_surface()
+                } else {
+                    theme::bg_elevated()
+                })
+                .child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(theme::bg_canvas())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .font_family(theme::MONO_FONT_FAMILY)
+                        .text_xs()
+                        .text_color(theme::accent())
+                        .child(*key),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_right()
+                        .text_xs()
+                        .text_color(theme::text_primary())
+                        .child(*desc),
+                )
+        });
+
+    div()
+        .id("shortcuts-help-backdrop")
+        .occlude()
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x090c11b8))
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_6()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                this.focus_root(window);
+                this.close_shortcuts_help(cx);
+            }),
+        )
+        .child(
+            div()
+                .id("shortcuts-help-modal")
+                .occlude()
+                .flex()
+                .flex_col()
+                .w(px(520.0))
+                .max_w_full()
+                .max_h(px(480.0))
+                .rounded_xl()
+                .bg(theme::bg_elevated())
+                .border_1()
+                .border_color(theme::border_strong())
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .px_4()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(theme::border_subtle())
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::accent())
+                                .child(strings.shortcuts_title),
+                        )
+                        .child(
+                            div()
+                                .id("close-shortcuts-modal")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(theme::bg_surface())
+                                .hover(|s| s.bg(theme::bg_hover()))
+                                .text_xs()
+                                .text_color(theme::text_secondary())
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.focus_root(window);
+                                    this.close_shortcuts_help(cx);
+                                }))
+                                .child("✕"),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("shortcuts-help-scroll")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_3()
+                        .gap_1()
+                        .children(rows),
+                ),
+        )
         .into_any_element()
 }
 

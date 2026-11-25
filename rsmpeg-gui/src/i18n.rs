@@ -125,6 +125,77 @@ pub struct UiStrings {
 
     // Shortcuts legend
     pub shortcuts_hint: &'static str,
+
+    // Repeat, shuffle, A-B loop, frame step
+    pub repeat_off: &'static str,
+    pub repeat_all: &'static str,
+    pub repeat_one: &'static str,
+    pub shuffle_on: &'static str,
+    pub shuffle_off: &'static str,
+    pub ab_loop_btn: &'static str,
+    pub ab_loop_set_a: &'static str,
+    pub ab_loop_set_b: &'static str,
+    pub ab_loop_clear: &'static str,
+    pub ab_clear_btn: &'static str,
+    pub step_frame_btn: &'static str,
+    pub step_frame_osd: &'static str,
+
+    // Tools popover, aspect ratio, video filters, screenshot
+    pub tools_btn: &'static str,
+    pub tools_menu_title: &'static str,
+    pub aspect_mode: &'static str,
+    pub aspect_contain: &'static str,
+    pub aspect_cover: &'static str,
+    pub aspect_fill: &'static str,
+    pub video_section: &'static str,
+    pub rotate_btn: &'static str,
+    pub mirror_btn: &'static str,
+    pub grayscale_btn: &'static str,
+    pub brightness_label: &'static str,
+    pub contrast_label: &'static str,
+    pub reset_filters_btn: &'static str,
+    pub screenshot_btn: &'static str,
+    pub screenshot_saved: &'static str,
+    pub screenshot_failed: &'static str,
+
+    // Subtitles
+    pub subtitle_section: &'static str,
+    pub subtitle_load_btn: &'static str,
+    pub subtitle_dialog_title: &'static str,
+    pub subtitle_filter_label: &'static str,
+    pub subtitle_toggle_btn: &'static str,
+    pub subtitle_on: &'static str,
+    pub subtitle_off: &'static str,
+    pub subtitle_offset_label: &'static str,
+    pub subtitle_size_label: &'static str,
+    pub subtitle_size_small: &'static str,
+    pub subtitle_size_medium: &'static str,
+    pub subtitle_size_large: &'static str,
+    pub subtitle_none: &'static str,
+    pub subtitle_loaded: &'static str,
+    pub subtitle_failed: &'static str,
+
+    // Playback & playlist helpers
+    pub playback_section: &'static str,
+    pub speed_reset_btn: &'static str,
+    pub playlist_add_folder: &'static str,
+    pub folder_dialog_title: &'static str,
+    pub move_up: &'static str,
+    pub move_down: &'static str,
+
+    // Media info decoder summary
+    pub info_section_decoder: &'static str,
+    pub info_demuxer: &'static str,
+    pub info_video_decoder: &'static str,
+    pub info_audio_decoder: &'static str,
+    pub info_decoder_none: &'static str,
+
+    // Time mode, volume OSD, shortcuts modal
+    pub remaining_time_tooltip: &'static str,
+    pub volume_osd: &'static str,
+    pub help_btn: &'static str,
+    pub shortcuts_title: &'static str,
+    pub shortcuts_rows: &'static [(&'static str, &'static str)],
 }
 
 /// Traditional Chinese (Taiwan) localization table.
@@ -212,7 +283,93 @@ pub const ZH_TW: UiStrings = UiStrings {
     error_open_failed: "開啟檔案失敗",
     error_unsupported_or_corrupt: "格式不受支援或檔案已損毀",
 
-    shortcuts_hint: "空白鍵 播放/暫停 · ←/→ 5秒 · ↑/↓ 音量 · F 全螢幕 · M 靜音 · O 開檔",
+    shortcuts_hint: "空白鍵 播放/暫停 · ←/→ 5秒 · ↑/↓ 音量 · F 全螢幕 · M 靜音 · O 開檔 · ? 快捷鍵",
+
+    repeat_off: "循環：關",
+    repeat_all: "循環：全部",
+    repeat_one: "循環：單曲",
+    shuffle_on: "隨機：開",
+    shuffle_off: "隨機：關",
+    ab_loop_btn: "A-B",
+    ab_loop_set_a: "已設定 A 點",
+    ab_loop_set_b: "A-B 循環已啟用",
+    ab_loop_clear: "已清除 A-B 循環",
+    ab_clear_btn: "清除 A-B",
+    step_frame_btn: "逐幀",
+    step_frame_osd: "單幀前進",
+
+    tools_btn: "工具",
+    tools_menu_title: "播放與畫面工具",
+    aspect_mode: "畫面比例",
+    aspect_contain: "完整適應",
+    aspect_cover: "填滿裁切",
+    aspect_fill: "拉伸填滿",
+    video_section: "視訊調整",
+    rotate_btn: "旋轉 90°",
+    mirror_btn: "水平鏡像",
+    grayscale_btn: "灰階",
+    brightness_label: "亮度",
+    contrast_label: "對比",
+    reset_filters_btn: "重設畫面",
+    screenshot_btn: "截圖",
+    screenshot_saved: "已儲存截圖",
+    screenshot_failed: "截圖失敗",
+
+    subtitle_section: "字幕",
+    subtitle_load_btn: "載入字幕",
+    subtitle_dialog_title: "選擇字幕檔案",
+    subtitle_filter_label: "字幕檔案",
+    subtitle_toggle_btn: "字幕顯示",
+    subtitle_on: "開",
+    subtitle_off: "關",
+    subtitle_offset_label: "字幕延遲",
+    subtitle_size_label: "字幕大小",
+    subtitle_size_small: "小",
+    subtitle_size_medium: "中",
+    subtitle_size_large: "大",
+    subtitle_none: "尚未載入字幕",
+    subtitle_loaded: "已載入字幕",
+    subtitle_failed: "字幕載入失敗",
+
+    playback_section: "播放控制",
+    speed_reset_btn: "重設 1.0x",
+    playlist_add_folder: "資料夾",
+    folder_dialog_title: "選擇媒體資料夾",
+    move_up: "上移",
+    move_down: "下移",
+
+    info_section_decoder: "解碼引擎",
+    info_demuxer: "解封裝器",
+    info_video_decoder: "視訊解碼",
+    info_audio_decoder: "音訊解碼",
+    info_decoder_none: "無",
+
+    remaining_time_tooltip: "點擊切換剩餘 / 總時長",
+    volume_osd: "音量",
+    help_btn: "快捷鍵",
+    shortcuts_title: "鍵盤與滑鼠快捷鍵",
+    shortcuts_rows: &[
+        ("Space", "播放 / 暫停"),
+        ("← / →", "快退 / 快進 5 秒"),
+        ("Shift + ← / →", "快退 / 快進 30 秒"),
+        ("Ctrl + ← / →", "精準微調 ±1 秒"),
+        ("0 – 9", "跳轉至 0% – 90% 進度"),
+        (".", "單幀前進"),
+        ("↑ / ↓ / 滾輪", "調整音量 ±5%"),
+        ("M", "靜音 / 取消靜音"),
+        ("[ / ] / Backspace", "降速 / 加速 / 重設 1.0x"),
+        ("B", "A-B 循環（設 A / 設 B / 清除）"),
+        ("R / H", "切換循環模式 / 隨機播放"),
+        ("D / Shift + R", "切換畫面比例 / 順時針旋轉 90°"),
+        ("Shift + S", "儲存目前畫面為 PNG 截圖"),
+        ("C / Shift + C", "顯示或隱藏字幕 / 載入字幕檔"),
+        ("V / A / T", "視訊軌 / 音軌 / 工具選單"),
+        ("I / L", "媒體資訊 / 播放清單面板"),
+        ("F / 雙擊畫面", "全螢幕切換"),
+        ("O / Ctrl + O", "開啟媒體檔案"),
+        ("G / ? / F1", "切換語言 / 快捷鍵說明"),
+        ("S / Esc", "停止播放 / 關閉彈窗或退出全螢幕"),
+    ],
 };
 
 /// English (United States) localization table.
@@ -300,7 +457,94 @@ pub const EN_US: UiStrings = UiStrings {
     error_open_failed: "Failed to open file",
     error_unsupported_or_corrupt: "Unsupported format or corrupted file",
 
-    shortcuts_hint: "Space Play/Pause · ←/→ ±5s · ↑/↓ Volume · F Fullscreen · M Mute · O Open",
+    shortcuts_hint:
+        "Space Play/Pause · ←/→ ±5s · ↑/↓ Volume · F Fullscreen · M Mute · O Open · ? Help",
+
+    repeat_off: "Repeat: Off",
+    repeat_all: "Repeat: All",
+    repeat_one: "Repeat: One",
+    shuffle_on: "Shuffle: On",
+    shuffle_off: "Shuffle: Off",
+    ab_loop_btn: "A-B",
+    ab_loop_set_a: "Loop A set",
+    ab_loop_set_b: "A-B loop active",
+    ab_loop_clear: "A-B loop cleared",
+    ab_clear_btn: "Clear A-B",
+    step_frame_btn: "Step",
+    step_frame_osd: "Frame step",
+
+    tools_btn: "Tools",
+    tools_menu_title: "Playback & Video Tools",
+    aspect_mode: "Aspect",
+    aspect_contain: "Contain",
+    aspect_cover: "Cover",
+    aspect_fill: "Stretch",
+    video_section: "Video",
+    rotate_btn: "Rotate 90°",
+    mirror_btn: "Mirror H",
+    grayscale_btn: "Grayscale",
+    brightness_label: "Brightness",
+    contrast_label: "Contrast",
+    reset_filters_btn: "Reset Video",
+    screenshot_btn: "Snapshot",
+    screenshot_saved: "Screenshot saved",
+    screenshot_failed: "Screenshot failed",
+
+    subtitle_section: "Subtitles",
+    subtitle_load_btn: "Load Subtitle",
+    subtitle_dialog_title: "Select Subtitle File",
+    subtitle_filter_label: "Subtitle Files",
+    subtitle_toggle_btn: "Subtitles",
+    subtitle_on: "On",
+    subtitle_off: "Off",
+    subtitle_offset_label: "Offset",
+    subtitle_size_label: "Size",
+    subtitle_size_small: "Small",
+    subtitle_size_medium: "Medium",
+    subtitle_size_large: "Large",
+    subtitle_none: "No subtitle loaded",
+    subtitle_loaded: "Subtitle loaded",
+    subtitle_failed: "Subtitle failed",
+
+    playback_section: "Playback",
+    speed_reset_btn: "Reset 1.0x",
+    playlist_add_folder: "Folder",
+    folder_dialog_title: "Select Media Folder",
+    move_up: "Move Up",
+    move_down: "Move Down",
+
+    info_section_decoder: "Active Decoder Engine",
+    info_demuxer: "Demuxer",
+    info_video_decoder: "Video Decoder",
+    info_audio_decoder: "Audio Decoder",
+    info_decoder_none: "None",
+
+    remaining_time_tooltip: "Click to toggle remaining / total time",
+    volume_osd: "Volume",
+    help_btn: "Shortcuts",
+    shortcuts_title: "Keyboard & Mouse Shortcuts",
+    shortcuts_rows: &[
+        ("Space", "Play / Pause"),
+        ("← / →", "Seek ±5s"),
+        ("Shift + ← / →", "Seek ±30s"),
+        ("Ctrl + ← / →", "Fine Seek ±1s"),
+        ("0 – 9", "Jump to 0% – 90%"),
+        (".", "Step Forward 1 Frame"),
+        ("↑ / ↓ / Wheel", "Volume ±5%"),
+        ("M", "Mute / Unmute"),
+        ("[ / ] / Backspace", "Speed - / + / Reset 1.0x"),
+        ("B", "A-B Loop (Set A / Set B / Clear)"),
+        ("R / H", "Cycle Repeat / Toggle Shuffle"),
+        ("D / Shift + R", "Aspect Mode / Rotate 90°"),
+        ("Shift + S", "Save PNG Screenshot"),
+        ("C / Shift + C", "Toggle Subtitles / Load Subtitle"),
+        ("V / A / T", "Video / Audio Tracks / Tools"),
+        ("I / L", "Media Info / Playlist Panel"),
+        ("F / Double-Click", "Toggle Fullscreen"),
+        ("O / Ctrl + O", "Open Media File"),
+        ("G / ? / F1", "Toggle Language / Shortcuts Help"),
+        ("S / Esc", "Stop / Close Overlay or Exit Fullscreen"),
+    ],
 };
 
 /// Retrieve the active locale's string table.
@@ -327,11 +571,79 @@ mod tests {
             assert!(!s.playlist_title.is_empty());
             assert!(!s.error_title.is_empty());
             assert!(!s.shortcuts_hint.is_empty());
+
+            assert!(!s.repeat_off.is_empty());
+            assert!(!s.repeat_all.is_empty());
+            assert!(!s.repeat_one.is_empty());
+            assert!(!s.shuffle_on.is_empty());
+            assert!(!s.shuffle_off.is_empty());
+            assert!(!s.ab_loop_btn.is_empty());
+            assert!(!s.ab_loop_set_a.is_empty());
+            assert!(!s.ab_loop_set_b.is_empty());
+            assert!(!s.ab_loop_clear.is_empty());
+            assert!(!s.ab_clear_btn.is_empty());
+            assert!(!s.step_frame_btn.is_empty());
+            assert!(!s.step_frame_osd.is_empty());
+            assert!(!s.tools_btn.is_empty());
+            assert!(!s.tools_menu_title.is_empty());
+            assert!(!s.aspect_mode.is_empty());
+            assert!(!s.aspect_contain.is_empty());
+            assert!(!s.aspect_cover.is_empty());
+            assert!(!s.aspect_fill.is_empty());
+            assert!(!s.video_section.is_empty());
+            assert!(!s.rotate_btn.is_empty());
+            assert!(!s.mirror_btn.is_empty());
+            assert!(!s.grayscale_btn.is_empty());
+            assert!(!s.brightness_label.is_empty());
+            assert!(!s.contrast_label.is_empty());
+            assert!(!s.reset_filters_btn.is_empty());
+            assert!(!s.screenshot_btn.is_empty());
+            assert!(!s.screenshot_saved.is_empty());
+            assert!(!s.screenshot_failed.is_empty());
+            assert!(!s.subtitle_section.is_empty());
+            assert!(!s.subtitle_load_btn.is_empty());
+            assert!(!s.subtitle_dialog_title.is_empty());
+            assert!(!s.subtitle_filter_label.is_empty());
+            assert!(!s.subtitle_toggle_btn.is_empty());
+            assert!(!s.subtitle_on.is_empty());
+            assert!(!s.subtitle_off.is_empty());
+            assert!(!s.subtitle_offset_label.is_empty());
+            assert!(!s.subtitle_size_label.is_empty());
+            assert!(!s.subtitle_size_small.is_empty());
+            assert!(!s.subtitle_size_medium.is_empty());
+            assert!(!s.subtitle_size_large.is_empty());
+            assert!(!s.subtitle_none.is_empty());
+            assert!(!s.subtitle_loaded.is_empty());
+            assert!(!s.subtitle_failed.is_empty());
+            assert!(!s.playback_section.is_empty());
+            assert!(!s.speed_reset_btn.is_empty());
+            assert!(!s.playlist_add_folder.is_empty());
+            assert!(!s.folder_dialog_title.is_empty());
+            assert!(!s.move_up.is_empty());
+            assert!(!s.move_down.is_empty());
+            assert!(!s.info_section_decoder.is_empty());
+            assert!(!s.info_demuxer.is_empty());
+            assert!(!s.info_video_decoder.is_empty());
+            assert!(!s.info_audio_decoder.is_empty());
+            assert!(!s.info_decoder_none.is_empty());
+            assert!(!s.remaining_time_tooltip.is_empty());
+            assert!(!s.volume_osd.is_empty());
+            assert!(!s.help_btn.is_empty());
+            assert!(!s.shortcuts_title.is_empty());
+            assert!(!s.shortcuts_rows.is_empty());
+            for (key, desc) in s.shortcuts_rows {
+                assert!(!key.is_empty());
+                assert!(!desc.is_empty());
+            }
         }
 
         assert_ne!(
             strings(Locale::ZhTw).app_title,
             strings(Locale::EnUs).app_title
+        );
+        assert_eq!(
+            strings(Locale::ZhTw).shortcuts_rows.len(),
+            strings(Locale::EnUs).shortcuts_rows.len()
         );
         assert_eq!(Locale::ZhTw.toggle(), Locale::EnUs);
         assert_eq!(Locale::EnUs.toggle(), Locale::ZhTw);

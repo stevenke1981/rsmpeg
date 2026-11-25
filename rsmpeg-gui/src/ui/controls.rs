@@ -2,16 +2,18 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
-    canvas, div, prelude::*, px, relative, AnyElement, Bounds, Context, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Pixels, Styled,
+    canvas, div, prelude::*, px, relative, rgba, AnyElement, Bounds, Context, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Styled, Window,
 };
 
 use crate::format_time::{format_duration, format_rate, format_volume_percent};
 use crate::i18n::UiStrings;
+use crate::playlist::RepeatMode;
 use crate::state::{format_track_label_for, PlaybackStatus, PlaybackUiState, TrackMenu};
-use crate::ui::{theme, PlayerView};
+use crate::ui::{aspect_mode_label, repeat_mode_label, subtitle_size_label, theme, PlayerView};
 
 /// Render the full bottom playback control deck.
 pub fn render_controls(
@@ -42,9 +44,10 @@ pub fn render_controls(
             div()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
-                .gap_3()
+                .gap_2()
                 .child(render_transport_buttons(
                     state, has_media, is_playing, strings, cx,
                 ))
@@ -60,9 +63,39 @@ fn render_seek_row(
     cx: &mut Context<PlayerView>,
 ) -> AnyElement {
     let pos_text = format_duration(state.displayed_position());
-    let dur_text = format_duration(state.duration);
+    let dur_text = if state.show_remaining_time && !state.duration.is_zero() {
+        let rem = state.duration.saturating_sub(state.displayed_position());
+        format!("-{}", format_duration(rem))
+    } else {
+        format_duration(state.duration)
+    };
     let frac = state.progress_fraction().clamp(0.0, 1.0) as f32;
     let can_seek = has_media && !state.duration.is_zero();
+    let dur_secs = state.duration.as_secs_f64();
+
+    let ab_fracs = if dur_secs > 0.0 {
+        let fa = state
+            .ab_loop
+            .point_a
+            .map(|a| (a.as_secs_f64() / dur_secs).clamp(0.0, 1.0) as f32);
+        let fb = state
+            .ab_loop
+            .point_b
+            .map(|b| (b.as_secs_f64() / dur_secs).clamp(0.0, 1.0) as f32);
+        (fa, fb)
+    } else {
+        (None, None)
+    };
+
+    let hover_tooltip = if can_seek {
+        state.seek_hover_fraction.map(|hf| {
+            let clamped = hf.clamp(0.0, 1.0);
+            let hover_dur = Duration::from_secs_f64(dur_secs * clamped);
+            (clamped as f32, format_duration(hover_dur))
+        })
+    } else {
+        None
+    };
 
     div()
         .flex()
@@ -95,6 +128,14 @@ fn render_seek_row(
                         this.begin_seek_drag(ev.position.x, cx);
                     }),
                 )
+                .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _window, cx| {
+                    this.update_seek_hover(ev.position.x, cx);
+                }))
+                .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                    if !*hovered {
+                        this.clear_seek_hover(cx);
+                    }
+                }))
                 .child(
                     // Background rail
                     div()
@@ -104,14 +145,56 @@ fn render_seek_row(
                         .rounded_full()
                         .bg(theme::track_bg())
                         .overflow_hidden()
+                        .when_some(
+                            match ab_fracs {
+                                (Some(a), Some(b)) if b > a => Some((a, b - a)),
+                                _ => None,
+                            },
+                            |el, (start, span)| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left(relative(start))
+                                        .w(relative(span))
+                                        .bg(rgba(0xfbbf2466)),
+                                )
+                            },
+                        )
                         .child(
                             div()
+                                .relative()
                                 .h_full()
                                 .w(relative(frac))
                                 .rounded_full()
                                 .bg(theme::accent()),
                         ),
                 )
+                .when_some(ab_fracs.0, |el, fa| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(relative(fa))
+                            .ml(px(-1.0))
+                            .w(px(2.0))
+                            .h(px(12.0))
+                            .rounded_full()
+                            .bg(theme::status_paused()),
+                    )
+                })
+                .when_some(ab_fracs.1, |el, fb| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(relative(fb))
+                            .ml(px(-1.0))
+                            .w(px(2.0))
+                            .h(px(12.0))
+                            .rounded_full()
+                            .bg(theme::status_paused()),
+                    )
+                })
                 .when(can_seek, |el| {
                     // Thumb indicator aligned to current fraction
                     el.child(
@@ -125,6 +208,26 @@ fn render_seek_row(
                             .bg(theme::text_primary())
                             .border_2()
                             .border_color(theme::accent()),
+                    )
+                })
+                .when_some(hover_tooltip, |el, (hf, label)| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(px(24.0))
+                            .left(relative(hf))
+                            .ml(px(-24.0))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(theme::bg_elevated())
+                            .border_1()
+                            .border_color(theme::border_strong())
+                            .shadow_md()
+                            .font_family(theme::MONO_FONT_FAMILY)
+                            .text_xs()
+                            .text_color(theme::text_primary())
+                            .child(label),
                     )
                 })
                 .child(
@@ -142,12 +245,19 @@ fn render_seek_row(
         )
         .child(
             div()
+                .id("btn-duration-mode")
                 .flex_none()
-                .w(px(58.0))
+                .w(px(68.0))
                 .text_right()
                 .font_family(theme::MONO_FONT_FAMILY)
                 .text_xs()
                 .text_color(theme::text_secondary())
+                .hover(|s| s.text_color(theme::text_primary()))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_root(window);
+                    this.toggle_remaining_time(cx);
+                }))
                 .child(dur_text),
         )
         .into_any_element()
@@ -160,18 +270,32 @@ fn render_transport_buttons(
     strings: &UiStrings,
     cx: &mut Context<PlayerView>,
 ) -> AnyElement {
-    let has_prev = state.playlist.has_prev();
-    let has_next = state.playlist.has_next();
+    let has_prev = state.playlist.has_prev_with_mode(state.repeat_mode);
+    let has_next = state
+        .playlist
+        .has_next_with_mode(state.repeat_mode, state.shuffle);
+    let ab_active = state.ab_loop.point_a.is_some();
+    let ab_label = if state.ab_loop.point_a.is_some() && state.ab_loop.point_b.is_none() {
+        "A·"
+    } else {
+        strings.ab_loop_btn
+    };
+    let repeat_active = state.repeat_mode != RepeatMode::Off;
+    let repeat_icon = if state.repeat_mode == RepeatMode::One {
+        "↻1"
+    } else {
+        "↻"
+    };
 
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
+        .gap_1p5()
         .child(
             div()
                 .id("btn-prev")
-                .px_2p5()
+                .px_2()
                 .py_1p5()
                 .rounded_md()
                 .bg(theme::bg_elevated())
@@ -193,7 +317,7 @@ fn render_transport_buttons(
         .child(
             div()
                 .id("btn-play-pause")
-                .px_4()
+                .px_3p5()
                 .py_1p5()
                 .rounded_md()
                 .bg(theme::accent())
@@ -214,8 +338,30 @@ fn render_transport_buttons(
         )
         .child(
             div()
+                .id("btn-step-frame")
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .bg(theme::bg_elevated())
+                .border_1()
+                .border_color(theme::border_subtle())
+                .text_xs()
+                .when(has_media, |el| {
+                    el.text_color(theme::text_primary())
+                        .hover(|s| s.bg(theme::bg_hover()))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.focus_root(window);
+                            this.step_frame_forward(cx);
+                        }))
+                })
+                .when(!has_media, |el| el.text_color(theme::text_muted()))
+                .child("▸|"),
+        )
+        .child(
+            div()
                 .id("btn-stop")
-                .px_2p5()
+                .px_2()
                 .py_1p5()
                 .rounded_md()
                 .bg(theme::bg_elevated())
@@ -237,7 +383,7 @@ fn render_transport_buttons(
         .child(
             div()
                 .id("btn-next")
-                .px_2p5()
+                .px_2()
                 .py_1p5()
                 .rounded_md()
                 .bg(theme::bg_elevated())
@@ -255,6 +401,103 @@ fn render_transport_buttons(
                 })
                 .when(!has_next, |el| el.text_color(theme::text_muted()))
                 .child(format!("{} ▶|", strings.next_track)),
+        )
+        .child(
+            div()
+                .id("btn-ab-loop")
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .bg(if ab_active {
+                    theme::accent_soft()
+                } else {
+                    theme::bg_elevated()
+                })
+                .border_1()
+                .border_color(if ab_active {
+                    theme::status_paused()
+                } else {
+                    theme::border_subtle()
+                })
+                .font_family(theme::MONO_FONT_FAMILY)
+                .text_xs()
+                .when(has_media, |el| {
+                    el.text_color(if ab_active {
+                        theme::status_paused()
+                    } else {
+                        theme::text_primary()
+                    })
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus_root(window);
+                        this.cycle_ab_loop(cx);
+                    }))
+                })
+                .when(!has_media, |el| el.text_color(theme::text_muted()))
+                .child(ab_label),
+        )
+        .child(
+            div()
+                .id("btn-repeat")
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .bg(if repeat_active {
+                    theme::accent_soft()
+                } else {
+                    theme::bg_elevated()
+                })
+                .hover(|s| s.bg(theme::bg_hover()))
+                .border_1()
+                .border_color(if repeat_active {
+                    theme::accent()
+                } else {
+                    theme::border_subtle()
+                })
+                .text_xs()
+                .text_color(if repeat_active {
+                    theme::accent()
+                } else {
+                    theme::text_secondary()
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_root(window);
+                    this.cycle_repeat_mode(cx);
+                }))
+                .child(repeat_icon),
+        )
+        .child(
+            div()
+                .id("btn-shuffle")
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .bg(if state.shuffle {
+                    theme::accent_soft()
+                } else {
+                    theme::bg_elevated()
+                })
+                .hover(|s| s.bg(theme::bg_hover()))
+                .border_1()
+                .border_color(if state.shuffle {
+                    theme::accent()
+                } else {
+                    theme::border_subtle()
+                })
+                .text_xs()
+                .text_color(if state.shuffle {
+                    theme::accent()
+                } else {
+                    theme::text_secondary()
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_root(window);
+                    this.toggle_shuffle(cx);
+                }))
+                .child("⤮"),
         )
         .into_any_element()
 }
@@ -298,12 +541,13 @@ fn render_right_controls(
     } else {
         format!("{} ▾", strings.track_audio_btn)
     };
+    let tools_open = state.open_track_menu == TrackMenu::Tools;
 
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap_2p5()
+        .gap_2()
         .child(
             // Mute toggle button
             div()
@@ -335,7 +579,7 @@ fn render_right_controls(
                 .relative()
                 .flex()
                 .items_center()
-                .w(px(92.0))
+                .w(px(84.0))
                 .h(px(20.0))
                 .cursor_pointer()
                 .on_mouse_down(
@@ -387,7 +631,7 @@ fn render_right_controls(
         )
         .child(
             div()
-                .w(px(36.0))
+                .w(px(34.0))
                 .font_family(theme::MONO_FONT_FAMILY)
                 .text_xs()
                 .text_color(theme::text_secondary())
@@ -398,7 +642,7 @@ fn render_right_controls(
             el.child(
                 div()
                     .id("btn-video-tracks")
-                    .px_2p5()
+                    .px_2()
                     .py_1()
                     .rounded_md()
                     .bg(if open {
@@ -432,7 +676,7 @@ fn render_right_controls(
             el.child(
                 div()
                     .id("btn-audio-tracks")
-                    .px_2p5()
+                    .px_2()
                     .py_1()
                     .rounded_md()
                     .bg(if open {
@@ -465,7 +709,7 @@ fn render_right_controls(
             // Playback speed selector button
             div()
                 .id("btn-speed")
-                .px_2p5()
+                .px_2()
                 .py_1()
                 .rounded_md()
                 .bg(theme::bg_elevated())
@@ -489,6 +733,38 @@ fn render_right_controls(
                     this.cycle_playback_rate(cx);
                 }))
                 .child(rate_text),
+        )
+        .child(
+            // Tools popover button
+            div()
+                .id("btn-tools")
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(if tools_open {
+                    theme::accent_soft()
+                } else {
+                    theme::bg_elevated()
+                })
+                .hover(|s| s.bg(theme::bg_hover()))
+                .border_1()
+                .border_color(if tools_open {
+                    theme::accent()
+                } else {
+                    theme::border_subtle()
+                })
+                .text_xs()
+                .text_color(if tools_open {
+                    theme::accent()
+                } else {
+                    theme::text_primary()
+                })
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_root(window);
+                    this.toggle_track_menu(TrackMenu::Tools, cx);
+                }))
+                .child(format!("⚙ {} ▾", strings.tools_btn)),
         )
         .child(
             // Fullscreen toggle button
@@ -520,7 +796,7 @@ pub fn render_track_menu_popover(
     cx: &mut Context<PlayerView>,
 ) -> Option<AnyElement> {
     let (title, is_video, tracks, active_idx) = match state.open_track_menu {
-        TrackMenu::None => return None,
+        TrackMenu::None | TrackMenu::Tools => return None,
         TrackMenu::Video => (
             strings.track_menu_video_title,
             true,
@@ -700,4 +976,452 @@ pub fn render_track_menu_popover(
             .children(rows)
             .into_any_element(),
     )
+}
+
+/// Render the floating playback, video filter, and subtitle tools popover when open.
+pub fn render_tools_popover(
+    state: &PlaybackUiState,
+    strings: &UiStrings,
+    cx: &mut Context<PlayerView>,
+) -> Option<AnyElement> {
+    if state.open_track_menu != TrackMenu::Tools {
+        return None;
+    }
+
+    let vt = state.video_transform;
+    let rotate_label = if vt.rotation_deg == 0 {
+        strings.rotate_btn.to_string()
+    } else {
+        format!("{} ({}°)", strings.rotate_btn, vt.rotation_deg)
+    };
+    let aspect_label = format!(
+        "{}: {}",
+        strings.aspect_mode,
+        aspect_mode_label(strings, state.aspect_mode)
+    );
+    let sub_toggle_label = format!(
+        "{}: {}",
+        strings.subtitle_toggle_btn,
+        if state.subtitles_enabled {
+            strings.subtitle_on
+        } else {
+            strings.subtitle_off
+        }
+    );
+    let sub_size_label = format!(
+        "{}: {}",
+        strings.subtitle_size_label,
+        subtitle_size_label(strings, state.subtitle_size)
+    );
+    let sub_status = state
+        .subtitle_name
+        .as_deref()
+        .unwrap_or(strings.subtitle_none)
+        .to_string();
+    let ab_active = state.ab_loop.point_a.is_some();
+    let repeat_label = repeat_mode_label(strings, state.repeat_mode);
+    let shuffle_label = if state.shuffle {
+        strings.shuffle_on
+    } else {
+        strings.shuffle_off
+    };
+
+    Some(
+        div()
+            .id("tools-menu-popover")
+            .occlude()
+            .absolute()
+            .bottom(px(86.0))
+            .right(px(16.0))
+            .w(px(376.0))
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .p_3()
+            .rounded_lg()
+            .bg(theme::bg_elevated())
+            .border_1()
+            .border_color(theme::border_strong())
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .pb_1p5()
+                    .border_b_1()
+                    .border_color(theme::border_subtle())
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::accent())
+                            .child(strings.tools_menu_title),
+                    )
+                    .child(
+                        div()
+                            .id("close-tools-menu")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .hover(|s| s.bg(theme::bg_hover()))
+                            .text_xs()
+                            .text_color(theme::text_secondary())
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.focus_root(window);
+                                this.close_track_menu(cx);
+                            }))
+                            .child("✕"),
+                    ),
+            )
+            // Video section
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme::bg_surface())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .child(section_heading(strings.video_section))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .child(tool_chip_btn(
+                                "tool-aspect-btn",
+                                aspect_label,
+                                state.aspect_mode != crate::state::AspectMode::Contain,
+                                true,
+                                cx,
+                                |this, _, cx| this.cycle_aspect_mode(cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-rotate-btn",
+                                rotate_label,
+                                vt.rotation_deg != 0,
+                                true,
+                                cx,
+                                |this, window, cx| this.rotate_video(window, cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-mirror-btn",
+                                strings.mirror_btn,
+                                vt.mirror_horizontal,
+                                true,
+                                cx,
+                                |this, window, cx| this.toggle_mirror(window, cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-grayscale-btn",
+                                strings.grayscale_btn,
+                                vt.grayscale,
+                                true,
+                                cx,
+                                |this, window, cx| this.toggle_grayscale(window, cx),
+                            )),
+                    )
+                    .child(stepper_row(
+                        "tool-bright",
+                        strings.brightness_label,
+                        format!("{:+}", vt.brightness),
+                        cx,
+                        |this, window, cx| this.adjust_brightness(-5, window, cx),
+                        |this, window, cx| this.adjust_brightness(5, window, cx),
+                    ))
+                    .child(stepper_row(
+                        "tool-contrast",
+                        strings.contrast_label,
+                        format!("{}%", vt.contrast_pct),
+                        cx,
+                        |this, window, cx| this.adjust_contrast(-10, window, cx),
+                        |this, window, cx| this.adjust_contrast(10, window, cx),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1p5()
+                            .child(tool_chip_btn(
+                                "tool-video-reset-btn",
+                                strings.reset_filters_btn,
+                                false,
+                                !vt.is_identity(),
+                                cx,
+                                |this, window, cx| this.reset_video_filters(window, cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-screenshot-btn",
+                                strings.screenshot_btn,
+                                false,
+                                state.has_video_frame,
+                                cx,
+                                |this, window, cx| this.take_screenshot(window, cx),
+                            )),
+                    ),
+            )
+            // Subtitles section
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme::bg_surface())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(section_heading(strings.subtitle_section))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_right()
+                                    .text_xs()
+                                    .text_color(theme::text_muted())
+                                    .truncate()
+                                    .child(sub_status),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .child(tool_chip_btn(
+                                "tool-sub-load-btn",
+                                strings.subtitle_load_btn,
+                                false,
+                                true,
+                                cx,
+                                |this, window, cx| this.open_subtitle_dialog(window, cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-sub-toggle-btn",
+                                sub_toggle_label,
+                                state.subtitles_enabled && state.subtitle_track.is_some(),
+                                true,
+                                cx,
+                                |this, _, cx| this.toggle_subtitles(cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-sub-size-btn",
+                                sub_size_label,
+                                false,
+                                true,
+                                cx,
+                                |this, _, cx| this.cycle_subtitle_size(cx),
+                            )),
+                    )
+                    .child(stepper_row(
+                        "tool-sub-offset",
+                        strings.subtitle_offset_label,
+                        format!("{:+} ms", state.subtitle_offset_ms),
+                        cx,
+                        |this, _, cx| this.adjust_subtitle_offset(-250, cx),
+                        |this, _, cx| this.adjust_subtitle_offset(250, cx),
+                    )),
+            )
+            // Playback section
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(theme::bg_surface())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .child(section_heading(strings.playback_section))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .child(tool_chip_btn(
+                                "tool-ab-clear-btn",
+                                strings.ab_clear_btn,
+                                false,
+                                ab_active,
+                                cx,
+                                |this, _, cx| this.clear_ab_loop(cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-repeat-btn",
+                                repeat_label,
+                                state.repeat_mode != RepeatMode::Off,
+                                true,
+                                cx,
+                                |this, _, cx| this.cycle_repeat_mode(cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-shuffle-btn",
+                                shuffle_label,
+                                state.shuffle,
+                                true,
+                                cx,
+                                |this, _, cx| this.toggle_shuffle(cx),
+                            ))
+                            .child(tool_chip_btn(
+                                "tool-speed-reset-btn",
+                                strings.speed_reset_btn,
+                                false,
+                                (state.playback_rate - 1.0).abs() > 0.01,
+                                cx,
+                                |this, _, cx| this.reset_playback_rate(cx),
+                            )),
+                    ),
+            )
+            .into_any_element(),
+    )
+}
+
+fn section_heading(title: &'static str) -> AnyElement {
+    div()
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme::text_secondary())
+        .child(title)
+        .into_any_element()
+}
+
+fn tool_chip_btn(
+    id: &'static str,
+    label: impl Into<String>,
+    active: bool,
+    enabled: bool,
+    cx: &mut Context<PlayerView>,
+    on_click: impl Fn(&mut PlayerView, &mut Window, &mut Context<PlayerView>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(if active {
+            theme::accent_soft()
+        } else {
+            theme::bg_elevated()
+        })
+        .border_1()
+        .border_color(if active {
+            theme::accent()
+        } else {
+            theme::border_subtle()
+        })
+        .text_xs()
+        .when(enabled, |el| {
+            el.text_color(if active {
+                theme::accent()
+            } else {
+                theme::text_primary()
+            })
+            .hover(|s| s.bg(theme::bg_hover()))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.focus_root(window);
+                on_click(this, window, cx);
+            }))
+        })
+        .when(!enabled, |el| el.text_color(theme::text_muted()))
+        .child(label.into())
+        .into_any_element()
+}
+
+fn stepper_row(
+    id_prefix: &'static str,
+    label: &'static str,
+    value: String,
+    cx: &mut Context<PlayerView>,
+    on_dec: impl Fn(&mut PlayerView, &mut Window, &mut Context<PlayerView>) + 'static,
+    on_inc: impl Fn(&mut PlayerView, &mut Window, &mut Context<PlayerView>) + 'static,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::text_secondary())
+                .child(label),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .id((id_prefix, 0usize))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(theme::bg_elevated())
+                        .hover(|s| s.bg(theme::bg_hover()))
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .font_family(theme::MONO_FONT_FAMILY)
+                        .text_xs()
+                        .text_color(theme::text_primary())
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.focus_root(window);
+                            on_dec(this, window, cx);
+                        }))
+                        .child("-"),
+                )
+                .child(
+                    div()
+                        .min_w(px(64.0))
+                        .text_center()
+                        .font_family(theme::MONO_FONT_FAMILY)
+                        .text_xs()
+                        .text_color(theme::text_primary())
+                        .child(value),
+                )
+                .child(
+                    div()
+                        .id((id_prefix, 1usize))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(theme::bg_elevated())
+                        .hover(|s| s.bg(theme::bg_hover()))
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .font_family(theme::MONO_FONT_FAMILY)
+                        .text_xs()
+                        .text_color(theme::text_primary())
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.focus_root(window);
+                            on_inc(this, window, cx);
+                        }))
+                        .child("+"),
+                ),
+        )
+        .into_any_element()
 }

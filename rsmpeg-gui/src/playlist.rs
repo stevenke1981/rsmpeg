@@ -7,15 +7,47 @@ pub const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "wav", "flac", "mp3", "m4a", "ogg", "opus",
 ];
 
-/// Return `true` when `path` has a recognized audio/video file extension.
-pub fn is_supported_media_extension(path: &Path) -> bool {
+/// Supported subtitle extensions for sidecar detection, file dialogs, and drag-and-drop.
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "vtt"];
+
+fn has_extension_in(path: &Path, allowed_exts: &[&str]) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {
-            MEDIA_EXTENSIONS
+            allowed_exts
                 .iter()
                 .any(|allowed| ext.eq_ignore_ascii_case(allowed))
         })
+}
+
+/// Return `true` when `path` has a recognized audio/video file extension.
+pub fn is_supported_media_extension(path: &Path) -> bool {
+    has_extension_in(path, MEDIA_EXTENSIONS)
+}
+
+/// Return `true` when `path` has a supported subtitle extension (`.srt` / `.vtt`).
+pub fn is_subtitle_extension(path: &Path) -> bool {
+    has_extension_in(path, SUBTITLE_EXTENSIONS)
+}
+
+/// Repeat behavior when advancing through or finishing a playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    /// Cycle through `Off -> All -> One -> Off`.
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
 }
 
 /// One entry in the playback queue.
@@ -118,11 +150,77 @@ impl Playlist {
         matches!(self.current, Some(i) if i > 0)
     }
 
+    /// Whether advancing with the given `repeat` and `shuffle` modes yields a track.
+    pub fn has_next_with_mode(&self, repeat: RepeatMode, shuffle: bool) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        match repeat {
+            RepeatMode::All => true,
+            RepeatMode::One => self.current.is_some(),
+            RepeatMode::Off => {
+                if shuffle && self.items.len() > 1 {
+                    true
+                } else {
+                    self.has_next()
+                }
+            }
+        }
+    }
+
+    /// Whether stepping backward with the given `repeat` mode yields a track.
+    pub fn has_prev_with_mode(&self, repeat: RepeatMode) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        match repeat {
+            RepeatMode::All => true,
+            RepeatMode::Off | RepeatMode::One => self.has_prev(),
+        }
+    }
+
     /// Advance to the next item if one exists.
     pub fn advance_next(&mut self) -> Option<&PlaylistItem> {
         let next_idx = match self.current {
             Some(i) if i + 1 < self.items.len() => i + 1,
             None if !self.items.is_empty() => 0,
+            _ => return None,
+        };
+        self.current = Some(next_idx);
+        self.items.get(next_idx)
+    }
+
+    /// Advance deterministically respecting `repeat` mode, `shuffle`, and `seed`.
+    pub fn advance_with_mode(
+        &mut self,
+        repeat: RepeatMode,
+        shuffle: bool,
+        seed: u64,
+    ) -> Option<&PlaylistItem> {
+        let len = self.items.len();
+        if len == 0 {
+            return None;
+        }
+        if repeat == RepeatMode::One {
+            return self.current.and_then(|cur| self.items.get(cur));
+        }
+        if shuffle && len > 1 {
+            let next_idx = if let Some(cur) = self.current {
+                let mixed = seed ^ ((cur as u64 + 1).wrapping_mul(6364136223846793005));
+                let offset = 1 + ((mixed as usize) % (len - 1));
+                (cur + offset) % len
+            } else {
+                let mixed = seed ^ 6364136223846793005;
+                (mixed as usize) % len
+            };
+            self.current = Some(next_idx);
+            return self.items.get(next_idx);
+        }
+        let next_idx = match (repeat, self.current) {
+            (RepeatMode::All, Some(i)) => (i + 1) % len,
+            (RepeatMode::All, None) => 0,
+            (RepeatMode::Off, Some(i)) if i + 1 < len => i + 1,
+            (RepeatMode::Off, None) => 0,
             _ => return None,
         };
         self.current = Some(next_idx);
@@ -137,6 +235,50 @@ impl Playlist {
         };
         self.current = Some(prev_idx);
         self.items.get(prev_idx)
+    }
+
+    /// Step backward respecting `repeat` mode (`RepeatMode::All` wraps around).
+    pub fn step_prev_with_mode(&mut self, repeat: RepeatMode) -> Option<&PlaylistItem> {
+        let len = self.items.len();
+        if len == 0 {
+            return None;
+        }
+        let prev_idx = match (repeat, self.current) {
+            (RepeatMode::All, Some(i)) => (i + len - 1) % len,
+            (RepeatMode::All, None) => len - 1,
+            (_, Some(i)) if i > 0 => i - 1,
+            _ => return None,
+        };
+        self.current = Some(prev_idx);
+        self.items.get(prev_idx)
+    }
+
+    /// Swap item `index` with `index - 1`, preserving `current` tracking.
+    pub fn move_up(&mut self, index: usize) -> bool {
+        if index == 0 || index >= self.items.len() {
+            return false;
+        }
+        self.items.swap(index - 1, index);
+        if self.current == Some(index) {
+            self.current = Some(index - 1);
+        } else if self.current == Some(index - 1) {
+            self.current = Some(index);
+        }
+        true
+    }
+
+    /// Swap item `index` with `index + 1`, preserving `current` tracking.
+    pub fn move_down(&mut self, index: usize) -> bool {
+        if index >= self.items.len() || index + 1 >= self.items.len() {
+            return false;
+        }
+        self.items.swap(index, index + 1);
+        if self.current == Some(index) {
+            self.current = Some(index + 1);
+        } else if self.current == Some(index + 1) {
+            self.current = Some(index);
+        }
+        true
     }
 
     /// Remove an entry by index and report whether the active track changed.
@@ -236,5 +378,110 @@ mod tests {
         assert_eq!(pl.remove(0), RemoveOutcome::ActiveReplaced(None));
         assert!(pl.is_empty());
         assert_eq!(pl.current_index(), None);
+    }
+
+    #[test]
+    fn repeat_mode_cycles_and_subtitle_extensions_match() {
+        assert_eq!(RepeatMode::default(), RepeatMode::Off);
+        assert_eq!(RepeatMode::Off.cycle(), RepeatMode::All);
+        assert_eq!(RepeatMode::All.cycle(), RepeatMode::One);
+        assert_eq!(RepeatMode::One.cycle(), RepeatMode::Off);
+
+        assert!(is_subtitle_extension(Path::new("movie.srt")));
+        assert!(is_subtitle_extension(Path::new("movie.VTT")));
+        assert!(!is_subtitle_extension(Path::new("movie.mp4")));
+        assert!(!is_subtitle_extension(Path::new("no_ext")));
+    }
+
+    #[test]
+    fn move_up_and_move_down_preserve_current_item_tracking() {
+        let mut pl = Playlist::new();
+        pl.add_paths([
+            PathBuf::from("a.mp4"),
+            PathBuf::from("b.mp4"),
+            PathBuf::from("c.mp4"),
+        ]);
+        pl.select(1); // "b.mp4"
+
+        assert!(!pl.move_up(0));
+        assert!(!pl.move_down(2));
+        assert!(!pl.move_up(99));
+
+        // Moving the current item up updates current_index to follow it.
+        assert!(pl.move_up(1));
+        assert_eq!(pl.current_index(), Some(0));
+        assert_eq!(pl.current_item().unwrap().display_name, "b.mp4");
+
+        // Moving a neighbor across the current item keeps current pointing to "b.mp4".
+        assert!(pl.move_up(1)); // "a.mp4" moves from 1 -> 0, "b.mp4" shifts to 1
+        assert_eq!(pl.current_index(), Some(1));
+        assert_eq!(pl.current_item().unwrap().display_name, "b.mp4");
+
+        // Moving the current item down updates current_index to 2.
+        assert!(pl.move_down(1));
+        assert_eq!(pl.current_index(), Some(2));
+        assert_eq!(pl.current_item().unwrap().display_name, "b.mp4");
+        assert_eq!(pl.items()[0].display_name, "a.mp4");
+        assert_eq!(pl.items()[1].display_name, "c.mp4");
+    }
+
+    #[test]
+    fn advance_and_step_prev_with_mode_cover_off_all_one_and_shuffle() {
+        let mut pl = Playlist::new();
+        assert!(!pl.has_next_with_mode(RepeatMode::All, false));
+        assert!(!pl.has_prev_with_mode(RepeatMode::All));
+        assert!(pl.advance_with_mode(RepeatMode::All, false, 1).is_none());
+        assert!(pl.step_prev_with_mode(RepeatMode::All).is_none());
+
+        pl.add_paths([
+            PathBuf::from("0.mp4"),
+            PathBuf::from("1.mp4"),
+            PathBuf::from("2.mp4"),
+        ]);
+        pl.select(2);
+
+        // Repeat::Off stops at end when not shuffling.
+        assert!(!pl.has_next_with_mode(RepeatMode::Off, false));
+        assert!(pl.advance_with_mode(RepeatMode::Off, false, 7).is_none());
+
+        // Repeat::All wraps forward and backward.
+        assert!(pl.has_next_with_mode(RepeatMode::All, false));
+        assert_eq!(
+            pl.advance_with_mode(RepeatMode::All, false, 7)
+                .unwrap()
+                .display_name,
+            "0.mp4"
+        );
+        assert!(pl.has_prev_with_mode(RepeatMode::All));
+        assert_eq!(
+            pl.step_prev_with_mode(RepeatMode::All)
+                .unwrap()
+                .display_name,
+            "2.mp4"
+        );
+
+        // Repeat::One stays on current.
+        assert!(pl.has_next_with_mode(RepeatMode::One, true));
+        assert_eq!(
+            pl.advance_with_mode(RepeatMode::One, true, 7)
+                .unwrap()
+                .display_name,
+            "2.mp4"
+        );
+        assert_eq!(pl.current_index(), Some(2));
+
+        // Shuffle picks a deterministic index != current.
+        assert!(pl.has_next_with_mode(RepeatMode::Off, true));
+        let picked = pl
+            .advance_with_mode(RepeatMode::Off, true, 42)
+            .unwrap()
+            .display_name
+            .clone();
+        assert_ne!(picked, "2.mp4");
+        let idx1 = pl.current_index().unwrap();
+        // Reset back to 2 with same seed -> identical deterministic choice.
+        pl.select(2);
+        pl.advance_with_mode(RepeatMode::Off, true, 42);
+        assert_eq!(pl.current_index(), Some(idx1));
     }
 }

@@ -4,8 +4,10 @@
 //! edge cases, and math can be unit-tested headlessly in CI.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use rsmpeg::codec::SubtitleTrack;
 use rsmpeg_player::{
     PlayerError, PlayerEvent, PlayerTrackInfo, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE,
 };
@@ -13,13 +15,118 @@ use rsmpeg_player::{
 use crate::format_time::{format_channels_for, format_sample_rate};
 use crate::i18n::Locale;
 use crate::media_info::MediaInfo;
-use crate::playlist::Playlist;
+use crate::playlist::{
+    is_subtitle_extension, is_supported_media_extension, Playlist, RepeatMode, SUBTITLE_EXTENSIONS,
+};
+use crate::video::VideoTransform;
 
 /// Preset playback speed steps offered by the UI and `[` / `]` shortcuts.
 pub const PLAYBACK_RATES: &[f64] = &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 /// Number of historical audio amplitude bars displayed on the audio-only stage.
 pub const WAVEFORM_BARS: usize = 48;
+
+/// How video frames are fitted inside the viewport stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AspectMode {
+    #[default]
+    Contain,
+    Cover,
+    Fill,
+}
+
+impl AspectMode {
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Contain => Self::Cover,
+            Self::Cover => Self::Fill,
+            Self::Fill => Self::Contain,
+        }
+    }
+}
+
+/// Overlay subtitle font size preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtitleSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl SubtitleSize {
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Small => Self::Medium,
+            Self::Medium => Self::Large,
+            Self::Large => Self::Small,
+        }
+    }
+
+    pub const fn font_px(self) -> f32 {
+        match self {
+            Self::Small => 15.0,
+            Self::Medium => 19.0,
+            Self::Large => 24.0,
+        }
+    }
+}
+
+/// A-B segment loop markers (`[point_a, point_b]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AbLoopState {
+    pub point_a: Option<Duration>,
+    pub point_b: Option<Duration>,
+}
+
+impl AbLoopState {
+    /// Advance through the 3-step A-B cycle: unset -> set A -> set B -> clear.
+    pub fn cycle_at(&mut self, pos: Duration) {
+        match (self.point_a, self.point_b) {
+            (None, _) => {
+                self.point_a = Some(pos);
+                self.point_b = None;
+            }
+            (Some(a), None) => {
+                if pos > a {
+                    self.point_b = Some(pos);
+                } else if pos < a {
+                    self.point_a = Some(pos);
+                    self.point_b = Some(a);
+                } else {
+                    self.clear();
+                }
+            }
+            (Some(_), Some(_)) => {
+                self.clear();
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.point_a = None;
+        self.point_b = None;
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!((self.point_a, self.point_b), (Some(a), Some(b)) if b > a)
+    }
+
+    pub fn should_loop_at(&self, pos: Duration) -> Option<Duration> {
+        match (self.point_a, self.point_b) {
+            (Some(a), Some(b)) if b > a && pos >= b => Some(a),
+            _ => None,
+        }
+    }
+}
+
+/// Active demuxer and decoder summary reported by `rsmpeg-player`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderSummary {
+    pub demuxer: String,
+    pub video_decoder: Option<String>,
+    pub audio_decoder: Option<String>,
+}
 
 /// High-level playback lifecycle displayed in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,21 +151,24 @@ pub enum SidePanel {
     Playlist,
 }
 
-/// Active track switcher dropdown menu.
+/// Active track switcher or tools dropdown menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackMenu {
     #[default]
     None,
     Video,
     Audio,
+    Tools,
 }
 
 /// Side effect returned by [`PlaybackUiState::apply_player_event`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventOutcome {
     None,
-    /// Current track reached natural EOF and playlist has a next track.
+    /// Current track reached natural EOF and playlist should advance.
     AutoAdvanceNext,
+    /// Current track reached natural EOF with `RepeatMode::One` active.
+    ReplayCurrent,
 }
 
 /// Candidate volume/mute transition waiting for worker confirmation.
@@ -107,6 +217,23 @@ pub struct PlaybackUiState {
     pub is_probing: bool,
     pub playlist: Playlist,
     pub media_info: Option<MediaInfo>,
+    pub repeat_mode: RepeatMode,
+    pub shuffle: bool,
+    pub shuffle_seed: u64,
+    pub ab_loop: AbLoopState,
+    pub aspect_mode: AspectMode,
+    pub video_transform: VideoTransform,
+    pub show_remaining_time: bool,
+    pub seek_hover_fraction: Option<f64>,
+    pub subtitle_track: Option<SubtitleTrack>,
+    pub subtitle_name: Option<String>,
+    pub subtitles_enabled: bool,
+    pub subtitle_offset_ms: i64,
+    pub subtitle_size: SubtitleSize,
+    pub decoder_info: Option<DecoderSummary>,
+    pub osd_message: Option<String>,
+    pub osd_expires_at: Option<Instant>,
+    pub show_shortcuts_help: bool,
 }
 
 impl Default for PlaybackUiState {
@@ -151,6 +278,23 @@ impl PlaybackUiState {
             is_probing: false,
             playlist: Playlist::new(),
             media_info: None,
+            repeat_mode: RepeatMode::Off,
+            shuffle: false,
+            shuffle_seed: 1,
+            ab_loop: AbLoopState::default(),
+            aspect_mode: AspectMode::Contain,
+            video_transform: VideoTransform::default(),
+            show_remaining_time: false,
+            seek_hover_fraction: None,
+            subtitle_track: None,
+            subtitle_name: None,
+            subtitles_enabled: true,
+            subtitle_offset_ms: 0,
+            subtitle_size: SubtitleSize::Medium,
+            decoder_info: None,
+            osd_message: None,
+            osd_expires_at: None,
+            show_shortcuts_help: false,
         }
     }
 
@@ -161,6 +305,7 @@ impl PlaybackUiState {
         self.duration = Duration::ZERO;
         self.scrubbing = false;
         self.scrub_fraction = 0.0;
+        self.seek_hover_fraction = None;
         self.has_video_frame = false;
         self.video_unsupported = false;
         self.video_resolution = None;
@@ -169,6 +314,11 @@ impl PlaybackUiState {
         self.raw_error_message = None;
         self.raw_warning_message = None;
         self.media_info = None;
+        self.decoder_info = None;
+        self.ab_loop.clear();
+        self.subtitle_track = None;
+        self.subtitle_name = None;
+        self.subtitle_offset_ms = 0;
         self.open_track_menu = TrackMenu::None;
         self.pending_volume = None;
         self.pending_playback_rate = None;
@@ -484,6 +634,52 @@ impl PlaybackUiState {
                 .is_some_and(MediaInfo::is_audio_only)
     }
 
+    /// Display a short-lived OSD toast message on the video stage.
+    pub fn set_osd(&mut self, msg: String) {
+        self.osd_message = Some(msg);
+        self.osd_expires_at = Some(Instant::now() + Duration::from_millis(1600));
+    }
+
+    /// Expire the OSD toast if its deadline has passed; returns `true` if state changed.
+    pub fn expire_osd(&mut self) -> bool {
+        if let Some(deadline) = self.osd_expires_at {
+            if Instant::now() >= deadline {
+                self.osd_message = None;
+                self.osd_expires_at = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return the active subtitle text at the displayed playback position, if enabled.
+    pub fn active_subtitle_text(&self) -> Option<String> {
+        if !self.subtitles_enabled {
+            return None;
+        }
+        let track = self.subtitle_track.as_ref()?;
+        track.active_text_at(self.displayed_position(), self.subtitle_offset_ms)
+    }
+
+    /// Return `Some(point_a)` when the A-B loop is active and playback has reached `point_b`.
+    pub fn check_ab_loop(&self) -> Option<Duration> {
+        self.ab_loop.should_loop_at(self.position)
+    }
+
+    /// Look for a matching sidecar `.srt` / `.vtt` subtitle file next to `media_path`.
+    pub fn find_sidecar_subtitle(media_path: &Path) -> Option<PathBuf> {
+        if is_subtitle_extension(media_path) {
+            return None;
+        }
+        for ext in SUBTITLE_EXTENSIONS {
+            let candidate = media_path.with_extension(ext);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// Apply a [`PlayerEvent`] emitted by `rsmpeg-player`.
     pub fn apply_player_event(&mut self, ev: &PlayerEvent) -> EventOutcome {
         let ev_gen = ev.generation();
@@ -570,10 +766,22 @@ impl PlaybackUiState {
                 if !self.duration.is_zero() {
                     self.position = self.duration;
                 }
-                if self.playlist.has_next() {
-                    EventOutcome::AutoAdvanceNext
-                } else {
-                    EventOutcome::None
+                match self.repeat_mode {
+                    RepeatMode::One => EventOutcome::ReplayCurrent,
+                    RepeatMode::All => {
+                        if self.playlist.is_empty() {
+                            EventOutcome::None
+                        } else {
+                            EventOutcome::AutoAdvanceNext
+                        }
+                    }
+                    RepeatMode::Off => {
+                        if self.playlist.has_next() || (self.shuffle && self.playlist.len() > 1) {
+                            EventOutcome::AutoAdvanceNext
+                        } else {
+                            EventOutcome::None
+                        }
+                    }
                 }
             }
             PlayerEvent::Error { message, .. } => {
@@ -616,6 +824,21 @@ impl PlaybackUiState {
                     if video_tracks.iter().any(|t| t.index == idx && t.supported) {
                         self.video_unsupported = false;
                     }
+                }
+                EventOutcome::None
+            }
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => {
+                if !is_stale {
+                    self.decoder_info = Some(DecoderSummary {
+                        demuxer: demuxer.clone(),
+                        video_decoder: video_decoder.clone(),
+                        audio_decoder: audio_decoder.clone(),
+                    });
                 }
                 EventOutcome::None
             }
@@ -773,28 +996,52 @@ pub fn format_track_label_for(
     parts.join(" · ")
 }
 
-/// Expand dropped paths (files + 1-level directories of supported media) off the UI thread.
-pub fn expand_dropped_paths(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
-    use crate::playlist::is_supported_media_extension;
+fn collect_dir_media(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut child_media: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && is_supported_media_extension(p))
+            .collect();
+        child_media.sort();
+        out.extend(child_media);
+    }
+}
 
+/// Expand dropped paths (files + 1-level directories of supported media) off the UI thread.
+pub fn expand_dropped_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut result = Vec::new();
     for path in paths {
         if path.is_file() {
             result.push(path);
         } else if path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                let mut child_media: Vec<std::path::PathBuf> = entries
-                    .filter_map(Result::ok)
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file() && is_supported_media_extension(p))
-                    .collect();
-                child_media.sort();
-                result.extend(child_media);
-            }
+            collect_dir_media(&path, &mut result);
         }
     }
     result.sort_by_key(|p| !is_supported_media_extension(p));
     result
+}
+
+/// Expand dropped files/folders into `(media_paths, first_subtitle_path)`.
+pub fn expand_dropped_items(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let mut media = Vec::new();
+    let mut subtitle = None;
+
+    for path in paths {
+        if path.is_file() {
+            if is_subtitle_extension(&path) {
+                if subtitle.is_none() {
+                    subtitle = Some(path);
+                }
+            } else {
+                media.push(path);
+            }
+        } else if path.is_dir() {
+            collect_dir_media(&path, &mut media);
+        }
+    }
+    media.sort_by_key(|p| !is_supported_media_extension(p));
+    (media, subtitle)
 }
 
 #[cfg(test)]
@@ -1210,5 +1457,190 @@ mod tests {
         });
         assert_eq!(st.status, PlaybackStatus::Ended);
         assert_eq!(st.position, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn ab_loop_cycles_and_triggers_when_past_point_b() {
+        let mut ab = AbLoopState::default();
+        assert!(!ab.is_active());
+        assert_eq!(ab.should_loop_at(Duration::from_secs(5)), None);
+
+        ab.cycle_at(Duration::from_secs(4));
+        assert_eq!(ab.point_a, Some(Duration::from_secs(4)));
+        assert_eq!(ab.point_b, None);
+        assert!(!ab.is_active());
+
+        ab.cycle_at(Duration::from_secs(9));
+        assert_eq!(ab.point_a, Some(Duration::from_secs(4)));
+        assert_eq!(ab.point_b, Some(Duration::from_secs(9)));
+        assert!(ab.is_active());
+        assert_eq!(ab.should_loop_at(Duration::from_secs(8)), None);
+        assert_eq!(
+            ab.should_loop_at(Duration::from_secs(9)),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            ab.should_loop_at(Duration::from_secs(10)),
+            Some(Duration::from_secs(4))
+        );
+
+        ab.cycle_at(Duration::from_secs(10));
+        assert_eq!(ab.point_a, None);
+        assert_eq!(ab.point_b, None);
+        assert!(!ab.is_active());
+
+        // Setting B before A normalizes A < B.
+        ab.cycle_at(Duration::from_secs(12));
+        ab.cycle_at(Duration::from_secs(3));
+        assert_eq!(ab.point_a, Some(Duration::from_secs(3)));
+        assert_eq!(ab.point_b, Some(Duration::from_secs(12)));
+        assert!(ab.is_active());
+
+        let mut st = PlaybackUiState::new();
+        st.ab_loop = ab;
+        st.position = Duration::from_secs(12);
+        assert_eq!(st.check_ab_loop(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn repeat_modes_and_shuffle_control_ended_event_outcome() {
+        let mut st = PlaybackUiState::new();
+        st.playlist
+            .add_paths([PathBuf::from("a.mp4"), PathBuf::from("b.mp4")]);
+        st.playlist.select(1); // last track
+
+        // Repeat::Off without shuffle -> None at last track.
+        st.repeat_mode = RepeatMode::Off;
+        st.shuffle = false;
+        assert_eq!(
+            st.apply_player_event(&PlayerEvent::Ended { generation: 1 }),
+            EventOutcome::None
+        );
+
+        // Repeat::Off with shuffle and >1 tracks -> AutoAdvanceNext.
+        st.shuffle = true;
+        assert_eq!(
+            st.apply_player_event(&PlayerEvent::Ended { generation: 2 }),
+            EventOutcome::AutoAdvanceNext
+        );
+
+        // Repeat::All -> AutoAdvanceNext even on last track without shuffle.
+        st.shuffle = false;
+        st.repeat_mode = RepeatMode::All;
+        assert_eq!(
+            st.apply_player_event(&PlayerEvent::Ended { generation: 3 }),
+            EventOutcome::AutoAdvanceNext
+        );
+
+        // Repeat::One -> ReplayCurrent.
+        st.repeat_mode = RepeatMode::One;
+        assert_eq!(
+            st.apply_player_event(&PlayerEvent::Ended { generation: 4 }),
+            EventOutcome::ReplayCurrent
+        );
+    }
+
+    #[test]
+    fn osd_expires_and_decoder_info_and_subtitles_update_cleanly() {
+        let mut st = PlaybackUiState::new();
+        st.set_osd("Volume: 85%".to_string());
+        assert_eq!(st.osd_message.as_deref(), Some("Volume: 85%"));
+        assert!(!st.expire_osd());
+
+        // Force past deadline to test expiration deterministically without sleeping.
+        st.osd_expires_at = Some(Instant::now() - Duration::from_millis(10));
+        assert!(st.expire_osd());
+        assert!(st.osd_message.is_none());
+        assert!(st.osd_expires_at.is_none());
+        assert!(!st.expire_osd());
+
+        // DecoderInfo event stores demuxer & decoder summary.
+        st.apply_player_event(&PlayerEvent::DecoderInfo {
+            demuxer: "rsmpeg-format (mp4)".to_string(),
+            video_decoder: Some("OpenH264 (H.264)".to_string()),
+            audio_decoder: Some("Symphonia (AAC)".to_string()),
+            generation: 1,
+        });
+        assert_eq!(
+            st.decoder_info,
+            Some(DecoderSummary {
+                demuxer: "rsmpeg-format (mp4)".to_string(),
+                video_decoder: Some("OpenH264 (H.264)".to_string()),
+                audio_decoder: Some("Symphonia (AAC)".to_string()),
+            })
+        );
+
+        // Subtitle track lookup respects enabled toggle and offset_ms.
+        let track = rsmpeg::codec::parse_srt("1\n00:00:02,000 --> 00:00:04,000\nSubtitle line\n")
+            .expect("valid SRT");
+        st.subtitle_track = Some(track);
+        st.position = Duration::from_millis(2500);
+        assert_eq!(st.active_subtitle_text().as_deref(), Some("Subtitle line"));
+
+        st.subtitle_offset_ms = 1000; // delayed by 1s -> now [3.0s, 5.0s)
+        assert_eq!(st.active_subtitle_text(), None);
+        st.position = Duration::from_millis(3200);
+        assert_eq!(st.active_subtitle_text().as_deref(), Some("Subtitle line"));
+
+        st.subtitles_enabled = false;
+        assert_eq!(st.active_subtitle_text(), None);
+
+        // User preferences persist across begin_loading, while transient per-file state clears.
+        st.repeat_mode = RepeatMode::All;
+        st.shuffle = true;
+        st.aspect_mode = AspectMode::Cover;
+        st.video_transform.rotate_cw();
+        st.subtitle_size = SubtitleSize::Large;
+        st.show_remaining_time = true;
+        st.ab_loop.cycle_at(Duration::from_secs(1));
+        st.begin_loading();
+        assert!(st.decoder_info.is_none());
+        assert!(st.subtitle_track.is_none());
+        assert!(!st.ab_loop.is_active());
+        assert_eq!(st.ab_loop.point_a, None);
+        assert_eq!(st.repeat_mode, RepeatMode::All);
+        assert!(st.shuffle);
+        assert_eq!(st.aspect_mode, AspectMode::Cover);
+        assert_eq!(st.video_transform.rotation_deg, 90);
+        assert_eq!(st.subtitle_size, SubtitleSize::Large);
+        assert!(st.show_remaining_time);
+    }
+
+    #[test]
+    fn aspect_and_subtitle_size_cycle_and_sidecar_detection() {
+        assert_eq!(AspectMode::Contain.cycle(), AspectMode::Cover);
+        assert_eq!(AspectMode::Cover.cycle(), AspectMode::Fill);
+        assert_eq!(AspectMode::Fill.cycle(), AspectMode::Contain);
+
+        assert_eq!(SubtitleSize::Small.cycle(), SubtitleSize::Medium);
+        assert_eq!(SubtitleSize::Medium.cycle(), SubtitleSize::Large);
+        assert_eq!(SubtitleSize::Large.cycle(), SubtitleSize::Small);
+        assert_eq!(SubtitleSize::Small.font_px(), 15.0);
+        assert_eq!(SubtitleSize::Medium.font_px(), 19.0);
+        assert_eq!(SubtitleSize::Large.font_px(), 24.0);
+
+        let dir = std::env::temp_dir().join("rsmpeg_gui_sidecar_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("episode.mp4");
+        let vtt = dir.join("episode.vtt");
+        let srt = dir.join("episode.srt");
+        std::fs::write(&media, b"mp4").unwrap();
+        std::fs::write(&vtt, b"WEBVTT\n").unwrap();
+
+        assert_eq!(
+            PlaybackUiState::find_sidecar_subtitle(&media),
+            Some(vtt.clone())
+        );
+        std::fs::write(&srt, b"1\n00:00:00,000 --> 00:00:01,000\nhi\n").unwrap();
+        assert_eq!(
+            PlaybackUiState::find_sidecar_subtitle(&media),
+            Some(srt.clone())
+        );
+
+        let (dropped_media, dropped_sub) = expand_dropped_items(vec![media.clone(), vtt.clone()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(dropped_media, vec![media]);
+        assert_eq!(dropped_sub, Some(vtt));
     }
 }
