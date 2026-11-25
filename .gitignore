@@ -1,4 +1,5 @@
 /target/
+/dist/
 .superpowers/
 
 # OpenCode runtime state

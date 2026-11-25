@@ -45,6 +45,19 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 PlayerEvent::Warning { message, .. } => {
                     eprintln!("  Warning: {}", message);
                 }
+                PlayerEvent::DecoderInfo {
+                    demuxer,
+                    video_decoder,
+                    audio_decoder,
+                    ..
+                } => {
+                    println!(
+                        "  Pipeline: demux={}, video={}, audio={}",
+                        demuxer,
+                        video_decoder.as_deref().unwrap_or("none"),
+                        audio_decoder.as_deref().unwrap_or("none")
+                    );
+                }
                 // Snapshot metadata is not needed by the legacy minifb `play`
                 // window; it is only reported for duration display in the GUI.
                 PlayerEvent::Snapshot(_s) => {}

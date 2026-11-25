@@ -119,7 +119,8 @@ impl eframe::App for MediaApp {
                     }
                     PlayerEvent::VideoFrame { .. }
                     | PlayerEvent::AudioLevel { .. }
-                    | PlayerEvent::Tracks { .. } => {}
+                    | PlayerEvent::Tracks { .. }
+                    | PlayerEvent::DecoderInfo { .. } => {}
                 }
             }
 
