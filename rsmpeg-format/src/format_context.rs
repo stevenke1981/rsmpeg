@@ -115,7 +115,7 @@ impl FormatContext {
                 demuxer = Some(Box::new(crate::demuxers::AVIDemuxer));
             }
             "flac" => {
-                demuxer = Some(Box::new(crate::demuxers::FLACDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::FLACDemuxer::default()));
             }
             "wav" => {
                 demuxer = Some(Box::new(crate::demuxers::WAVDemuxer::default()));

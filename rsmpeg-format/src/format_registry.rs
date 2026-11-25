@@ -94,7 +94,7 @@ pub fn register_builtin_formats() {
     registry.register_demuxer(Box::new(MP4Demuxer::default()));
     registry.register_demuxer(Box::new(MKVDemuxer));
     registry.register_demuxer(Box::new(AVIDemuxer));
-    registry.register_demuxer(Box::new(FLACDemuxer));
+    registry.register_demuxer(Box::new(FLACDemuxer::default()));
     registry.register_demuxer(Box::new(WAVDemuxer::default()));
     registry.register_demuxer(Box::new(RawVideoDemuxer));
     tracing::info!("Registered 6 built-in demuxers");

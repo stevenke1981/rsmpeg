@@ -1311,6 +1311,21 @@ fn parse_stsd(
                 tables.codec_id = CodecId::Av1;
                 tables.media_type = MediaType::Video;
             }
+            b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" => {
+                tables.codec_id = CodecId::Mjpeg;
+                tables.media_type = MediaType::Video;
+                parse_visual_sample_entry(io, payload_start, payload_end, tables)?;
+            }
+            b"mp4v" => {
+                tables.codec_id = CodecId::Mpeg4;
+                tables.media_type = MediaType::Video;
+                parse_visual_sample_entry(io, payload_start, payload_end, tables)?;
+            }
+            b"fLaC" => {
+                tables.codec_id = CodecId::Flac;
+                tables.media_type = MediaType::Audio;
+                parse_audio_sample_entry(io, payload_start, payload_end, tables)?;
+            }
             _ => {}
         }
         if entry_size == 0 {
@@ -1363,6 +1378,30 @@ fn parse_visual_sample_entry(
                     nal_length_size: nls,
                 };
                 tables.codec_id = CodecId::H264;
+            }
+        } else if &box_type == b"esds" {
+            let len_u64 = payload_end.saturating_sub(payload_start);
+            if let Ok(len) = usize::try_from(len_u64) {
+                if len > 0 && len < 64 * 1024 {
+                    io.seek(SeekFrom::Start(payload_start))?;
+                    let data = io.read_bytes(len)?;
+                    if let Some(esds) = parse_esds(&data) {
+                        if esds.object_type_indication == 0x6C {
+                            tables.codec_id = CodecId::Mjpeg;
+                        }
+                        if let Some(dsi) = esds.audio_specific_config {
+                            tables.extradata = Some(dsi);
+                        }
+                        let br = if esds.avg_bitrate > 0 {
+                            esds.avg_bitrate
+                        } else {
+                            esds.max_bitrate
+                        };
+                        if br > 0 {
+                            tables.bit_rate = u64::from(br);
+                        }
+                    }
+                }
             }
         }
         if box_size == 0 {
@@ -1432,6 +1471,25 @@ fn parse_audio_sample_entry(
                     };
                     if br > 0 {
                         tables.bit_rate = u64::from(br);
+                    }
+                }
+            }
+        } else if &box_type == b"dfLa" {
+            let len_u64 = payload_end.saturating_sub(payload_start);
+            if let Ok(len) = usize::try_from(len_u64) {
+                if (8..64 * 1024).contains(&len) {
+                    io.seek(SeekFrom::Start(payload_start))?;
+                    let data = io.read_bytes(len)?;
+                    if data.len() >= 8 {
+                        let hdr = &data[4..8];
+                        let block_type = hdr[0] & 0x7F;
+                        let block_len = (usize::from(hdr[1]) << 16)
+                            | (usize::from(hdr[2]) << 8)
+                            | usize::from(hdr[3]);
+                        if block_type == 0 && block_len >= 34 && data.len() >= 8 + 34 {
+                            tables.extradata = Some(data[8..8 + 34].to_vec());
+                            tables.codec_id = CodecId::Flac;
+                        }
                     }
                 }
             }
@@ -3095,5 +3153,187 @@ mod tests {
             open_res.expect("public FormatContext::open_input + read_header must not panic"),
             0
         );
+    }
+
+    fn build_mp4_with_sample_entry(
+        handler_type: &[u8; 4],
+        timescale: u32,
+        sample_entry_box: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut stsd_rest = Vec::new();
+        stsd_rest.extend_from_slice(&be32(1));
+        stsd_rest.extend_from_slice(&sample_entry_box);
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1024));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = Vec::new();
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = Vec::new();
+        stsz_rest.extend_from_slice(&be32(0));
+        stsz_rest.extend_from_slice(&be32(1));
+        stsz_rest.extend_from_slice(&be32(4));
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mdat = box_bytes(b"mdat", b"DATA");
+        let data_offset = (ftyp.len() + 8) as u32;
+
+        let mut stco_rest = Vec::new();
+        stco_rest.extend_from_slice(&be32(1));
+        stco_rest.extend_from_slice(&be32(data_offset));
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut stbl_body = Vec::new();
+        for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+            stbl_body.extend_from_slice(b);
+        }
+        let minf = box_bytes(b"minf", &box_bytes(b"stbl", &stbl_body));
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&be32(timescale));
+        mdhd_body[12..16].copy_from_slice(&be32(1024));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(handler_type);
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body)),
+        );
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    #[test]
+    fn mp4_demuxer_parses_mjpeg_visual_sample_entries() {
+        for fourcc in [b"jpeg", b"mjpa", b"mjpb", b"mjpg"] {
+            let mut visual_payload = vec![0u8; 78];
+            visual_payload[24..26].copy_from_slice(&be16(640));
+            visual_payload[26..28].copy_from_slice(&be16(480));
+            let entry = box_bytes(fourcc, &visual_payload);
+            let file = build_mp4_with_sample_entry(b"vide", 90_000, entry);
+
+            let mut ctx = ctx_from(file);
+            let mut demuxer = MP4Demuxer::default();
+            demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+            assert_eq!(ctx.streams.len(), 1);
+            let st = &ctx.streams[0];
+            assert_eq!(st.codec_id, CodecId::Mjpeg);
+            assert_eq!(st.media_type, MediaType::Video);
+            assert_eq!(st.codec_params.width, Some(640));
+            assert_eq!(st.codec_params.height, Some(480));
+        }
+    }
+
+    #[test]
+    fn mp4_demuxer_upgrades_mp4v_with_esds_0x6c_to_mjpeg() {
+        let esds_mjpeg = box_bytes(b"esds", &build_esds_payload(1, 0x00, 0x6C, &[]));
+        let mut visual_payload = vec![0u8; 78];
+        visual_payload[24..26].copy_from_slice(&be16(320));
+        visual_payload[26..28].copy_from_slice(&be16(240));
+        visual_payload.extend_from_slice(&esds_mjpeg);
+        let mp4v_mjpeg = box_bytes(b"mp4v", &visual_payload);
+
+        let file = build_mp4_with_sample_entry(b"vide", 30_000, mp4v_mjpeg);
+        let mut ctx = ctx_from(file);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+        assert_eq!(ctx.streams.len(), 1);
+        let st = &ctx.streams[0];
+        assert_eq!(st.codec_id, CodecId::Mjpeg);
+        assert_eq!(st.media_type, MediaType::Video);
+        assert_eq!(st.codec_params.width, Some(320));
+        assert_eq!(st.codec_params.height, Some(240));
+
+        // Plain MPEG-4 Visual (objectTypeIndication = 0x20) remains CodecId::Mpeg4.
+        let esds_mpeg4 = box_bytes(b"esds", &build_esds_payload(1, 0x00, 0x20, &[0x00, 0x00]));
+        let mut visual_mpeg4 = vec![0u8; 78];
+        visual_mpeg4[24..26].copy_from_slice(&be16(1280));
+        visual_mpeg4[26..28].copy_from_slice(&be16(720));
+        visual_mpeg4.extend_from_slice(&esds_mpeg4);
+        let mp4v_mpeg4 = box_bytes(b"mp4v", &visual_mpeg4);
+
+        let file2 = build_mp4_with_sample_entry(b"vide", 30_000, mp4v_mpeg4);
+        let mut ctx2 = ctx_from(file2);
+        let mut demuxer2 = MP4Demuxer::default();
+        demuxer2
+            .read_header(&mut ctx2)
+            .expect("read_header succeeds");
+        assert_eq!(ctx2.streams[0].codec_id, CodecId::Mpeg4);
+        assert_eq!(ctx2.streams[0].codec_params.width, Some(1280));
+        assert_eq!(ctx2.streams[0].codec_params.height, Some(720));
+    }
+
+    #[test]
+    fn mp4_demuxer_parses_flac_dfla_streaminfo_extradata() {
+        let mut streaminfo = [0u8; 34];
+        for (i, b) in streaminfo.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1);
+        }
+        let mut dfla_rest = vec![0x80, 0x00, 0x00, 34]; // last-block=1, type=0 (STREAMINFO), len=34
+        dfla_rest.extend_from_slice(&streaminfo);
+        let dfla_box = box_bytes(b"dfLa", &fullbox(0, 0, &dfla_rest));
+
+        let mut flac_payload = vec![0u8; 28];
+        flac_payload[16..18].copy_from_slice(&be16(2)); // 2 channels
+        flac_payload[18..20].copy_from_slice(&be16(16)); // 16-bit
+        flac_payload[24..26].copy_from_slice(&be16(44_100)); // 44100 Hz
+        flac_payload.extend_from_slice(&dfla_box);
+        let flac_entry = box_bytes(b"fLaC", &flac_payload);
+
+        let file = build_mp4_with_sample_entry(b"soun", 44_100, flac_entry);
+        let mut ctx = ctx_from(file);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+        assert_eq!(ctx.streams.len(), 1);
+        let st = &ctx.streams[0];
+        assert_eq!(st.codec_id, CodecId::Flac);
+        assert_eq!(st.media_type, MediaType::Audio);
+        assert_eq!(st.codec_params.sample_rate, Some(44_100));
+        assert_eq!(st.codec_params.channels, Some(2));
+        assert_eq!(
+            st.codec_params.extradata.as_deref(),
+            Some(streaminfo.as_slice())
+        );
+
+        // Truncated dfLa must not panic and leaves extradata empty.
+        let bad_dfla = box_bytes(b"dfLa", &fullbox(0, 0, &[0x80, 0x00, 0x00, 34, 0x01, 0x02]));
+        let mut bad_payload = vec![0u8; 28];
+        bad_payload[16..18].copy_from_slice(&be16(2));
+        bad_payload[24..26].copy_from_slice(&be16(44_100));
+        bad_payload.extend_from_slice(&bad_dfla);
+        let bad_entry = box_bytes(b"fLaC", &bad_payload);
+
+        let bad_file = build_mp4_with_sample_entry(b"soun", 44_100, bad_entry);
+        let mut bad_ctx = ctx_from(bad_file);
+        let mut bad_demuxer = MP4Demuxer::default();
+        bad_demuxer
+            .read_header(&mut bad_ctx)
+            .expect("truncated dfLa must not panic");
+        assert_eq!(bad_ctx.streams[0].codec_id, CodecId::Flac);
+        assert_eq!(bad_ctx.streams[0].codec_params.extradata, None);
     }
 }

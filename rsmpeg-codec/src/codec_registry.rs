@@ -76,8 +76,12 @@ pub fn register_builtin_codecs() {
         return;
     }
 
-    // Register raw video codec
+    // Register pure-Rust video codecs
     registry.register(Box::new(RawVideoCodec));
+    registry.register(Box::new(MjpegCodec));
+
+    // Register pure-Rust lossless audio codec
+    registry.register(Box::new(FlacCodec));
 
     // Register PCM audio codecs for common formats
     for sample_fmt in &[
@@ -90,6 +94,10 @@ pub fn register_builtin_codecs() {
             registry.register(Box::new(codec));
         }
     }
+
+    // Register subtitle codecs
+    registry.register(Box::new(SrtCodec));
+    registry.register(Box::new(WebVttCodec));
 
     tracing::info!("Registered {} built-in codecs", registry.len());
 }
