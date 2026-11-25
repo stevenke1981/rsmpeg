@@ -602,6 +602,7 @@ fn run_worker(
     let mut audio_play_start: Option<Instant> = None;
     let mut audio_throttle_clock = crate::clock::AudioPlaybackClock::new();
     let mut audio_played_base: u64 = 0;
+    let mut appended_audio_frames: u64 = 0;
     let mut drop_until: Option<Duration> = None;
 
     // ── Video decoder (OpenH264 backend) ──
@@ -764,6 +765,7 @@ fn run_worker(
                             audio_play_start = None;
                             audio_throttle_clock.seek(Duration::ZERO);
                             audio_played_base = 0;
+                            appended_audio_frames = 0;
                             let _ = format.seek(
                                 SeekMode::Coarse,
                                 SeekTo::Time {
@@ -900,6 +902,7 @@ fn run_worker(
                                 audio_play_start = None;
                                 audio_throttle_clock.seek(Duration::ZERO);
                                 audio_played_base = 0;
+                                appended_audio_frames = 0;
                                 if eof_draining {
                                     let cur_secs = position.as_secs_f64().max(0.0);
                                     let _ = format.seek(
@@ -1038,6 +1041,7 @@ fn run_worker(
                                 audio_play_start = None;
                                 audio_throttle_clock.seek(Duration::ZERO);
                                 audio_played_base = 0;
+                                appended_audio_frames = 0;
                                 if let Some(ref s) = sink {
                                     s.clear();
                                     s.set_volume(volume);
@@ -1118,19 +1122,36 @@ fn run_worker(
             continue;
         }
 
-        // Sample-based throttle works even on headless environments without an audio sink;
-        // `rodio` queue backpressure acts as an additional cap when a sink is present.
-        if audio_throttle_clock.is_output_active() && playing {
-            let played = (audio_throttle_clock.now().as_secs_f64() * audio_rate as f64) as u64
-                * audio_channels as u64;
-            audio_ring.consume(played.saturating_sub(audio_played_base) as usize);
-            audio_played_base = played;
-        }
-        if !audio_ring.is_empty() && audio_ring.len() >= audio_ring.capacity() {
-            thread::sleep(Duration::from_millis(4));
-            continue;
+        if video_track.is_none() && playing && audio_throttle_clock.is_output_active() {
+            let queued_audio =
+                PlaybackClock::duration_from_audio_samples(appended_audio_frames, audio_rate);
+            if queued_audio
+                > audio_throttle_clock
+                    .now()
+                    .saturating_add(Duration::from_millis(AUDIO_TARGET_MS))
+            {
+                emit(
+                    &event_tx,
+                    PlayerEvent::PositionChanged {
+                        position,
+                        generation,
+                    },
+                );
+                thread::sleep(Duration::from_millis(8));
+                continue;
+            }
         }
         if let Some(ref s) = sink {
+            if audio_throttle_clock.is_output_active() && playing {
+                let played = (audio_throttle_clock.now().as_secs_f64() * audio_rate as f64) as u64
+                    * audio_channels as u64;
+                audio_ring.consume(played.saturating_sub(audio_played_base) as usize);
+                audio_played_base = played;
+            }
+            if !audio_ring.is_empty() && audio_ring.len() >= audio_ring.capacity() {
+                thread::sleep(Duration::from_millis(4));
+                continue;
+            }
             if s.len() >= MAX_AUDIO_QUEUE_SOURCES {
                 thread::sleep(Duration::from_millis(4));
                 continue;
@@ -1422,6 +1443,8 @@ fn run_worker(
                                         last_level_emit = Some(Instant::now());
                                     }
                                     audio_ring.push(&samples);
+                                    appended_audio_frames +=
+                                        (samples.len() / usize::from(audio_channels.max(1))) as u64;
                                     if let Some(ref s) = sink {
                                         s.append(rodio::buffer::SamplesBuffer::new(
                                             audio_channels,
@@ -1482,12 +1505,20 @@ fn run_worker(
                                 );
                                 last_level_emit = Some(Instant::now());
                             }
+                            appended_audio_frames +=
+                                (samples.len() / usize::from(audio_channels.max(1))) as u64;
                             if let Some(ref s) = sink {
                                 s.append(rodio::buffer::SamplesBuffer::new(
                                     audio_channels,
                                     audio_rate,
                                     samples,
                                 ));
+                            }
+                            if playing {
+                                if audio_play_start.is_none() {
+                                    audio_play_start = Some(Instant::now());
+                                }
+                                audio_throttle_clock.start_output_at(Duration::ZERO);
                             }
                         }
                     }
