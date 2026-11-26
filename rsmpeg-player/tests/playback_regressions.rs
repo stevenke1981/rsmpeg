@@ -1,4 +1,9 @@
 //! End-to-end playback worker regression tests (native & Symphonia fallback).
+//!
+//! Tests that need H.264 or AAC are gated on the backend providing it. The rest
+//! run under every feature combination, including `--no-default-features`;
+//! without `backend-symphonia` their "fallback" iterations use the native
+//! pipeline too.
 
 #![forbid(unsafe_code)]
 
@@ -7,8 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsmpeg_player::{Player, PlayerError, PlayerEvent, PlayerState};
+#[cfg(feature = "backend-openh264")]
+use rsmpeg_player::PlayerError;
+use rsmpeg_player::{Player, PlayerEvent, PlayerState};
 
+#[cfg(any(feature = "backend-symphonia", feature = "backend-openh264"))]
 /// Single valid 48 kHz mono AAC-LC raw frame (non-silent tone, 1024 samples / ~21.33 ms).
 const AAC_MONO_48K_FRAME: &[u8] = &[
     0x01, 0x36, 0x8F, 0xDE, 0xCA, 0x21, 0x96, 0x58, 0xA3, 0x14, 0x7E, 0xED, 0x38, 0xFE, 0xFA, 0xEB,
@@ -19,6 +27,7 @@ const AAC_MONO_48K_FRAME: &[u8] = &[
     0x70,
 ];
 
+#[cfg(any(feature = "backend-symphonia", feature = "backend-openh264"))]
 /// AAC-LC 48 kHz mono AudioSpecificConfig (`objectType=2`, `freqIdx=3`, `channels=1`).
 const AAC_MONO_48K_ASC: &[u8] = &[0x11, 0x88];
 
@@ -67,6 +76,7 @@ fn fullbox(version: u8, flags: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(any(feature = "backend-symphonia", feature = "backend-openh264"))]
 fn encode_mp4_esds(asc: &[u8]) -> Vec<u8> {
     // DecoderSpecificInfo (tag 0x05)
     let mut dsi = vec![0x05, asc.len() as u8];
@@ -99,6 +109,7 @@ fn encode_mp4_esds(asc: &[u8]) -> Vec<u8> {
     box_bytes(b"esds", &fullbox(0, 0, &es))
 }
 
+#[cfg(any(feature = "backend-symphonia", feature = "backend-openh264"))]
 fn encode_iso639_lang(lang: &[u8; 3]) -> u16 {
     let a = u16::from(lang[0].saturating_sub(0x60)) & 0x1F;
     let b = u16::from(lang[1].saturating_sub(0x60)) & 0x1F;
@@ -106,6 +117,7 @@ fn encode_iso639_lang(lang: &[u8; 3]) -> u16 {
     (a << 10) | (b << 5) | c
 }
 
+#[cfg(any(feature = "backend-symphonia", feature = "backend-openh264"))]
 fn build_aac_trak(
     track_id: u32,
     sample_count: u32,
@@ -207,6 +219,7 @@ fn build_aac_trak(
     box_bytes(b"trak", &trak_body)
 }
 
+#[cfg(feature = "backend-symphonia")]
 /// Build a valid self-contained dual-track AAC MP4 (`frames_per_track` × 21.33 ms per track).
 fn build_dual_aac_mp4(frames_per_track: u32) -> Vec<u8> {
     let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
@@ -273,6 +286,7 @@ fn watch(
 /// P1-02 regression: seeking and switching audio tracks while the demuxer has already reached
 /// EOF and `rodio::Sink` is still draining must be processed by the common command loop rather
 /// than silently discarded.
+#[cfg(all(feature = "backend-symphonia", feature = "audio-rodio"))]
 #[test]
 fn eof_audio_drain_handles_seek_and_track_switch_in_native_and_fallback() {
     // 14 frames ≈ 300 ms at 1.0x, ≈ 1.2 s at 0.25x so demux hits EOF well before sink drains.
@@ -417,12 +431,14 @@ fn build_pcm_wav(duration_secs: u32) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "backend-openh264")]
 /// Build a valid self-contained H.264 baseline 16×16 MP4 with `frame_count` IDR keyframes
 /// spaced at `frame_duration_ms` intervals (timescale = 1000).
 fn build_h264_mp4(frame_count: u32, frame_duration_ms: u32) -> Vec<u8> {
     build_h264_movie(1, frame_count, frame_duration_ms, false)
 }
 
+#[cfg(any(feature = "backend-openh264", feature = "backend-symphonia"))]
 /// Build a self-contained MP4 with `video_tracks` identical H.264 16×16 tracks (track ids
 /// `1..=video_tracks`, each with `frame_count` IDR samples spaced `frame_duration_ms` apart).
 /// When `with_aac` is set, a trailing 48 kHz mono AAC track (track id `video_tracks + 1`)
@@ -500,6 +516,7 @@ fn build_h264_movie(
     file
 }
 
+#[cfg(any(feature = "backend-openh264", feature = "backend-symphonia"))]
 /// One H.264 `trak` with track id `track_id` whose samples live at `data_offset`.
 fn build_h264_trak(
     track_id: u32,
@@ -675,6 +692,7 @@ fn paused_wav_seek_does_not_emit_ended_in_native_and_fallback() {
 /// P1-03b regression: opening a video with `autoplay(false)` and immediately seeking to 5.5 s
 /// before any frame has been decoded must keep the 0-based media time origin so the first
 /// preview frame and `Player::position()` reflect ~5.0–5.5 s rather than jumping back to 0 ns.
+#[cfg(feature = "backend-openh264")]
 #[test]
 fn initial_seek_with_autoplay_false_preserves_media_time_origin() {
     // 14 keyframes × 500 ms = 7.0 s video (keyframes at 0.0 s, 0.5 s, ..., 5.0 s, 5.5 s, ...).
@@ -736,6 +754,7 @@ fn initial_seek_with_autoplay_false_preserves_media_time_origin() {
 /// 2. Letting a fast-playing video saturate the 128-slot event queue without polling
 ///    still reliably delivers `PlayerEvent::Ended` once drained, and subsequent
 ///    commands return `Err(PlayerError::ShutDown)` instead of `CommandQueueFull`.
+#[cfg(feature = "backend-openh264")]
 #[test]
 fn queue_saturation_and_event_backpressure_preserve_generation_and_ended() {
     // 160 keyframes × 10 ms = 1.6 s at 1× (~400 ms at 4×) -> produces >320 VideoFrame + PositionChanged events!
@@ -908,6 +927,7 @@ fn paused_wav_seek_then_resume_does_not_count_pause_duration() {
 /// pausing polling during playback must NOT drop subsequent control replies
 /// (`Pause`, `Seek`, `SelectAudioTrack`, `SetPlaybackRate`, `SetVolume`) in either
 /// the native pipeline or the Symphonia fallback worker.
+#[cfg(feature = "backend-symphonia")]
 #[test]
 fn saturated_stream_delivers_all_control_replies_in_native_and_fallback() {
     // 450 frames × 21.33 ms ≈ 9.6 s dual-AAC MP4 -> saturates 128-slot stream channel easily.
@@ -1013,6 +1033,7 @@ fn saturated_stream_delivers_all_control_replies_in_native_and_fallback() {
 /// P1-06 regression (end-to-end): playing a short dual-AAC MP4 to completion must
 /// deliver `opening` / `Tracks` / `playing` strictly before `Ended`, with zero
 /// events arriving after `Ended`.
+#[cfg(feature = "backend-symphonia")]
 #[test]
 fn short_file_delivers_opening_and_playing_snapshots_strictly_before_ended() {
     // 10 frames ≈ 213 ms short AAC MP4.
@@ -1079,6 +1100,7 @@ fn short_file_delivers_opening_and_playing_snapshots_strictly_before_ended() {
 /// during native video playback, pausing and seeking to 7.0 s must still deliver
 /// the single new preview `VideoFrame` at the seeked generation and PTS rather than
 /// leaving the host with only a stale generation-1 frame.
+#[cfg(feature = "backend-openh264")]
 #[test]
 fn saturated_stream_delivers_paused_seek_preview_frame() {
     // 240 keyframes × 50 ms = 12.0 s @ 20 fps -> 20 frames + 20 positions/sec = 40 stream events/s;
@@ -1715,10 +1737,12 @@ fn native_mjpeg_mp4_seek_precise_lands_at_target_while_paused() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 /// Upper bound for any single control acknowledgement; generous for CI, but tight enough to
 /// catch a worker that stops servicing commands while it waits for the next frame.
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 fn is_warning_for(ev: &PlayerEvent, generation: u64, needle: &str) -> bool {
     matches!(
         ev,
@@ -1727,6 +1751,7 @@ fn is_warning_for(ev: &PlayerEvent, generation: u64, needle: &str) -> bool {
     )
 }
 
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 /// Wait for an acknowledgement of a command issued just before this call, asserting it arrives
 /// within [`ACK_TIMEOUT`].
 fn expect_ack_within(
@@ -1744,6 +1769,7 @@ fn expect_ack_within(
 
 /// Invalid track indices must surface as `Warning` events on both pipelines (never a crash or
 /// hang), and the player must still shut down cleanly afterwards.
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 #[test]
 fn invalid_track_indices_emit_warning_without_crashing_native_and_fallback() {
     // One H.264 video track plus one AAC track so both selection paths are exercised.
@@ -1799,6 +1825,7 @@ fn invalid_track_indices_emit_warning_without_crashing_native_and_fallback() {
 
 /// Stepping while paused must advance the generation once per step and leave the player paused.
 /// On the native pipeline each step must also emit exactly one advancing preview frame.
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 #[test]
 fn step_forward_while_paused_emits_frame_and_stays_paused_native_and_fallback() {
     // 20 keyframes × 250 ms = 5 s of 16×16 H.264, plus an AAC track so the fallback opens the file.
@@ -1905,6 +1932,7 @@ fn step_forward_while_paused_emits_frame_and_stays_paused_native_and_fallback() 
 /// A burst of 12 rapid seeks (alternating coarse and precise) on a paused H.264+AAC file must
 /// settle on the final generation: one `SeekCompleted` at the last target (plus its preview frame
 /// on the native pipeline), with no `Error` and no hang.
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 #[test]
 fn rapid_consecutive_seeks_deliver_final_generation_preview_native_and_fallback() {
     let path = unique_temp_path("rapid_seeks", "mp4");
@@ -1988,6 +2016,7 @@ fn rapid_consecutive_seeks_deliver_final_generation_preview_native_and_fallback(
 
 /// With a slow 2 fps stream the worker spends most of its time waiting for the next frame. Rate
 /// changes, pause, play and stop issued during that wait must each be acknowledged promptly.
+#[cfg(all(feature = "backend-openh264", feature = "backend-symphonia"))]
 #[test]
 fn wait_loop_responds_promptly_to_rate_change_pause_and_stop() {
     // 10 keyframes × 500 ms = 5 s at 2 fps, plus an AAC track so the fallback opens the file.
@@ -2070,6 +2099,7 @@ fn wait_loop_responds_promptly_to_rate_change_pause_and_stop() {
 
 /// Switching between two H.264 video tracks on the native pipeline must report the new active
 /// track in `Tracks` and deliver a preview frame stamped with the new generation.
+#[cfg(feature = "backend-openh264")]
 #[test]
 fn multi_video_track_switch_native_updates_active_video_and_emits_frame() {
     // Two identical H.264 tracks (ids 1 and 2), 10 frames × 200 ms each.
@@ -2357,6 +2387,7 @@ fn build_mjpeg_pcm_avi() -> Vec<u8> {
     riff_chunk(b"RIFF", &avi_payload)
 }
 
+#[cfg(feature = "backend-openh264")]
 #[test]
 fn native_mkv_plays_pure_rust_demux_and_decoders() {
     let path = unique_temp_path("native_mkv_e2e", "mkv");
@@ -2526,5 +2557,405 @@ fn native_avi_plays_pure_rust_mjpeg_and_pcm() {
     );
 
     let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// What one playback session reported while being driven to its end.
+#[derive(Default)]
+struct Session {
+    decoder_info: Option<(String, Option<String>, Option<String>)>,
+    active: Option<(Option<usize>, Option<usize>)>,
+    warnings: Vec<String>,
+}
+
+/// Open `path` paused, seek to `target`, then play to the end, asserting every
+/// step: the seek is acknowledged, audio resumes at or after the target, and
+/// playback finishes with `Ended` (never `Error`).
+fn seek_then_play_to_end(path: &std::path::Path, target: Duration) -> Session {
+    let mut player = Player::builder()
+        .input(path)
+        .prefer_native_pipeline(true)
+        .autoplay(false)
+        .volume(0.0)
+        .build()
+        .expect("build player");
+
+    let mut session = Session::default();
+    let mut errors = Vec::new();
+    let opened = watch(&mut player, Duration::from_secs(3), |ev| {
+        match ev {
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => session.decoder_info = Some((demuxer, video_decoder, audio_decoder)),
+            PlayerEvent::Tracks {
+                active_video,
+                active_audio,
+                ..
+            } => session.active = Some((active_video, active_audio)),
+            PlayerEvent::Warning { message, .. } => session.warnings.push(message),
+            PlayerEvent::Error { message, .. } => errors.push(message),
+            PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing => {
+                return session.decoder_info.is_some();
+            }
+            _ => {}
+        }
+        false
+    });
+    assert!(
+        opened,
+        "expected DecoderInfo and a paused snapshot: {errors:?}"
+    );
+
+    player.seek(target).expect("seek");
+    let seek_gen = player.generation();
+    assert!(
+        watch(&mut player, Duration::from_secs(3), |ev| {
+            matches!(
+                ev,
+                PlayerEvent::SeekCompleted { position, generation }
+                    if generation == seek_gen && position == target
+            )
+        }),
+        "expected SeekCompleted({target:?})"
+    );
+
+    player.play().expect("play");
+    let mut peak_seen = false;
+    let mut positions = Vec::new();
+    let ended = watch(&mut player, Duration::from_secs(6), |ev| {
+        match ev {
+            PlayerEvent::AudioLevel {
+                peak, generation, ..
+            } if generation == seek_gen => peak_seen |= peak > 0.0,
+            PlayerEvent::PositionChanged {
+                position,
+                generation,
+            } if generation == seek_gen => positions.push(position),
+            PlayerEvent::Error { message, .. } => errors.push(message),
+            PlayerEvent::Ended { generation } => return generation == seek_gen,
+            _ => {}
+        }
+        false
+    });
+    assert!(ended, "expected Ended after the seek: {errors:?}");
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    assert!(peak_seen, "expected audible samples after the seek");
+    assert!(!positions.is_empty(), "expected playback positions");
+    let earliest = target.saturating_sub(Duration::from_millis(100));
+    assert!(
+        positions.iter().all(|&p| p >= earliest),
+        "positions must not restart before the seek target {target:?}: {positions:?}"
+    );
+    assert_eq!(player.state(), PlayerState::Ended);
+    let _ = player.shutdown();
+    session
+}
+
+#[test]
+fn native_wav_plays_seeks_and_finishes_pure_rust() {
+    let path = unique_temp_path("pure_wav_seek_eof", "wav");
+    std::fs::write(&path, build_pcm_wav(1)).expect("write wav fixture");
+
+    let session = seek_then_play_to_end(&path, Duration::from_millis(500));
+    assert_eq!(
+        session.decoder_info,
+        Some((
+            "rsmpeg-format (wav)".to_string(),
+            None,
+            Some("rsmpeg-rust (PCM)".to_string()),
+        ))
+    );
+    assert_eq!(session.active, Some((None, Some(0))));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A 48 kHz stereo 16-bit FLAC stream of `frame_count` frames × 192 samples:
+/// a VERBATIM left subframe (square wave) and a CONSTANT right subframe.
+fn build_verbatim_stereo_flac(frame_count: u8) -> Vec<u8> {
+    const BLOCK: u16 = 192;
+    let sample_rate: u32 = 48_000;
+    let total_samples = u32::from(frame_count) * u32::from(BLOCK);
+
+    let mut info = [0u8; 34];
+    info[0..2].copy_from_slice(&BLOCK.to_be_bytes());
+    info[2..4].copy_from_slice(&BLOCK.to_be_bytes());
+    info[10] = (sample_rate >> 12) as u8;
+    info[11] = (sample_rate >> 4) as u8;
+    // Low rate bits, channels - 1 = 1, bits per sample - 1 = 15.
+    info[12] = (((sample_rate & 0x0F) as u8) << 4) | (1 << 1);
+    info[13] = 15 << 4;
+    info[14..18].copy_from_slice(&total_samples.to_be_bytes());
+
+    let mut out = b"fLaC".to_vec();
+    out.extend_from_slice(&[0x80, 0x00, 0x00, 34]); // last block: STREAMINFO
+    out.extend_from_slice(&info);
+
+    assert!(frame_count < 0x80, "single-byte coded frame number");
+    for number in 0..frame_count {
+        let mut frame = vec![
+            0xFF,
+            0xF8,                // sync, fixed block size
+            (1 << 4) | 10,       // 192 samples, 48 kHz
+            (1 << 4) | (4 << 1), // independent stereo, 16-bit
+            number,
+        ];
+        frame.push(flac_crc8(&frame));
+        frame.push(0x02); // left: VERBATIM
+        for i in 0..BLOCK {
+            let sample: i16 = if (i / 48) % 2 == 0 { 6000 } else { -6000 };
+            frame.extend_from_slice(&sample.to_be_bytes());
+        }
+        frame.push(0x00); // right: CONSTANT
+        frame.extend_from_slice(&3000i16.to_be_bytes());
+        let crc = flac_crc16(&frame);
+        frame.extend_from_slice(&crc.to_be_bytes());
+        out.extend_from_slice(&frame);
+    }
+    out
+}
+
+#[test]
+fn native_verbatim_flac_plays_seeks_and_finishes_pure_rust() {
+    // 120 frames × 4 ms = 480 ms.
+    let path = unique_temp_path("pure_flac_verbatim", "flac");
+    std::fs::write(&path, build_verbatim_stereo_flac(120)).expect("write flac fixture");
+
+    let session = seek_then_play_to_end(&path, Duration::from_millis(200));
+    assert_eq!(
+        session.decoder_info,
+        Some((
+            "rsmpeg-format (flac)".to_string(),
+            None,
+            Some("rsmpeg-rust (FLAC)".to_string()),
+        ))
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn native_avi_pure_rust_seeks_while_paused_then_finishes() {
+    let path = unique_temp_path("pure_avi_seek_eof", "avi");
+    std::fs::write(&path, build_mjpeg_pcm_avi()).expect("write avi fixture");
+
+    let session = seek_then_play_to_end(&path, Duration::from_millis(100));
+    assert_eq!(
+        session.decoder_info,
+        Some((
+            "rsmpeg-format (avi)".to_string(),
+            Some("rsmpeg-rust (MJPEG)".to_string()),
+            Some("rsmpeg-rust (PCM)".to_string()),
+        ))
+    );
+    assert_eq!(session.active, Some((Some(0), Some(1))));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Without OpenH264 an H.264 + PCM file still opens natively: the video track is
+/// reported as unsupported and the audio plays.
+#[cfg(not(feature = "backend-openh264"))]
+#[test]
+fn h264_without_openh264_warns_and_plays_audio_natively() {
+    let path = unique_temp_path("no_openh264_mkv", "mkv");
+    std::fs::write(&path, build_h264_pcm_mkv()).expect("write mkv fixture");
+
+    let session = seek_then_play_to_end(&path, Duration::from_millis(100));
+    let (_, video_decoder, audio_decoder) = session.decoder_info.expect("DecoderInfo");
+    assert_eq!(video_decoder, None);
+    assert_eq!(audio_decoder.as_deref(), Some("rsmpeg-rust (PCM)"));
+    assert!(
+        session
+            .warnings
+            .iter()
+            .any(|w| w.contains("Unsupported video codec 'h264'")),
+        "expected an unsupported-codec warning, got {:?}",
+        session.warnings
+    );
+    assert_eq!(session.active.map(|(video, _)| video), Some(None));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Without OpenH264, selecting the H.264 track of an H.264 + AAC file is
+/// refused or reported, and audio keeps driving playback to the end.
+#[cfg(all(feature = "backend-symphonia", not(feature = "backend-openh264")))]
+#[test]
+fn selecting_h264_without_openh264_keeps_audio_playing_to_the_end() {
+    let path = unique_temp_path("no_openh264_select", "mp4");
+    // 4 × 250 ms = 1 s.
+    std::fs::write(&path, build_h264_movie(1, 4, 250, true)).expect("write h264+aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(false)
+            .volume(0.0)
+            .build()
+            .expect("build player");
+
+        let mut tracks = None;
+        let mut video_decoder = Some(String::new());
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                match ev {
+                    PlayerEvent::Tracks {
+                        video_tracks,
+                        active_video,
+                        ..
+                    } => tracks = Some((video_tracks, active_video)),
+                    PlayerEvent::DecoderInfo {
+                        video_decoder: name,
+                        ..
+                    } => video_decoder = name,
+                    PlayerEvent::Snapshot(s) => return s.status == "paused" && tracks.is_some(),
+                    _ => {}
+                }
+                false
+            }),
+            "native={prefer_native}: expected Tracks and a paused snapshot"
+        );
+        let (video_tracks, active_video) = tracks.expect("tracks");
+        assert_eq!(video_decoder, None, "native={prefer_native}");
+        assert_eq!(active_video, None, "native={prefer_native}");
+        assert!(
+            video_tracks.iter().all(|t| !t.supported),
+            "native={prefer_native}: {video_tracks:?}"
+        );
+
+        player.select_video_track(99).expect("select invalid track");
+        let invalid_gen = player.generation();
+        assert!(
+            watch(&mut player, Duration::from_secs(2), |ev| {
+                matches!(
+                    ev,
+                    PlayerEvent::Warning { message, generation }
+                        if generation == invalid_gen && message.contains("invalid video track")
+                )
+            }),
+            "native={prefer_native}: expected an invalid-track warning"
+        );
+
+        if let Some(track) = video_tracks.first() {
+            player
+                .select_video_track(track.index)
+                .expect("select h264 track");
+            let select_gen = player.generation();
+            assert!(
+                watch(&mut player, Duration::from_secs(2), |ev| {
+                    matches!(
+                        ev,
+                        PlayerEvent::Warning { message, generation }
+                            if generation == select_gen
+                                && message.contains("Unsupported video codec 'h264'")
+                    )
+                }),
+                "native={prefer_native}: expected an unsupported-codec warning"
+            );
+        }
+
+        player.play().expect("play");
+        let mut furthest = Duration::ZERO;
+        assert!(
+            watch(&mut player, Duration::from_secs(5), |ev| {
+                match ev {
+                    PlayerEvent::PositionChanged { position, .. } => {
+                        furthest = furthest.max(position);
+                    }
+                    PlayerEvent::Ended { .. } => return true,
+                    _ => {}
+                }
+                false
+            }),
+            "native={prefer_native}: expected Ended"
+        );
+        assert!(
+            furthest >= Duration::from_millis(500),
+            "native={prefer_native}: audio must drive the position, reached {furthest:?}"
+        );
+        let _ = player.shutdown();
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Without Symphonia `prefer_native_pipeline(false)` has nothing to select, so
+/// the native pipeline plays the file.
+#[cfg(not(feature = "backend-symphonia"))]
+#[test]
+fn without_symphonia_the_native_pipeline_is_always_used() {
+    let path = unique_temp_path("no_symphonia_wav", "wav");
+    std::fs::write(&path, build_pcm_wav(1)).expect("write wav fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(false)
+        .playback_rate(4.0)
+        .volume(0.0)
+        .build()
+        .expect("build player");
+
+    let mut demuxer_name = None;
+    assert!(
+        watch(&mut player, Duration::from_secs(5), |ev| {
+            match ev {
+                PlayerEvent::DecoderInfo { demuxer, .. } => demuxer_name = Some(demuxer),
+                PlayerEvent::Ended { .. } => return true,
+                _ => {}
+            }
+            false
+        }),
+        "expected Ended"
+    );
+    assert_eq!(demuxer_name.as_deref(), Some("rsmpeg-format (wav)"));
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Without Symphonia a file the native pipeline rejects produces exactly one
+/// `Error` that names the missing fallback and no other backend.
+#[cfg(not(feature = "backend-symphonia"))]
+#[test]
+fn without_symphonia_an_unplayable_file_reports_one_clear_error() {
+    let path = unique_temp_path("no_symphonia_garbage", "bin");
+    std::fs::write(&path, b"this is not a media file").expect("write garbage fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .volume(0.0)
+            .build()
+            .expect("build player");
+
+        let mut errors = Vec::new();
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                if let PlayerEvent::Error { message, .. } = ev {
+                    errors.push(message);
+                    return true;
+                }
+                false
+            }),
+            "native={prefer_native}: expected an Error event"
+        );
+        thread::sleep(Duration::from_millis(50));
+        while let Some(ev) = player.poll_event() {
+            if let PlayerEvent::Error { message, .. } = ev {
+                errors.push(message);
+            }
+        }
+        assert_eq!(errors.len(), 1, "native={prefer_native}: {errors:?}");
+        assert!(errors[0].contains("backend-symphonia"), "{errors:?}");
+        assert!(!errors[0].contains("openh264"), "{errors:?}");
+        assert_eq!(player.state(), PlayerState::Error);
+    }
+
     let _ = std::fs::remove_file(&path);
 }

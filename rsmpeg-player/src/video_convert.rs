@@ -76,10 +76,29 @@ fn validate_packed_plane(frame: &Frame, row_bytes: usize) -> RsResult<(&[u8], us
     Ok((plane, stride))
 }
 
+/// Write one RGBA pixel per `src_bpp`-byte source pixel of a validated packed
+/// `plane` into `out`, a tightly packed `width * height * 4` buffer.
+fn expand_to_rgba(
+    plane: &[u8],
+    stride: usize,
+    width: usize,
+    src_bpp: usize,
+    out: &mut [u8],
+    to_rgba: impl Fn(&[u8]) -> [u8; 4],
+) {
+    for (row, out_row) in out.chunks_exact_mut(width * 4).enumerate() {
+        let src_row = &plane[row * stride..][..width * src_bpp];
+        let pixels = out_row.chunks_exact_mut(4);
+        for (px, source) in pixels.zip(src_row.chunks_exact(src_bpp)) {
+            px.copy_from_slice(&to_rgba(source));
+        }
+    }
+}
+
 /// Convert any supported video [`Frame`] into a tightly packed RGBA buffer (`w * h * 4`).
 ///
-/// Supports `Rgba`, `Bgra`, `Rgb24`, `Bgr24` and `Gray8`, plus `Yuv420P`, `Yuv422P`,
-/// `Yuv444P` and `Nv12` through the cached scaler.
+/// Supports `Rgba`, `Bgra`, `Argb`, `Rgb24`, `Bgr24` and `Gray8`, plus `Yuv420P`,
+/// `Yuv422P`, `Yuv444P`, `Nv12` and `Nv21` through the cached scaler.
 pub fn frame_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
     if frame.width == 0 || frame.height == 0 {
         return Err(RsError::InvalidData(
@@ -109,52 +128,40 @@ pub fn frame_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
             }
             Ok(out)
         }
-        PixelFormat::Bgra => {
-            let row_bytes = w * 4;
-            let (plane, stride) = validate_packed_plane(frame, row_bytes)?;
-            let mut out = Vec::with_capacity(out_len);
-            for row in 0..h {
-                let start = row * stride;
-                for px in plane[start..start + row_bytes].chunks_exact(4) {
-                    out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-                }
-            }
-            Ok(out)
-        }
-        PixelFormat::Rgb24 | PixelFormat::Bgr24 => {
-            let row_bytes = w.checked_mul(3).ok_or_else(|| {
+        format @ (PixelFormat::Bgra
+        | PixelFormat::Argb
+        | PixelFormat::Rgb24
+        | PixelFormat::Bgr24
+        | PixelFormat::Gray8) => {
+            let src_bpp = format.channels();
+            let row_bytes = w.checked_mul(src_bpp).ok_or_else(|| {
                 RsError::InvalidData("frame_to_rgba_cached: width overflow".into())
             })?;
             let (plane, stride) = validate_packed_plane(frame, row_bytes)?;
-            // Byte offsets of red and blue within one source pixel.
-            let (r, b) = if frame.pixel_format == PixelFormat::Bgr24 {
-                (2, 0)
-            } else {
-                (0, 2)
-            };
-            let mut out = Vec::with_capacity(out_len);
-            for row in 0..h {
-                let start = row * stride;
-                for px in plane[start..start + row_bytes].chunks_exact(3) {
-                    out.extend_from_slice(&[px[r], px[1], px[b], 255]);
+            let mut out = vec![0u8; out_len];
+            // One closure per format, so each loop is specialised.
+            match format {
+                PixelFormat::Bgra => {
+                    expand_to_rgba(plane, stride, w, 4, &mut out, |p| [p[2], p[1], p[0], p[3]])
                 }
+                PixelFormat::Argb => {
+                    expand_to_rgba(plane, stride, w, 4, &mut out, |p| [p[1], p[2], p[3], p[0]])
+                }
+                PixelFormat::Rgb24 => {
+                    expand_to_rgba(plane, stride, w, 3, &mut out, |p| [p[0], p[1], p[2], 255])
+                }
+                PixelFormat::Bgr24 => {
+                    expand_to_rgba(plane, stride, w, 3, &mut out, |p| [p[2], p[1], p[0], 255])
+                }
+                _ => expand_to_rgba(plane, stride, w, 1, &mut out, |p| [p[0], p[0], p[0], 255]),
             }
             Ok(out)
         }
-        PixelFormat::Gray8 => {
-            let (plane, stride) = validate_packed_plane(frame, w)?;
-            let mut out = Vec::with_capacity(out_len);
-            for row in 0..h {
-                let start = row * stride;
-                for &y in &plane[start..start + w] {
-                    out.extend_from_slice(&[y, y, y, 255]);
-                }
-            }
-            Ok(out)
-        }
-        PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P | PixelFormat::Nv12 => {
-            crate::scaler_cache::yuv_to_rgba_cached(frame)
-        }
+        PixelFormat::Yuv420P
+        | PixelFormat::Yuv422P
+        | PixelFormat::Yuv444P
+        | PixelFormat::Nv12
+        | PixelFormat::Nv21 => crate::scaler_cache::yuv_to_rgba_cached(frame),
         other => Err(RsError::Unsupported(
             format!("frame_to_rgba_cached: unsupported pixel format {other:?}").into(),
         )),
@@ -338,8 +345,28 @@ mod tests {
     }
 
     #[test]
+    fn frame_to_rgba_cached_reorders_argb_with_padded_stride() {
+        // Width 2 -> 8 bytes per row, stride 12; the last row is unpadded.
+        let data = vec![
+            4, 1, 2, 3, 8, 5, 6, 7, 99, 99, 99, 99, // row 0 + padding
+            0, 9, 10, 11, 128, 13, 14, 15, // row 1
+        ];
+        let frame = packed_frame(2, 2, PixelFormat::Argb, 12, data);
+        assert_eq!(
+            frame_to_rgba_cached(&frame).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 13, 14, 15, 128]
+        );
+    }
+
+    #[test]
     fn frame_to_rgba_cached_rejects_truncated_bgr_planes() {
-        for (format, full) in [(PixelFormat::Bgr24, 12), (PixelFormat::Bgra, 16)] {
+        for (format, full) in [
+            (PixelFormat::Bgr24, 12),
+            (PixelFormat::Bgra, 16),
+            (PixelFormat::Argb, 16),
+            (PixelFormat::Rgb24, 12),
+            (PixelFormat::Gray8, 4),
+        ] {
             let frame = packed_frame(2, 2, format, full / 2, vec![0; full - 1]);
             assert!(frame_to_rgba_cached(&frame).is_err(), "{format:?}");
         }
@@ -417,6 +444,23 @@ mod tests {
         assert_eq!(
             frame_to_rgba_cached(&frame).unwrap(),
             expected_rgba(|x, y| (u[y][x], v[y][x]))
+        );
+    }
+
+    #[test]
+    fn frame_to_rgba_cached_converts_padded_nv21() {
+        // Same picture as the NV12 case, with each chroma pair stored V first.
+        let frame = yuv_frame(
+            PixelFormat::Nv21,
+            vec![
+                padded(&[&LUMA[0], &LUMA[1]], 6),
+                padded(&[&[210, 60, 70, 200]], 8),
+            ],
+            vec![6, 8],
+        );
+        assert_eq!(
+            frame_to_rgba_cached(&frame).unwrap(),
+            expected_rgba(|x, _| if x < 2 { (60, 210) } else { (200, 70) })
         );
     }
 

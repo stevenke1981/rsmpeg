@@ -8,14 +8,31 @@
 //! - **Identity path**: when the frame is already interleaved [`SampleFormat::S16`]
 //!   at the target rate and channel count, bytes are re-read as little-endian `i16`
 //!   with no resampling.
-//! - **Resample path**: otherwise a [`rsmpeg_resample::Resampler`] is constructed and
-//!   invoked. The resampler performs real linear-interpolation sample-rate conversion
-//!   with format conversion (`S16`/`F32`) and basic channel remapping, producing
-//!   correctly sized, non-silent output.
+//! - **Integer path**: interleaved `S32` and `U8` at the target rate and channel
+//!   count are shifted to 16 bits directly.
+//! - **Resample path**: everything else (including `F32`, `F64` and the planar
+//!   formats) goes through a [`rsmpeg_resample::Resampler`], which performs
+//!   linear-interpolation sample-rate conversion, format conversion and weighted
+//!   channel remixing. Resamplers are cached per thread and reused across frames.
+
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
 use rsmpeg_codec::Frame;
 use rsmpeg_resample::{Resampler, ResamplerConfig};
 use rsmpeg_util::{ChannelLayout, RsError, RsResult, SampleFormat};
+
+/// Most resamplers one thread keeps; the cache is emptied when a new key would
+/// exceed this.
+const MAX_CACHED_RESAMPLERS: usize = 16;
+
+/// `(source rate, target rate, source format, source channels, target channels)`.
+type ResamplerKey = (u32, u32, SampleFormat, u16, u16);
+
+thread_local! {
+    static RESAMPLERS: RefCell<HashMap<ResamplerKey, Resampler>> = RefCell::new(HashMap::new());
+}
 
 /// Convert an audio [`Frame`] to interleaved `i16` at `target_rate` / `target_channels`.
 ///
@@ -54,19 +71,18 @@ pub fn frame_to_s16_device(
         return s16_plane_to_i16(frame);
     }
 
+    let same_layout = frame.sample_rate == target_rate && frame.channels == target_channels;
     match frame.sample_format {
-        SampleFormat::S32 => {
+        SampleFormat::S32 if same_layout => {
             let plane = validated_plane(frame, SampleFormat::S32)?;
-            let samples: Vec<i16> = plane
+            Ok(plane
                 .chunks_exact(4)
                 .map(|c| (i32::from_le_bytes([c[0], c[1], c[2], c[3]]) >> 16) as i16)
-                .collect();
-            deliver_converted_s16(frame, samples, target_rate, target_channels)
+                .collect())
         }
-        SampleFormat::U8 => {
+        SampleFormat::U8 if same_layout => {
             let plane = validated_plane(frame, SampleFormat::U8)?;
-            let samples: Vec<i16> = plane.iter().map(|&b| (i16::from(b) - 128) << 8).collect();
-            deliver_converted_s16(frame, samples, target_rate, target_channels)
+            Ok(plane.iter().map(|&b| (i16::from(b) - 128) << 8).collect())
         }
         _ => resample_to_s16(frame, target_rate, target_channels),
     }
@@ -105,59 +121,39 @@ fn validated_plane(frame: &Frame, fmt: SampleFormat) -> RsResult<&[u8]> {
     Ok(&plane[..expected])
 }
 
-fn deliver_converted_s16(
-    src: &Frame,
-    samples: Vec<i16>,
-    target_rate: u32,
-    target_channels: u16,
-) -> RsResult<Vec<i16>> {
-    if src.sample_rate == target_rate && src.channels == target_channels {
-        return Ok(samples);
-    }
-    if samples.is_empty() {
-        let _ = layout_for_channels(src.channels)?;
-        let _ = layout_for_channels(target_channels)?;
-        return Ok(Vec::new());
-    }
-    let mut tmp_bytes = Vec::with_capacity(samples.len() * 2);
-    for s in &samples {
-        tmp_bytes.extend_from_slice(&s.to_le_bytes());
-    }
-    let linesize = tmp_bytes.len();
-    let tmp = Frame {
-        data: vec![tmp_bytes],
-        linesize: vec![linesize],
-        width: 0,
-        height: 0,
-        pixel_format: rsmpeg_util::PixelFormat::None,
-        sample_format: SampleFormat::S16,
-        sample_rate: src.sample_rate,
-        channels: src.channels,
-        samples: src.samples,
-        pts: src.pts,
-        duration: src.duration,
-        time_base: src.time_base,
-        key_frame: src.key_frame,
-        pict_type: src.pict_type,
-    };
-    resample_to_s16(&tmp, target_rate, target_channels)
-}
-
+/// Convert through this thread's cached [`Resampler`] for the frame's shape.
 fn resample_to_s16(frame: &Frame, target_rate: u32, target_channels: u16) -> RsResult<Vec<i16>> {
-    let src_layout = layout_for_channels(frame.channels)?;
-    let dst_layout = layout_for_channels(target_channels)?;
-
-    let config = ResamplerConfig::new(
+    let key = (
         frame.sample_rate,
         target_rate,
         frame.sample_format,
-        SampleFormat::S16,
-    )
-    .with_channel_layouts(src_layout, dst_layout);
-
-    let resampler = Resampler::new(config)?;
-    let out = resampler.resample(frame)?;
+        frame.channels,
+        target_channels,
+    );
+    let out = RESAMPLERS.with(|cache| -> RsResult<Frame> {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MAX_CACHED_RESAMPLERS && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        match cache.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut().resample(frame),
+            Entry::Vacant(entry) => {
+                let resampler = new_s16_resampler(key)?;
+                entry.insert(resampler).resample(frame)
+            }
+        }
+    })?;
     s16_plane_to_i16(&out)
+}
+
+fn new_s16_resampler(key: ResamplerKey) -> RsResult<Resampler> {
+    let (src_rate, target_rate, src_format, src_channels, target_channels) = key;
+    let src_layout = layout_for_channels(src_channels)?;
+    let dst_layout = layout_for_channels(target_channels)?;
+
+    let config = ResamplerConfig::new(src_rate, target_rate, src_format, SampleFormat::S16)
+        .with_channel_layouts(src_layout, dst_layout);
+    Resampler::new(config)
 }
 
 fn layout_for_channels(channels: u16) -> RsResult<ChannelLayout> {
@@ -481,6 +477,148 @@ mod tests {
         let out_resampled = frame_to_s16_device(&frame_44k, 48_000, 2).unwrap();
         assert_eq!(out_resampled.len(), 480 * 2);
         assert!(out_resampled.iter().any(|&s| s != 0));
+    }
+
+    fn cached_resampler_count() -> usize {
+        RESAMPLERS.with(|c| c.borrow().len())
+    }
+
+    /// A frame holding `planes` of `format` samples at `rate`.
+    fn raw_frame(format: SampleFormat, rate: u32, channels: u16, planes: Vec<Vec<u8>>) -> Frame {
+        let per_plane = if format.is_planar() {
+            1
+        } else {
+            usize::from(channels)
+        };
+        let samples = planes[0].len() / (per_plane * format.bytes());
+        let mut frame = Frame::new_audio(format, rate, channels, 0);
+        frame.samples = samples;
+        frame.linesize = planes.iter().map(Vec::len).collect();
+        frame.data = planes;
+        frame
+    }
+
+    #[test]
+    fn cached_resampler_is_reused_across_frames() {
+        let frame = s16_stereo_frame(44_100, &[100, -100, 200, -200, 300, -300]);
+        let first = frame_to_s16_device(&frame, 48_000, 2).unwrap();
+        assert_eq!(cached_resampler_count(), 1);
+        let second = frame_to_s16_device(&frame, 48_000, 2).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(cached_resampler_count(), 1);
+    }
+
+    #[test]
+    fn identity_and_integer_paths_need_no_resampler() {
+        for format in [SampleFormat::S16, SampleFormat::S32, SampleFormat::U8] {
+            let frame = Frame::new_audio(format, 48_000, 2, 4);
+            frame_to_s16_device(&frame, 48_000, 2).unwrap();
+        }
+        assert_eq!(cached_resampler_count(), 0);
+    }
+
+    #[test]
+    fn cache_keys_on_every_part_of_the_conversion() {
+        let convert = |format: SampleFormat, rate, channels, target_rate, target_channels| {
+            let frame = Frame::new_audio(format, rate, channels, 4);
+            frame_to_s16_device(&frame, target_rate, target_channels).unwrap()
+        };
+        convert(SampleFormat::F32, 44_100, 2, 48_000, 2);
+        convert(SampleFormat::F32, 32_000, 2, 48_000, 2);
+        convert(SampleFormat::F32, 44_100, 2, 96_000, 2);
+        convert(SampleFormat::F64, 44_100, 2, 48_000, 2);
+        convert(SampleFormat::F32, 44_100, 1, 48_000, 2);
+        convert(SampleFormat::F32, 44_100, 2, 48_000, 1);
+        assert_eq!(cached_resampler_count(), 6);
+    }
+
+    #[test]
+    fn cache_stays_bounded_and_survives_rejected_keys() {
+        for i in 0..3 * MAX_CACHED_RESAMPLERS as u32 + 1 {
+            let frame = Frame::new_audio(SampleFormat::F32, 8_000 + i, 2, 4);
+            frame_to_s16_device(&frame, 48_000, 2).unwrap();
+            assert!(cached_resampler_count() <= MAX_CACHED_RESAMPLERS);
+        }
+        let before = cached_resampler_count();
+        let unsupported = Frame::new_audio(SampleFormat::F32, 44_100, 3, 4);
+        assert!(frame_to_s16_device(&unsupported, 48_000, 3).is_err());
+        assert!(cached_resampler_count() <= before);
+    }
+
+    #[test]
+    fn f64_frames_convert_at_matching_rate() {
+        let bytes: Vec<u8> = [0.0f64, 0.5, -0.5, -1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let frame = raw_frame(SampleFormat::F64, 48_000, 2, vec![bytes]);
+        assert_eq!(
+            frame_to_s16_device(&frame, 48_000, 2).unwrap(),
+            vec![0, 16384, -16384, i16::MIN]
+        );
+    }
+
+    #[test]
+    fn planar_frames_are_interleaved() {
+        let plane = |samples: [i16; 2]| -> Vec<u8> {
+            samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let frame = raw_frame(
+            SampleFormat::S16P,
+            48_000,
+            2,
+            vec![plane([1, 2]), plane([-1, -2])],
+        );
+        assert_eq!(
+            frame_to_s16_device(&frame, 48_000, 2).unwrap(),
+            vec![1, -1, 2, -2]
+        );
+
+        let plane = |samples: [f32; 2]| -> Vec<u8> {
+            samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
+        let frame = raw_frame(
+            SampleFormat::F32P,
+            48_000,
+            2,
+            vec![plane([0.5, 0.25]), plane([-0.5, -0.25])],
+        );
+        assert_eq!(
+            frame_to_s16_device(&frame, 48_000, 2).unwrap(),
+            vec![16384, -16384, 8192, -8192]
+        );
+
+        let mut short = frame;
+        short.data.pop();
+        assert!(frame_to_s16_device(&short, 48_000, 2).is_err());
+    }
+
+    #[test]
+    fn s32_planar_and_f64_planar_convert() {
+        let plane = |v: i32| v.to_le_bytes().to_vec();
+        let frame = raw_frame(
+            SampleFormat::S32P,
+            48_000,
+            2,
+            vec![plane(7 << 16), plane(-7 << 16)],
+        );
+        assert_eq!(frame_to_s16_device(&frame, 48_000, 2).unwrap(), vec![7, -7]);
+
+        let plane = |v: f64| v.to_le_bytes().to_vec();
+        let frame = raw_frame(SampleFormat::F64P, 48_000, 2, vec![plane(0.5), plane(-0.5)]);
+        assert_eq!(
+            frame_to_s16_device(&frame, 48_000, 2).unwrap(),
+            vec![16384, -16384]
+        );
+    }
+
+    #[test]
+    fn stereo_downmix_to_mono_averages() {
+        let frame = s16_stereo_frame(48_000, &[1000, 3000, -400, 200]);
+        assert_eq!(
+            frame_to_s16_device(&frame, 48_000, 1).unwrap(),
+            vec![2000, -100]
+        );
     }
 
     #[test]

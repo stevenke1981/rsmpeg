@@ -143,10 +143,17 @@ impl Resampler {
     ///
     /// Returns a new frame in the destination format/layout/rate.
     ///
-    /// The conversion is implemented with per-channel linear interpolation in
-    /// normalized `[-1, 1)` space, followed by encoding into the destination
-    /// sample format. Input is decoded from the first (interleaved) data plane
-    /// for `S16` and `F32` sample formats.
+    /// The input format is taken from the frame: interleaved `U8`, `S16`, `S32`,
+    /// `F32` and `F64` are read from the first data plane, and planar `S16P`,
+    /// `S32P`, `F32P` and `F64P` from one data plane per channel. The output is
+    /// interleaved `U8`, `S16`, `S32`, `F32` or `F64`.
+    ///
+    /// Samples are processed as `f64`, normalised so that integer full scale is
+    /// `[-1, 1)`. When the channel layouts differ, every output channel is the
+    /// weighted sum given by its [`ChannelMapping`] row (a row without any
+    /// weight copies the first source channel). The sample rate is then
+    /// converted by per-channel linear interpolation. Integer outputs are
+    /// rounded and clamped; floating-point outputs are not clamped.
     pub fn resample(&self, frame: &Frame) -> RsResult<Frame> {
         let nb_in = frame.samples;
         let src_ch = frame.channels as usize;
@@ -164,26 +171,16 @@ impl Resampler {
             return Ok(Frame::new_audio(dst_format, dst_rate, dst_ch as u16, 0));
         }
 
-        let plane = frame.data.first().map(|d| d.as_slice()).unwrap_or(&[]);
-        let bytes_per = frame.sample_format.bytes();
-        let expected = nb_in * src_ch * bytes_per;
-        if plane.len() < expected {
-            return Err(RsError::InvalidData(
-                format!(
-                    "Resampler: input plane too short (have {}, need {})",
-                    plane.len(),
-                    expected
-                )
-                .into(),
-            ));
-        }
+        let planes = input_planes(frame, src_ch)?;
 
         // Fast path: identical rate/format/layout (non-planar) → copy bytes.
         if src_rate == dst_rate
             && frame.sample_format == dst_format
             && !frame.sample_format.is_planar()
             && self.config.src_channel_layout == self.config.dst_channel_layout
+            && src_ch == dst_ch
         {
+            let plane = frame.data.first().map(|d| d.as_slice()).unwrap_or(&[]);
             let mut out = Frame::new_audio(dst_format, dst_rate, dst_ch as u16, nb_in);
             out.data[0] = plane.to_vec();
             out.linesize[0] = plane.len();
@@ -193,95 +190,76 @@ impl Resampler {
             return Ok(out);
         }
 
-        // Decode the interleaved input plane into deinterleaved f32 per source
-        // channel, normalized to [-1, 1).
-        let mut decoded: Vec<Vec<f32>> = vec![vec![0.0_f32; nb_in]; src_ch];
-        match frame.sample_format {
-            SampleFormat::S16 =>
-            {
-                #[allow(clippy::needless_range_loop)]
-                for i in 0..nb_in {
-                    for c in 0..src_ch {
-                        let off = (i * src_ch + c) * 2;
-                        let v = i16::from_le_bytes([plane[off], plane[off + 1]]);
-                        decoded[c][i] = v as f32 / 32768.0;
-                    }
-                }
-            }
-            SampleFormat::F32 =>
-            {
-                #[allow(clippy::needless_range_loop)]
-                for i in 0..nb_in {
-                    for c in 0..src_ch {
-                        let off = (i * src_ch + c) * 4;
-                        let v = f32::from_le_bytes([
-                            plane[off],
-                            plane[off + 1],
-                            plane[off + 2],
-                            plane[off + 3],
-                        ]);
-                        decoded[c][i] = v;
-                    }
-                }
-            }
-            other => {
-                return Err(RsError::Unsupported(
-                    format!("Resampler: unsupported source sample format {:?}", other).into(),
-                ));
-            }
-        }
+        let decode = sample_decoder(frame.sample_format).ok_or_else(|| {
+            RsError::Unsupported(
+                format!(
+                    "Resampler: unsupported source sample format {:?}",
+                    frame.sample_format
+                )
+                .into(),
+            )
+        })?;
+        let encode = sample_encoder(dst_format).ok_or_else(|| {
+            RsError::Unsupported(
+                format!("Resampler: unsupported destination sample format {dst_format:?}").into(),
+            )
+        })?;
+
+        // Deinterleave into one normalised buffer per source channel.
+        let bytes_per = frame.sample_format.bytes();
+        let decoded: Vec<Vec<f64>> = if frame.sample_format.is_planar() {
+            planes
+                .iter()
+                .map(|plane| plane.chunks_exact(bytes_per).map(decode).collect())
+                .collect()
+        } else {
+            (0..src_ch)
+                .map(|c| {
+                    planes[0]
+                        .chunks_exact(src_ch * bytes_per)
+                        .map(|sample| decode(&sample[c * bytes_per..]))
+                        .collect()
+                })
+                .collect()
+        };
+
+        // Remix into one buffer per destination channel; without a layout or
+        // channel-count change the decoded buffers are used as they are.
+        let mixed: Vec<Vec<f64>> = if self.channel_mapping.is_none() && src_ch == dst_ch {
+            decoded
+        } else {
+            (0..dst_ch)
+                .map(|o| {
+                    let terms = self.mix_terms(o, src_ch);
+                    (0..nb_in)
+                        .map(|i| terms.iter().map(|&(c, w)| w * decoded[c][i]).sum())
+                        .collect()
+                })
+                .collect()
+        };
 
         let dst_samples = self.config.estimate_output_samples(nb_in);
         // src samples per dst sample.
         let ratio = src_rate as f64 / dst_rate as f64;
-        let mut resampled: Vec<Vec<f32>> = vec![vec![0.0_f32; dst_samples]; dst_ch];
         let last = nb_in - 1;
 
-        #[allow(clippy::needless_range_loop)]
-        for o in 0..dst_ch {
-            let src_idx = self
-                .src_channel_for_dst(o)
-                .min(decoded.len().saturating_sub(1));
-            let src = &decoded[src_idx];
-            let dst = &mut resampled[o];
-            for j in 0..dst_samples {
-                let src_pos = j as f64 * ratio;
-                let i = src_pos.floor() as usize;
-                let frac = src_pos - i as f64;
-                let i0 = i.min(last);
-                let i1 = (i + 1).min(last);
-                let frac32 = frac as f32;
-                dst[j] = src[i0] * (1.0 - frac32) + src[i1] * frac32;
-            }
-        }
-
-        // Encode the interleaved output in the destination sample format.
-        let dst_bytes = dst_format.bytes();
-        let mut encoded: Vec<u8> = Vec::with_capacity(dst_samples * dst_ch * dst_bytes);
-        #[allow(clippy::needless_range_loop)]
+        // Interpolate and encode the interleaved output.
+        let mut encoded: Vec<u8> = Vec::with_capacity(dst_samples * dst_ch * dst_format.bytes());
         for j in 0..dst_samples {
-            for o in 0..dst_ch {
-                let s = resampled[o][j];
-                match dst_format {
-                    SampleFormat::S16 => {
-                        let clamped = s.clamp(-1.0, 1.0);
-                        let v = (clamped * 32768.0).round() as i32;
-                        let v = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        encoded.extend_from_slice(&v.to_le_bytes());
-                    }
-                    SampleFormat::F32 => {
-                        encoded.extend_from_slice(&(s as f32).to_le_bytes());
-                    }
-                    other => {
-                        return Err(RsError::Unsupported(
-                            format!(
-                                "Resampler: unsupported destination sample format {:?}",
-                                other
-                            )
-                            .into(),
-                        ));
-                    }
-                }
+            let src_pos = j as f64 * ratio;
+            let i = src_pos.floor() as usize;
+            let frac = src_pos - i as f64;
+            let i0 = i.min(last);
+            let i1 = (i + 1).min(last);
+            for channel in &mixed {
+                // On a source sample the neighbour must not contribute at all:
+                // `0.0 * NaN` would otherwise spread a bad sample backwards.
+                let sample = if frac == 0.0 {
+                    channel[i0]
+                } else {
+                    channel[i0] * (1.0 - frac) + channel[i1] * frac
+                };
+                encode(sample, &mut encoded);
             }
         }
 
@@ -295,46 +273,27 @@ impl Resampler {
         Ok(out)
     }
 
-    /// Map a destination channel index to the source channel index that should
-    /// feed it.
+    /// The `(source channel, weight)` terms that make up one destination channel
+    /// of a frame with `src_ch` (non-zero) channels.
     ///
     /// - Equal layouts: identity mapping.
-    /// - Different layouts: use the dominant coefficient in the remixing matrix
-    ///   built by `ChannelMapping`. If the row has no non-zero weight, fall back
-    ///   to taking the first source channels (or duplicating the last one when
-    ///   upmixing).
-    fn src_channel_for_dst(&self, dst_idx: usize) -> usize {
-        let src_ch = self.config.src_channel_layout.channels();
-
-        if self.config.src_channel_layout == self.config.dst_channel_layout {
-            return dst_idx.min(src_ch.saturating_sub(1));
-        }
-
-        match &self.channel_mapping {
-            Some(cm) => {
-                let row_idx = dst_idx.min(cm.matrix.len().saturating_sub(1));
-                let row = &cm.matrix[row_idx];
-                let mut best = 0usize;
-                let mut best_w = 0.0_f64;
-                let mut any = false;
-                for (in_ch, &w) in row.iter().enumerate() {
-                    if w != 0.0 {
-                        any = true;
-                        let aw = w.abs();
-                        if aw > best_w {
-                            best_w = aw;
-                            best = in_ch;
-                        }
-                    }
-                }
-                if any {
-                    best.min(src_ch.saturating_sub(1))
-                } else {
-                    // No weight: downmix takes first channel, upmix duplicates it.
-                    0
-                }
-            }
-            None => dst_idx.min(src_ch.saturating_sub(1)),
+    /// - Different layouts: every non-zero weight of the [`ChannelMapping`] row.
+    ///   If the row has none, the first source channel is copied.
+    fn mix_terms(&self, dst_idx: usize, src_ch: usize) -> Vec<(usize, f64)> {
+        let Some(mapping) = &self.channel_mapping else {
+            return vec![(dst_idx.min(src_ch - 1), 1.0)];
+        };
+        let terms: Vec<(usize, f64)> = mapping
+            .matrix
+            .get(dst_idx)
+            .into_iter()
+            .flat_map(|row| row.iter().copied().take(src_ch).enumerate())
+            .filter(|&(_, weight)| weight != 0.0)
+            .collect();
+        if terms.is_empty() {
+            vec![(0, 1.0)]
+        } else {
+            terms
         }
     }
 
@@ -366,6 +325,99 @@ impl Resampler {
         }
         self.config.dst_sample_rate as f64 / self.config.src_sample_rate as f64
     }
+}
+
+/// The sample bytes of a non-empty `frame` with `channels` channels: one slice
+/// for interleaved audio, or one per channel for planar audio. Each slice is
+/// trimmed to exactly the declared sample count.
+fn input_planes(frame: &Frame, channels: usize) -> RsResult<Vec<&[u8]>> {
+    let planar = frame.sample_format.is_planar();
+    let (count, per_sample) = if planar { (channels, 1) } else { (1, channels) };
+    if planar && frame.data.len() < count {
+        return Err(RsError::InvalidData(
+            format!(
+                "Resampler: planar input has {} plane(s), need {count}",
+                frame.data.len()
+            )
+            .into(),
+        ));
+    }
+    let expected = frame
+        .samples
+        .checked_mul(per_sample)
+        .and_then(|n| n.checked_mul(frame.sample_format.bytes()))
+        .ok_or_else(|| RsError::InvalidData("Resampler: input size overflow".into()))?;
+
+    (0..count)
+        .map(|index| {
+            let plane = frame.data.get(index).map(|d| d.as_slice()).unwrap_or(&[]);
+            plane.get(..expected).ok_or_else(|| {
+                RsError::InvalidData(
+                    format!(
+                        "Resampler: input plane {index} too short (have {}, need {expected})",
+                        plane.len()
+                    )
+                    .into(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Reads one little-endian sample (at the start of the slice) as normalised `f64`.
+type SampleDecoder = fn(&[u8]) -> f64;
+
+/// Appends one normalised sample to an output buffer, little-endian.
+type SampleEncoder = fn(f64, &mut Vec<u8>);
+
+/// Full-scale magnitude of signed 32-bit audio.
+const S32_SCALE: f64 = 2_147_483_648.0;
+
+fn sample_decoder(format: SampleFormat) -> Option<SampleDecoder> {
+    let decode: SampleDecoder = match format {
+        SampleFormat::U8 => |b| (f64::from(b[0]) - 128.0) / 128.0,
+        SampleFormat::S16 | SampleFormat::S16P => {
+            |b| f64::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0
+        }
+        SampleFormat::S32 | SampleFormat::S32P => {
+            |b| f64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])) / S32_SCALE
+        }
+        SampleFormat::F32 | SampleFormat::F32P => {
+            |b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+        SampleFormat::F64 | SampleFormat::F64P => {
+            |b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        }
+        SampleFormat::None => return None,
+    };
+    Some(decode)
+}
+
+/// Encoders exist for the interleaved formats only. Float → integer casts
+/// saturate, and map NaN to silence.
+fn sample_encoder(format: SampleFormat) -> Option<SampleEncoder> {
+    let encode: SampleEncoder = match format {
+        SampleFormat::U8 => |s, out| {
+            let v = ((s * 128.0).round() as i32).saturating_add(128);
+            out.push(v.clamp(0, 255) as u8);
+        },
+        SampleFormat::S16 => |s, out| {
+            let v = (s * 32768.0).round() as i16;
+            out.extend_from_slice(&v.to_le_bytes());
+        },
+        SampleFormat::S32 => |s, out| {
+            let v = (s * S32_SCALE).round() as i32;
+            out.extend_from_slice(&v.to_le_bytes());
+        },
+        SampleFormat::F32 => |s, out| out.extend_from_slice(&(s as f32).to_le_bytes()),
+        SampleFormat::F64 => |s, out| out.extend_from_slice(&s.to_le_bytes()),
+        SampleFormat::S16P
+        | SampleFormat::S32P
+        | SampleFormat::F32P
+        | SampleFormat::F64P
+        | SampleFormat::None => return None,
+    };
+    Some(encode)
 }
 
 #[cfg(test)]
@@ -612,9 +664,9 @@ mod tests {
     #[test]
     fn unsupported_source_format_is_rejected() {
         let mut frame = Frame::new_audio(SampleFormat::S16, 44_100, 2, 8);
-        // U8 has no decode branch in the resampler.
-        frame.sample_format = SampleFormat::U8;
-        let cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::U8, SampleFormat::S16)
+        // `None` names no sample encoding, so there is nothing to decode.
+        frame.sample_format = SampleFormat::None;
+        let cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::None, SampleFormat::S16)
             .with_channel_layouts(ChannelLayout::STEREO, ChannelLayout::STEREO);
         let err = Resampler::new(cfg).unwrap().resample(&frame).unwrap_err();
         assert!(
@@ -668,5 +720,310 @@ mod tests {
         let mut resampler = Resampler::new(cfg).unwrap();
         assert_eq!(resampler.delay(), 0);
         assert!(resampler.flush().unwrap().is_none());
+    }
+
+    /// A 48 kHz frame holding `data` planes of `format` samples.
+    fn audio_frame(format: SampleFormat, channels: u16, data: Vec<Vec<u8>>) -> Frame {
+        let per_plane = if format.is_planar() {
+            1
+        } else {
+            usize::from(channels)
+        };
+        let samples = data[0].len() / (per_plane * format.bytes());
+        let mut frame = Frame::new_audio(format, 48_000, channels, 0);
+        frame.samples = samples;
+        frame.linesize = data.iter().map(Vec::len).collect();
+        frame.data = data;
+        frame.pts = Some(7);
+        frame
+    }
+
+    fn bytes_of<T: Copy, const N: usize>(values: &[T], to_le: fn(T) -> [u8; N]) -> Vec<u8> {
+        values.iter().flat_map(|&v| to_le(v)).collect()
+    }
+
+    /// Convert `frame` at 48 kHz between equally sized layouts (or `layouts`).
+    fn convert_with(
+        frame: &Frame,
+        dst: SampleFormat,
+        layouts: (ChannelLayout, ChannelLayout),
+    ) -> Frame {
+        let cfg = ResamplerConfig::new(48_000, 48_000, frame.sample_format, dst)
+            .with_channel_layouts(layouts.0, layouts.1);
+        Resampler::new(cfg).unwrap().resample(frame).unwrap()
+    }
+
+    fn convert(frame: &Frame, dst: SampleFormat) -> Frame {
+        let layout = if frame.channels == 1 {
+            ChannelLayout::MONO
+        } else {
+            ChannelLayout::STEREO
+        };
+        convert_with(frame, dst, (layout, layout))
+    }
+
+    fn s16_samples(frame: &Frame) -> Vec<i16> {
+        frame.data[0]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    #[test]
+    fn f64_input_converts_to_s16_with_rounding_and_clamping() {
+        let values = [0.0f64, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, f64::NAN];
+        let frame = audio_frame(
+            SampleFormat::F64,
+            2,
+            vec![bytes_of(&values, f64::to_le_bytes)],
+        );
+        let out = convert(&frame, SampleFormat::S16);
+        assert_eq!((out.samples, out.channels, out.pts), (4, 2, Some(7)));
+        assert_eq!(
+            s16_samples(&out),
+            vec![0, 16384, -16384, i16::MAX, i16::MIN, i16::MAX, i16::MIN, 0]
+        );
+    }
+
+    #[test]
+    fn u8_input_and_output_are_centred_on_128() {
+        let frame = audio_frame(SampleFormat::U8, 2, vec![vec![0, 128, 255, 64]]);
+        assert_eq!(
+            s16_samples(&convert(&frame, SampleFormat::S16)),
+            vec![i16::MIN, 0, 32512, -16384]
+        );
+
+        let values = [0.0f32, 1.0, -1.0, f32::NAN];
+        let frame = audio_frame(
+            SampleFormat::F32,
+            2,
+            vec![bytes_of(&values, f32::to_le_bytes)],
+        );
+        assert_eq!(
+            convert(&frame, SampleFormat::U8).data[0],
+            vec![128, 255, 0, 128]
+        );
+    }
+
+    #[test]
+    fn s32_round_trips_bit_exactly_through_f64() {
+        let values = [i32::MIN, i32::MAX, -1, 1, 0x1234_5678, -0x1234_5678];
+        let frame = audio_frame(
+            SampleFormat::S32,
+            2,
+            vec![bytes_of(&values, i32::to_le_bytes)],
+        );
+        let wide = convert(&frame, SampleFormat::F64);
+        assert_eq!(wide.sample_format, SampleFormat::F64);
+        let back = convert(&wide, SampleFormat::S32);
+        assert_eq!(back.data[0], frame.data[0]);
+        assert_eq!(back.linesize, vec![values.len() * 4]);
+    }
+
+    #[test]
+    fn planar_s16_and_s32_are_interleaved() {
+        let left = [1i16, 2, 3];
+        let right = [-1i16, -2, -3];
+        let frame = audio_frame(
+            SampleFormat::S16P,
+            2,
+            vec![
+                bytes_of(&left, i16::to_le_bytes),
+                bytes_of(&right, i16::to_le_bytes),
+            ],
+        );
+        let out = convert(&frame, SampleFormat::S16);
+        assert_eq!(out.sample_format, SampleFormat::S16);
+        assert_eq!(s16_samples(&out), vec![1, -1, 2, -2, 3, -3]);
+
+        let frame = audio_frame(
+            SampleFormat::S32P,
+            2,
+            vec![
+                bytes_of(&[1i32 << 16, 2 << 16], i32::to_le_bytes),
+                bytes_of(&[-1i32 << 16, -2 << 16], i32::to_le_bytes),
+            ],
+        );
+        assert_eq!(
+            s16_samples(&convert(&frame, SampleFormat::S16)),
+            vec![1, -1, 2, -2]
+        );
+    }
+
+    #[test]
+    fn planar_float_inputs_match_their_interleaved_form() {
+        let interleaved = [0.25f32, -0.25, 0.5, -0.5];
+        let frame = audio_frame(
+            SampleFormat::F32P,
+            2,
+            vec![
+                bytes_of(&[0.25f32, 0.5], f32::to_le_bytes),
+                bytes_of(&[-0.25f32, -0.5], f32::to_le_bytes),
+            ],
+        );
+        assert_eq!(
+            convert(&frame, SampleFormat::F32).data[0],
+            bytes_of(&interleaved, f32::to_le_bytes)
+        );
+
+        let frame = audio_frame(
+            SampleFormat::F64P,
+            2,
+            vec![
+                bytes_of(&[0.25f64, 0.5], f64::to_le_bytes),
+                bytes_of(&[-0.25f64, -0.5], f64::to_le_bytes),
+            ],
+        );
+        assert_eq!(
+            convert(&frame, SampleFormat::F32).data[0],
+            bytes_of(&interleaved, f32::to_le_bytes)
+        );
+    }
+
+    #[test]
+    fn planar_input_is_resampled_per_channel() {
+        let frame = audio_frame(
+            SampleFormat::S16P,
+            2,
+            vec![
+                bytes_of(&[0i16, 100], i16::to_le_bytes),
+                bytes_of(&[0i16, -100], i16::to_le_bytes),
+            ],
+        );
+        let cfg = ResamplerConfig::new(48_000, 96_000, SampleFormat::S16P, SampleFormat::S16);
+        let out = Resampler::new(cfg).unwrap().resample(&frame).unwrap();
+        assert_eq!(out.samples, 4);
+        assert_eq!(s16_samples(&out), vec![0, 0, 50, -50, 100, -100, 100, -100]);
+    }
+
+    #[test]
+    fn planar_input_with_missing_or_short_planes_errors() {
+        let cfg = ResamplerConfig::new(48_000, 44_100, SampleFormat::S16P, SampleFormat::S16);
+        let resampler = Resampler::new(cfg).unwrap();
+        let good = audio_frame(SampleFormat::S16P, 2, vec![vec![0; 8], vec![0; 8]]);
+        assert!(resampler.resample(&good).is_ok());
+
+        let mut one_plane = good.clone();
+        one_plane.data.pop();
+        assert!(matches!(
+            resampler.resample(&one_plane),
+            Err(RsError::InvalidData(_))
+        ));
+
+        let mut short = good;
+        short.data[1].truncate(7);
+        assert!(matches!(
+            resampler.resample(&short),
+            Err(RsError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn planar_destination_formats_are_rejected() {
+        let frame = s16_stereo_frame(48_000, &[1, 2, 3, 4]);
+        for dst in [SampleFormat::S16P, SampleFormat::F32P, SampleFormat::None] {
+            let cfg = ResamplerConfig::new(48_000, 44_100, SampleFormat::S16, dst);
+            assert!(matches!(
+                Resampler::new(cfg).unwrap().resample(&frame),
+                Err(RsError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn stereo_to_mono_is_the_average_of_both_channels() {
+        let frame = s16_stereo_frame(48_000, &[1000, 3000, -400, 200, i16::MIN, i16::MIN]);
+        let out = convert_with(
+            &frame,
+            SampleFormat::S16,
+            (ChannelLayout::STEREO, ChannelLayout::MONO),
+        );
+        assert_eq!(out.channels, 1);
+        assert_eq!(s16_samples(&out), vec![2000, -100, i16::MIN]);
+    }
+
+    #[test]
+    fn mono_upmix_duplicates_the_channel() {
+        let frame = audio_frame(
+            SampleFormat::S16,
+            1,
+            vec![bytes_of(&[5i16, -9], i16::to_le_bytes)],
+        );
+        let out = convert_with(
+            &frame,
+            SampleFormat::S16,
+            (ChannelLayout::MONO, ChannelLayout::STEREO),
+        );
+        assert_eq!(s16_samples(&out), vec![5, 5, -9, -9]);
+    }
+
+    #[test]
+    fn five_point_one_downmixes_to_stereo_with_weights() {
+        // FL, FR, FC, LFE, BL, BR
+        let input = [0.1f64, 0.2, 0.3, 0.9, 0.4, 0.5];
+        let frame = audio_frame(
+            SampleFormat::F64,
+            6,
+            vec![bytes_of(&input, f64::to_le_bytes)],
+        );
+        let out = convert_with(
+            &frame,
+            SampleFormat::F64,
+            (ChannelLayout::_5POINT1, ChannelLayout::STEREO),
+        );
+        assert_eq!((out.channels, out.samples), (2, 1));
+        let got: Vec<f64> = out.data[0]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let k = std::f64::consts::FRAC_1_SQRT_2;
+        let norm = 1.0 + 2.0 * k;
+        let want = [
+            (0.1 + k * 0.3 + k * 0.4) / norm,
+            (0.2 + k * 0.3 + k * 0.5) / norm,
+        ];
+        for (got, want) in got.iter().zip(want) {
+            assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn full_scale_five_point_one_downmix_does_not_clip() {
+        let frame = audio_frame(
+            SampleFormat::S16,
+            6,
+            vec![bytes_of(&[i16::MAX; 6], i16::to_le_bytes)],
+        );
+        let out = convert_with(
+            &frame,
+            SampleFormat::S16,
+            (ChannelLayout::_5POINT1, ChannelLayout::STEREO),
+        );
+        assert_eq!(s16_samples(&out), vec![i16::MAX, i16::MAX]);
+    }
+
+    #[test]
+    fn all_zero_matrix_rows_copy_the_first_channel() {
+        let frame = s16_stereo_frame(48_000, &[11, 22]);
+        let out = convert_with(
+            &frame,
+            SampleFormat::S16,
+            (ChannelLayout::STEREO, ChannelLayout::_5POINT1),
+        );
+        assert_eq!(s16_samples(&out), vec![11, 22, 11, 11, 11, 11]);
+    }
+
+    #[test]
+    fn fast_path_covers_every_interleaved_format() {
+        for format in [
+            SampleFormat::U8,
+            SampleFormat::S32,
+            SampleFormat::F32,
+            SampleFormat::F64,
+        ] {
+            let bytes: Vec<u8> = (0..4 * format.bytes()).map(|i| i as u8).collect();
+            let frame = audio_frame(format, 2, vec![bytes.clone()]);
+            assert_eq!(convert(&frame, format).data[0], bytes, "{format:?}");
+        }
     }
 }
