@@ -1622,7 +1622,9 @@ mod tests {
 
     #[test]
     fn bitreader_wide_reads_and_reservoir_boundaries() {
-        let data: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let data: Vec<u8> = (0u8..32)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
         // 64-bit reads at every bit offset 0..8.
         for skip in 0..8u8 {
             let mut r = BitReader::new(&data);
@@ -1726,7 +1728,9 @@ mod tests {
         // Frames whose subframe data ends at every bit offset before the
         // byte-alignment padding: an LPC frame with an odd residual count and
         // large verbatim frames that cross many reservoir refills.
-        let big: Vec<i16> = (0..4096).map(|i| ((i * 7919) % 65_536 - 32_768) as i16).collect();
+        let big: Vec<i16> = (0..4096)
+            .map(|i| ((i * 7919) % 65_536 - 32_768) as i16)
+            .collect();
         let odd: Vec<i16> = (0..777).map(|i| (i as i16).wrapping_mul(-3)).collect();
         let mut packet = verbatim_frame(&big, 0);
         packet.extend_from_slice(&verbatim_frame(&odd, 1));
@@ -1742,7 +1746,9 @@ mod tests {
         packet.extend_from_slice(&w.finish_frame());
 
         let mut dec = FlacDecoder::new();
-        let frames = dec.decode(&Packet::new(Bytes::from(packet.clone()), 0)).unwrap();
+        let frames = dec
+            .decode(&Packet::new(Bytes::from(packet.clone()), 0))
+            .unwrap();
         assert_eq!(frames.len(), 3);
         let as_i16 = |f: &Frame| -> Vec<i16> {
             f.data[0]

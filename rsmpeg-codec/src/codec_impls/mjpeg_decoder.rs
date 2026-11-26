@@ -1331,10 +1331,8 @@ fn assemble_rgb24(frame: &FrameHeader, planes: &[CompPlane]) -> RsResult<Vec<u8>
     let cr_plane = &planes[2];
 
     let luma_full = y_comp.h_samp == frame.max_h && y_comp.v_samp == frame.max_v;
-    let chroma_1x1 = cb_comp.h_samp == 1
-        && cb_comp.v_samp == 1
-        && cr_comp.h_samp == 1
-        && cr_comp.v_samp == 1;
+    let chroma_1x1 =
+        cb_comp.h_samp == 1 && cb_comp.v_samp == 1 && cr_comp.h_samp == 1 && cr_comp.v_samp == 1;
 
     if luma_full && chroma_1x1 && frame.max_h <= 2 && frame.max_v <= 2 && frame.max_h >= frame.max_v
     {
@@ -1566,9 +1564,9 @@ fn decode_baseline_jpeg(data: &[u8]) -> RsResult<DecodedImage> {
 mod tests {
     use super::*;
     use crate::packet::PacketFlags;
-    use std::f64::consts::{FRAC_1_SQRT_2, PI};
     use bytes::Bytes;
     use rsmpeg_util::Rational;
+    use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
     #[derive(Clone, Copy)]
     struct HuffEncEntry {
@@ -2611,7 +2609,12 @@ mod tests {
         for (i, (g, e)) in got.chunks_exact(3).zip(exp.chunks_exact(3)).enumerate() {
             for c in 0..3 {
                 let diff = (i16::from(g[c]) - i16::from(e[c])).abs();
-                assert!(diff <= tol, "{label} px {i} ch {c}: got {} vs {}", g[c], e[c]);
+                assert!(
+                    diff <= tol,
+                    "{label} px {i} ch {c}: got {} vs {}",
+                    g[c],
+                    e[c]
+                );
             }
         }
     }
