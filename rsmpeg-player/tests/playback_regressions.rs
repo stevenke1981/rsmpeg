@@ -2134,3 +2134,397 @@ fn multi_video_track_switch_native_updates_active_video_and_emits_frame() {
     assert!(player.shutdown().is_ok());
     let _ = std::fs::remove_file(&path);
 }
+
+fn ebml_vint(n: u64) -> Vec<u8> {
+    for len in 1..=8usize {
+        if n < (1u64 << (7 * len)) - 1 {
+            let marked = n | (1u64 << (7 * len));
+            return (0..len).rev().map(|i| (marked >> (8 * i)) as u8).collect();
+        }
+    }
+    unreachable!("vint length fits within 8 bytes")
+}
+
+fn ebml_id(id: u32) -> Vec<u8> {
+    let b = id.to_be_bytes();
+    let skip = b.iter().position(|&x| x != 0).unwrap_or(3);
+    b[skip..].to_vec()
+}
+
+fn ebml_el(id: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = ebml_id(id);
+    out.extend_from_slice(&ebml_vint(body.len() as u64));
+    out.extend_from_slice(body);
+    out
+}
+
+fn ebml_uint(id: u32, val: u64) -> Vec<u8> {
+    let bytes = val.to_be_bytes();
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+    ebml_el(id, &bytes[start..])
+}
+
+fn ebml_simple_block(track_num: u8, rel_ts: i16, keyframe: bool, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + payload.len());
+    body.push(0x80 | (track_num & 0x7F));
+    body.extend_from_slice(&rel_ts.to_be_bytes());
+    body.push(if keyframe { 0x80 } else { 0x00 });
+    body.extend_from_slice(payload);
+    ebml_el(0xA3, &body)
+}
+
+fn build_h264_pcm_mkv() -> Vec<u8> {
+    // 4 clusters × 100 ms = 400 ms; 2 video frames (50 ms apart) + 100 ms 48 kHz mono S16 PCM per cluster.
+    let header_body = [
+        ebml_uint(0x4286, 1),
+        ebml_uint(0x42F7, 1),
+        ebml_uint(0x42F2, 4),
+        ebml_uint(0x42F3, 8),
+        ebml_el(0x4282, b"matroska"),
+        ebml_uint(0x4287, 4),
+        ebml_uint(0x4285, 2),
+    ]
+    .concat();
+    let ebml_header = ebml_el(0x1A45_DFA3, &header_body);
+
+    let mut info_body = ebml_uint(0x002A_D7B1, 1_000_000);
+    info_body.extend_from_slice(&ebml_el(0x4489, &400.0f64.to_be_bytes()));
+    let info = ebml_el(0x1549_A966, &info_body);
+
+    let video_pixel_el = [ebml_uint(0xB0, 16), ebml_uint(0xBA, 16)].concat();
+    let video_track = ebml_el(
+        0xAE,
+        &[
+            ebml_uint(0xD7, 1),
+            ebml_uint(0x73C5, 1),
+            ebml_uint(0x83, 1),
+            ebml_el(0x86, b"V_MPEG4/ISO/AVC"),
+            ebml_el(0x63A2, H264_16X16_AVCC),
+            ebml_el(0xE0, &video_pixel_el),
+        ]
+        .concat(),
+    );
+
+    let audio_settings_el = [
+        ebml_el(0xB5, &48_000.0f32.to_be_bytes()),
+        ebml_uint(0x9F, 1),
+        ebml_uint(0x6264, 16),
+    ]
+    .concat();
+    let audio_track = ebml_el(
+        0xAE,
+        &[
+            ebml_uint(0xD7, 2),
+            ebml_uint(0x73C5, 2),
+            ebml_uint(0x83, 2),
+            ebml_el(0x86, b"A_PCM/INT/LIT"),
+            ebml_el(0xE1, &audio_settings_el),
+        ]
+        .concat(),
+    );
+    let tracks = ebml_el(0x1654_AE6B, &[video_track, audio_track].concat());
+
+    // 4800 mono S16LE samples = 100 ms per chunk.
+    let mut pcm_chunk = Vec::with_capacity(4800 * 2);
+    for i in 0..4800u32 {
+        let s: i16 = if (i / 48) % 2 == 0 { 4000 } else { -4000 };
+        pcm_chunk.extend_from_slice(&s.to_le_bytes());
+    }
+
+    let mut seg_body = Vec::new();
+    seg_body.extend_from_slice(&info);
+    seg_body.extend_from_slice(&tracks);
+    for c_idx in 0..4u64 {
+        let cluster_ts = c_idx * 100;
+        let cluster_body = [
+            ebml_uint(0xE7, cluster_ts),
+            ebml_simple_block(1, 0, true, H264_16X16_IDR_SAMPLE),
+            ebml_simple_block(2, 0, true, &pcm_chunk),
+            ebml_simple_block(1, 50, true, H264_16X16_IDR_SAMPLE),
+        ]
+        .concat();
+        seg_body.extend_from_slice(&ebml_el(0x1F43_B675, &cluster_body));
+    }
+
+    let segment = ebml_el(0x1853_8067, &seg_body);
+    [ebml_header, segment].concat()
+}
+
+fn riff_chunk(id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + payload.len() + (payload.len() & 1));
+    out.extend_from_slice(id);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    if payload.len() & 1 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+fn riff_list(list_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + payload.len());
+    body.extend_from_slice(list_type);
+    body.extend_from_slice(payload);
+    riff_chunk(b"LIST", &body)
+}
+
+fn build_mjpeg_pcm_avi() -> Vec<u8> {
+    // 8 MJPEG frames @ 20 fps (400 ms) + 4 PCM S16LE chunks (100 ms each = 400 ms).
+    let jpeg = build_synthetic_jpeg_8x8();
+
+    let mut avih = [0u8; 56];
+    avih[0..4].copy_from_slice(&50_000u32.to_le_bytes()); // 20 fps
+    avih[12..16].copy_from_slice(&0x10u32.to_le_bytes()); // AVIF_HASINDEX
+    avih[16..20].copy_from_slice(&8u32.to_le_bytes()); // total frames
+    avih[24..28].copy_from_slice(&2u32.to_le_bytes()); // streams
+    avih[32..36].copy_from_slice(&8u32.to_le_bytes()); // width
+    avih[36..40].copy_from_slice(&8u32.to_le_bytes()); // height
+    let avih_chunk = riff_chunk(b"avih", &avih);
+
+    // Stream 0: vids / MJPG
+    let mut v_strh = [0u8; 56];
+    v_strh[0..4].copy_from_slice(b"vids");
+    v_strh[4..8].copy_from_slice(b"MJPG");
+    v_strh[20..24].copy_from_slice(&1u32.to_le_bytes()); // dwScale
+    v_strh[24..28].copy_from_slice(&20u32.to_le_bytes()); // dwRate (20 fps)
+    v_strh[32..36].copy_from_slice(&8u32.to_le_bytes()); // dwLength
+    let mut v_strf = [0u8; 40];
+    v_strf[0..4].copy_from_slice(&40u32.to_le_bytes());
+    v_strf[4..8].copy_from_slice(&8i32.to_le_bytes());
+    v_strf[8..12].copy_from_slice(&8i32.to_le_bytes());
+    v_strf[12..14].copy_from_slice(&1u16.to_le_bytes());
+    v_strf[14..16].copy_from_slice(&24u16.to_le_bytes());
+    v_strf[16..20].copy_from_slice(b"MJPG");
+    let v_strl = riff_list(
+        b"strl",
+        &[riff_chunk(b"strh", &v_strh), riff_chunk(b"strf", &v_strf)].concat(),
+    );
+
+    // Stream 1: auds / 48 kHz mono S16LE
+    let total_audio_samples: u32 = 4 * 4800;
+    let mut a_strh = [0u8; 56];
+    a_strh[0..4].copy_from_slice(b"auds");
+    a_strh[20..24].copy_from_slice(&1u32.to_le_bytes()); // dwScale
+    a_strh[24..28].copy_from_slice(&48_000u32.to_le_bytes()); // dwRate
+    a_strh[32..36].copy_from_slice(&total_audio_samples.to_le_bytes()); // dwLength
+    a_strh[44..48].copy_from_slice(&2u32.to_le_bytes()); // dwSampleSize = 2 bytes
+    let mut a_strf = [0u8; 18];
+    a_strf[0..2].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    a_strf[2..4].copy_from_slice(&1u16.to_le_bytes()); // mono
+    a_strf[4..8].copy_from_slice(&48_000u32.to_le_bytes());
+    a_strf[8..12].copy_from_slice(&96_000u32.to_le_bytes());
+    a_strf[12..14].copy_from_slice(&2u16.to_le_bytes()); // blockAlign
+    a_strf[14..16].copy_from_slice(&16u16.to_le_bytes()); // bitsPerSample
+    let a_strl = riff_list(
+        b"strl",
+        &[riff_chunk(b"strh", &a_strh), riff_chunk(b"strf", &a_strf)].concat(),
+    );
+
+    let hdrl = riff_list(b"hdrl", &[avih_chunk, v_strl, a_strl].concat());
+
+    let mut pcm_chunk = Vec::with_capacity(4800 * 2);
+    for i in 0..4800u32 {
+        let s: i16 = if (i / 48) % 2 == 0 { 4000 } else { -4000 };
+        pcm_chunk.extend_from_slice(&s.to_le_bytes());
+    }
+
+    let mut movi_body = Vec::new();
+    let mut idx1_body = Vec::new();
+    let mut push_entry = |ckid: &[u8; 4], payload: &[u8]| {
+        // Offset relative to `"movi"` FourCC (= 4 + movi_body.len())
+        let rel_offset = (4 + movi_body.len()) as u32;
+        movi_body.extend_from_slice(&riff_chunk(ckid, payload));
+        idx1_body.extend_from_slice(ckid);
+        idx1_body.extend_from_slice(&0x10u32.to_le_bytes()); // AVIIF_KEYFRAME
+        idx1_body.extend_from_slice(&rel_offset.to_le_bytes());
+        idx1_body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    };
+
+    for _ in 0..4u32 {
+        push_entry(b"00dc", &jpeg);
+        push_entry(b"01wb", &pcm_chunk);
+        push_entry(b"00dc", &jpeg);
+    }
+
+    let movi = riff_list(b"movi", &movi_body);
+    let idx1 = riff_chunk(b"idx1", &idx1_body);
+
+    let mut avi_payload = Vec::new();
+    avi_payload.extend_from_slice(b"AVI ");
+    avi_payload.extend_from_slice(&hdrl);
+    avi_payload.extend_from_slice(&movi);
+    avi_payload.extend_from_slice(&idx1);
+    riff_chunk(b"RIFF", &avi_payload)
+}
+
+#[test]
+fn native_mkv_plays_pure_rust_demux_and_decoders() {
+    let path = unique_temp_path("native_mkv_e2e", "mkv");
+    std::fs::write(&path, build_h264_pcm_mkv()).expect("write mkv fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(false)
+        .volume(0.0)
+        .build()
+        .expect("build mkv player");
+
+    let mut info = None;
+    let paused = watch(&mut player, Duration::from_secs(3), |ev| {
+        match ev {
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => info = Some((demuxer, video_decoder, audio_decoder)),
+            PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing => {
+                return info.is_some();
+            }
+            _ => {}
+        }
+        false
+    });
+    assert!(paused, "expected paused snapshot and DecoderInfo for MKV");
+    let (demuxer, video_decoder, audio_decoder) = info.expect("DecoderInfo for MKV");
+    assert!(
+        demuxer == "rsmpeg-format (mkv)" || demuxer == "rsmpeg-format (matroska)",
+        "unexpected MKV demuxer name: {demuxer}"
+    );
+    assert_eq!(video_decoder.as_deref(), Some("OpenH264 (H.264)"));
+    assert_eq!(audio_decoder.as_deref(), Some("rsmpeg-rust (PCM)"));
+
+    let target = Duration::from_millis(200);
+    player.seek(target).expect("seek mkv");
+    let seek_gen = player.generation();
+
+    let mut seek_ok = false;
+    let mut preview_ok = false;
+    assert!(
+        watch(&mut player, Duration::from_secs(3), |ev| {
+            match ev {
+                PlayerEvent::SeekCompleted {
+                    position,
+                    generation,
+                } if generation == seek_gen => seek_ok = position == target,
+                PlayerEvent::VideoFrame {
+                    width,
+                    height,
+                    generation,
+                    ..
+                } if generation == seek_gen => preview_ok = width == 16 && height == 16,
+                _ => {}
+            }
+            seek_ok && preview_ok
+        }),
+        "expected SeekCompleted and 16x16 preview frame for MKV seek"
+    );
+
+    player.set_playback_rate(2.0).expect("set rate");
+    player.play().expect("resume mkv");
+    let mut saw_level = false;
+    let mut saw_ended = false;
+    assert!(
+        watch(&mut player, Duration::from_secs(4), |ev| {
+            match ev {
+                PlayerEvent::AudioLevel { peak, .. } if peak > 0.0 => saw_level = true,
+                PlayerEvent::Ended { .. } => saw_ended = true,
+                _ => {}
+            }
+            saw_level && saw_ended
+        }),
+        "expected non-zero AudioLevel and Ended for MKV playback (level={saw_level}, ended={saw_ended})"
+    );
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn native_avi_plays_pure_rust_mjpeg_and_pcm() {
+    let path = unique_temp_path("native_avi_e2e", "avi");
+    std::fs::write(&path, build_mjpeg_pcm_avi()).expect("write avi fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(false)
+        .volume(0.0)
+        .build()
+        .expect("build avi player");
+
+    let mut info = None;
+    let paused = watch(&mut player, Duration::from_secs(3), |ev| {
+        match ev {
+            PlayerEvent::DecoderInfo {
+                demuxer,
+                video_decoder,
+                audio_decoder,
+                ..
+            } => info = Some((demuxer, video_decoder, audio_decoder)),
+            PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing => {
+                return info.is_some();
+            }
+            _ => {}
+        }
+        false
+    });
+    assert!(paused, "expected paused snapshot and DecoderInfo for AVI");
+    assert_eq!(
+        info,
+        Some((
+            "rsmpeg-format (avi)".to_string(),
+            Some("rsmpeg-rust (MJPEG)".to_string()),
+            Some("rsmpeg-rust (PCM)".to_string()),
+        ))
+    );
+
+    let target = Duration::from_millis(200);
+    player.seek(target).expect("seek avi");
+    let seek_gen = player.generation();
+
+    let mut seek_ok = false;
+    let mut preview_ok = false;
+    assert!(
+        watch(&mut player, Duration::from_secs(3), |ev| {
+            match ev {
+                PlayerEvent::SeekCompleted {
+                    position,
+                    generation,
+                } if generation == seek_gen => seek_ok = position == target,
+                PlayerEvent::VideoFrame {
+                    width,
+                    height,
+                    rgba,
+                    generation,
+                    ..
+                } if generation == seek_gen => {
+                    preview_ok = width == 8 && height == 8 && rgba.len() == 8 * 8 * 4;
+                }
+                _ => {}
+            }
+            seek_ok && preview_ok
+        }),
+        "expected SeekCompleted and 8x8 MJPEG preview frame for AVI seek"
+    );
+
+    player.set_playback_rate(2.0).expect("set rate");
+    player.play().expect("resume avi");
+    let mut saw_level = false;
+    let mut saw_ended = false;
+    assert!(
+        watch(&mut player, Duration::from_secs(4), |ev| {
+            match ev {
+                PlayerEvent::AudioLevel { peak, .. } if peak > 0.0 => saw_level = true,
+                PlayerEvent::Ended { .. } => saw_ended = true,
+                _ => {}
+            }
+            saw_level && saw_ended
+        }),
+        "expected non-zero AudioLevel and Ended for AVI playback (level={saw_level}, ended={saw_ended})"
+    );
+
+    let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}

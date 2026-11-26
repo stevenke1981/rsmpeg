@@ -503,7 +503,7 @@ fn frame_to_rgb24(frame: &rsmpeg::Frame) -> Option<Vec<u8>> {
         return None;
     }
     match frame.pixel_format {
-        rsmpeg::PixelFormat::Yuv420P | rsmpeg::PixelFormat::Nv12 => {
+        rsmpeg::PixelFormat::Yuv420P | rsmpeg::PixelFormat::Yuv444P | rsmpeg::PixelFormat::Nv12 => {
             scale_frame_to_packed(frame, rsmpeg::PixelFormat::Rgb24, 3)
         }
         // The Scaler has no Yuv422P -> Rgb24 kernel, so take the Rgba path and
@@ -1253,10 +1253,17 @@ mod tests {
 
         let yuv422 = yuv_frame(
             rsmpeg::PixelFormat::Yuv422P,
-            vec![y_plane, vec![128, 128], vec![128, 128]],
+            vec![y_plane.clone(), vec![128, 128], vec![128, 128]],
             vec![2, 1, 1],
         );
-        assert_eq!(frame_to_rgb24(&yuv422), Some(black_white));
+        assert_eq!(frame_to_rgb24(&yuv422), Some(black_white.clone()));
+
+        let yuv444 = yuv_frame(
+            rsmpeg::PixelFormat::Yuv444P,
+            vec![y_plane, vec![128; 4], vec![128; 4]],
+            vec![2, 2, 2],
+        );
+        assert_eq!(frame_to_rgb24(&yuv444), Some(black_white));
     }
 
     #[test]

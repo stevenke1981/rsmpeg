@@ -301,19 +301,26 @@ fn scan_box_tree_for_avcc(file: &mut File, mut pos: u64, end: u64) -> Option<Vec
             return Some(payload);
         }
 
-        // Containers that may nest avcC
-        if matches!(
-            btype,
-            b"trak" | b"mdia" | b"minf" | b"stbl" | b"stsd" | b"avc1" | b"avc3" | b"mp4v"
-        ) {
-            if let Some(v) = scan_box_tree_for_avcc(file, pos + header_size, pos + size) {
-                return Some(v);
+        // Containers that may nest avcC (stsd skips 8-byte FullBox + entry_count header;
+        // avc1/avc3 skip 78-byte VisualSampleEntry fixed fields).
+        let child_offset = match btype {
+            b"stsd" => Some(8u64),
+            b"avc1" | b"avc3" => Some(78u64),
+            b"trak" | b"mdia" | b"minf" | b"stbl" | b"mp4v" => Some(0u64),
+            _ => None,
+        };
+        if let Some(extra_hdr) = child_offset {
+            if let Some(child_start) = pos
+                .checked_add(header_size)
+                .and_then(|p| p.checked_add(extra_hdr))
+            {
+                if child_start < pos + size {
+                    if let Some(v) = scan_box_tree_for_avcc(file, child_start, pos + size) {
+                        return Some(v);
+                    }
+                }
             }
         }
-
-        // stsd has a 8-byte sample entry header before child boxes for visual sample entries
-        // (version/flags + entry count).  For robustness the recursive scan above already
-        // entered stsd; child sample entries (avc1) are scanned next iteration via seek.
 
         pos = pos.saturating_add(size);
     }
@@ -543,5 +550,67 @@ mod tests {
         let got = extract_avcc_streaming(&tmp);
         std::fs::remove_file(&tmp).ok();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn streaming_extract_finds_avcc_in_nested_stsd_avc1_hierarchy() {
+        fn make_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let size = 8u32 + payload.len() as u32;
+            let mut v = Vec::with_capacity(size as usize);
+            v.extend_from_slice(&size.to_be_bytes());
+            v.extend_from_slice(box_type);
+            v.extend_from_slice(payload);
+            v
+        }
+
+        let ftyp = make_box(b"ftyp", &[0u8; 12]);
+        let mut mdat_payload = vec![0u8; 24];
+        mdat_payload[10..14].copy_from_slice(b"avcC");
+        let mdat = make_box(b"mdat", &mdat_payload);
+
+        // Preceding audio track (`stsd` + `mp4a`) must be skipped cleanly before reaching video `trak`.
+        let mp4a = make_box(b"mp4a", &[0u8; 28]);
+        let mut audio_stsd_body = vec![0u8; 8];
+        audio_stsd_body[7] = 1;
+        audio_stsd_body.extend_from_slice(&mp4a);
+        let audio_stsd = make_box(b"stsd", &audio_stsd_body);
+        let audio_trak = make_box(
+            b"trak",
+            &make_box(b"mdia", &make_box(b"minf", &make_box(b"stbl", &audio_stsd))),
+        );
+
+        let avcc_payload: Vec<u8> = vec![
+            0x01, 0x42, 0x00, 0x1e, 0xff, 0xe1, 0x00, 0x0a, 0x67, 0x42, 0x00, 0x1e, 0x8d, 0x00,
+            0x00, 0x03, 0x00, 0x01, 0x01, 0x00, 0x04, 0x68, 0xce, 0x06, 0xe2,
+        ];
+        let pasp_box = make_box(b"pasp", &[0, 0, 0, 1, 0, 0, 0, 1]);
+        let avcc_box = make_box(b"avcC", &avcc_payload);
+
+        // VisualSampleEntry fixed header is 78 bytes before child boxes (`pasp`, `avcC`).
+        let mut avc1_body = vec![0u8; 78];
+        avc1_body[6..8].copy_from_slice(&1u16.to_be_bytes());
+        avc1_body.extend_from_slice(&pasp_box);
+        avc1_body.extend_from_slice(&avcc_box);
+        let avc1 = make_box(b"avc1", &avc1_body);
+
+        // stsd FullBox header is 8 bytes (version/flags + entry_count) before sample entries.
+        let mut stsd_body = vec![0u8; 8];
+        stsd_body[7] = 1;
+        stsd_body.extend_from_slice(&avc1);
+        let stsd = make_box(b"stsd", &stsd_body);
+
+        let video_trak = make_box(
+            b"trak",
+            &make_box(b"mdia", &make_box(b"minf", &make_box(b"stbl", &stsd))),
+        );
+        let moov = make_box(b"moov", &[audio_trak, video_trak].concat());
+        let mp4 = [ftyp, mdat, moov].concat();
+
+        let tmp = std::env::temp_dir().join("test_avcc_nested_stsd_avc1.mp4");
+        std::fs::write(&tmp, &mp4).unwrap();
+        let extracted = extract_avcc_streaming(&tmp);
+        std::fs::remove_file(&tmp).ok();
+
+        assert_eq!(extracted.as_deref(), Some(avcc_payload.as_slice()));
     }
 }
