@@ -1,6 +1,6 @@
 //! PCM audio codec — uncompressed audio passthrough.
 //!
-//! Supports common PCM formats: U8, S16LE, S32LE, F32.
+//! Supports common PCM formats: U8, S16LE, S32LE, F32LE, F64LE.
 
 use std::collections::VecDeque;
 
@@ -426,6 +426,7 @@ mod tests {
             SampleFormat::S16,
             SampleFormat::S32,
             SampleFormat::F32,
+            SampleFormat::F64,
         ] {
             let bytes_per_sample = fmt.bytes();
             let channels = 2u16;
@@ -502,5 +503,55 @@ mod tests {
             PCMAudioDecoder::from_params(&none_params),
             Err(RsError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn test_pcm_f64_decode_encode_round_trip() {
+        let codec = PCMAudioCodec::new(SampleFormat::F64).expect("F64 codec");
+        assert_eq!(codec.name(), "pcm_f64le");
+
+        // 3 stereo frames of f64 little-endian samples.
+        let samples = [0.0f64, -1.0, 0.5, 0.25, -0.125, 1.0];
+        let mut raw = Vec::new();
+        for s in samples {
+            raw.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut params = CodecParameters::new(CodecId::Pcm);
+        params.sample_format = Some(SampleFormat::F64);
+        params.channels = Some(2);
+        params.sample_rate = Some(96_000);
+        let mut decoder = PCMAudioDecoder::from_params(&params).expect("F64 params");
+        let packet = Packet {
+            data: Bytes::from(raw.clone()),
+            pts: Some(7),
+            dts: Some(7),
+            duration: 3,
+            stream_index: 0,
+            flags: PacketFlags::KEY,
+            pos: -1,
+            time_base: Rational::new(1, 96_000),
+        };
+        let frames = decoder.decode(&packet).unwrap();
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+        assert_eq!(f.sample_format, SampleFormat::F64);
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.sample_rate, 96_000);
+        assert_eq!(f.samples, 3, "48 bytes / (8 bytes x 2 ch) = 3 frames");
+        let decoded: Vec<f64> = f.data[0]
+            .chunks_exact(8)
+            .map(|c| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(c);
+                f64::from_le_bytes(b)
+            })
+            .collect();
+        assert_eq!(decoded, samples);
+
+        let mut encoder = codec.create_encoder().unwrap();
+        let packets = encoder.encode(f).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].data.as_ref(), raw.as_slice());
+        assert_eq!(packets[0].pts, Some(7));
     }
 }

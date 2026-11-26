@@ -57,6 +57,9 @@ jobs:
       - name: Check workspace without default features
         run: cargo check --workspace --no-default-features
 
+      - name: Test pure-Rust core crates without default features
+        run: cargo test -p rsmpeg-player -p rsmpeg-cli --no-default-features
+
   test-windows:
     name: test (windows, stable)
     runs-on: windows-latest
@@ -120,3 +123,6 @@ jobs:
 
       - name: Clippy workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Clippy pure-Rust core crates without default features
+        run: cargo clippy -p rsmpeg-player -p rsmpeg-cli --all-targets --no-default-features -- -D warnings

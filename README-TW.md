@@ -15,9 +15,9 @@ rsmpeg/                          # Facade crate（統一公開 API + re-export�
 ├── rsmpeg-codec/                # 編解碼層（CodecId、Packet、Frame、Codec trait、
 │                                #   Decoder/Encoder trait、CodecRegistry、CodecContext、
 │                                #   FlacDecoder、MjpegDecoder、PCMAudio、RawVideo、SRT/WebVTT）
-├── rsmpeg-format/               # 容器格式層（IOContext、Stream、偵測、
+├── rsmpeg-format/               # 容器格式層（IOContext 含 64 KiB 讀取緩衝、Stream、偵測、
 │                                #   InputFormat/OutputFormat trait、FormatRegistry、
-│                                #   FormatContext、MP4/MKV/AVI/FLAC/WAV/RawVideo demuxer）
+│                                #   FormatContext 讀寫、7 個 demuxer 與 WAV/Y4M muxer）
 ├── rsmpeg-filter/               # 濾鏡圖（FilterGraph DAG、Pad、FilterContext、
 │                                #   BufferSrc/Sink、內建 Scale/Trim/Null/Overlay 濾鏡）
 ├── rsmpeg-scale/                # 影片縮放（Scaler、色彩空間轉換、內插方法）
@@ -54,10 +54,26 @@ cd rsmpeg
 cargo build --workspace
 ```
 
+#### 純 Rust / Feature-Gated 建置模式（`rsmpeg-player` 與 `rsmpeg-cli`）
+
+`rsmpeg-player` 與 `rsmpeg-cli` 已將外部/C 後端以 Cargo feature 隔離，可獨立建置與測試純 Rust 管線：
+
+```bash
+# 僅啟用純 Rust 解碼器與原生 demuxer/muxer（不含 OpenH264、Symphonia、Rodio）
+cargo test -p rsmpeg-player -p rsmpeg-cli --no-default-features
+
+# 純 Rust 播放（含 Symphonia 音訊解碼與 Rodio 輸出，不含 C/C++ OpenH264）
+cargo build -p rsmpeg-cli --no-default-features --features pure-rust
+
+# 僅使用 rsmpeg 原生 demuxer/decoder 搭配 Rodio 音訊輸出
+cargo build -p rsmpeg-cli --no-default-features --features native-only
+```
+
 ### 執行測試
 
 ```bash
 cargo test --workspace
+cargo test -p rsmpeg-player -p rsmpeg-cli --no-default-features
 ```
 
 ### CLI 使用
@@ -86,6 +102,14 @@ cargo run --bin rsmpeg -- decode audio.flac --output decoded.wav
 
 # 解碼 MJPEG / RawVideo 並將第一幀匯出為二進位 PPM
 cargo run --bin rsmpeg -- decode mjpeg_clip.mp4 --output first_frame.ppm --max-frames 30
+
+# 純 Rust 音訊轉碼至 WAV（FLAC/WAV -> 重採樣/混音 PCM WAV）
+cargo run --bin rsmpeg -- transcode input.flac output.wav --acodec pcm_s16le --sample-rate 48000 --channels 2
+cargo run --bin rsmpeg -- transcode input.wav output_mono.wav --sample-rate 48000 --channels 1
+
+# 純 Rust 視訊轉碼至 Y4M（MJPEG AVI/MP4 或 Y4M -> 縮放轉換原始 YUV4MPEG2）
+cargo run --bin rsmpeg -- transcode mjpeg_clip.avi output.y4m --vcodec rawvideo --width 640 --height 360 --max-frames 60
+cargo run --bin rsmpeg -- transcode input.y4m scaled.y4m --width 1280 --height 720
 
 # 解析並檢視 SRT / WebVTT 字幕內容
 cargo run --bin rsmpeg -- decode subtitles.srt
@@ -118,19 +142,20 @@ cargo run --example version
 
 - **Util**：錯誤型別、有理數運算、媒體類型偵測、像素/取樣格式列舉、聲道佈局 bitflags、字典
 - **Codec**：`CodecId` 列舉（27+ 格式）、`Packet`/`Frame` 型別、`Codec` + `Decoder`/`Encoder` traits、`CodecRegistry` 全域單例、Builder 模式 `CodecContext`，以及純 Rust 編解碼器：
-  - `FlacDecoder`（`FlacCodec`）：RFC 9639 純 Rust 無損 FLAC 音訊解碼器（CRC-8/CRC-16 驗證、CONSTANT/VERBATIM/FIXED/LPC 子幀、立體聲去相關與單封包多幀解碼）
-  - `MjpegDecoder`（`MjpegCodec`）：ITU-T T.81 Baseline DCT Motion-JPEG 視訊解碼器（`SOF0`、Annex K.3.3 預設 Huffman 表、8/16 位元 DQT、灰階與 YCbCr 取樣、重啟標記，輸出 `Rgb24`）
-  - `PCMAudioDecoder` / `PCMAudioEncoder`（`PCMAudioCodec`）：無壓縮 PCM（`U8`、`S16`、`S32`、`F32`）
-  - `RawVideoDecoder` / `RawVideoEncoder`（`RawVideoCodec`）：無壓縮視訊幀直通
+  - `FlacDecoder`（`FlacCodec`）：RFC 9639 純 Rust 無損 FLAC 音訊解碼器，採用 64 位元 `BitReader`（CRC-8/CRC-16 驗證、CONSTANT/VERBATIM/FIXED/LPC 子幀、立體聲去相關與單封包多幀解碼）
+  - `MjpegDecoder`（`MjpegCodec`）：ITU-T T.81 Baseline DCT Motion-JPEG 視訊解碼器，採用整數 IDCT（`SOF0`、Annex K.3.3 預設 Huffman 表、8/16 位元 DQT、灰階與 YCbCr 取樣、重啟標記，輸出 `Rgb24`）
+  - `PCMAudioDecoder` / `PCMAudioEncoder`（`PCMAudioCodec`）：無壓縮 PCM（`U8`、`S16`、`S32`、`F32`、`F64`）
+  - `RawVideoDecoder` / `RawVideoEncoder`（`RawVideoCodec`）：無壓縮視訊幀直通，支援 planar/semi-planar/packed 佈局拆解
   - `SrtCodec`、`WebVttCodec`、`SubtitleDecoder`、`SubtitleTrack`、`SubtitleCue`，以及 `parse_srt` / `parse_webvtt` / `parse_subtitle_file`
-- **Format**：`IOContext` 抽象層（File/Buffer）、魔術位元組格式偵測、`InputFormat`/`OutputFormat` traits、`FormatRegistry`、`FormatContext` header 解析，與 **6 個已註冊 demuxer**（`mp4`、`mkv`、`avi`、`flac`、`wav`、`rawvideo`）：
+- **Format**：`IOContext` 抽象層（檔案含 64 KiB 讀取緩衝 / 記憶體緩衝）、魔術位元組格式偵測、`InputFormat`/`OutputFormat` traits、`FormatRegistry`、`FormatContext` 讀寫介面（`open_input`、`open_output`、`open_output_buffer`）、**7 個已註冊 demuxer**（`mp4`、`mkv`、`avi`、`flac`、`wav`、`rawvideo`、`y4m`）與 **2 個已註冊 muxer**（`wav`、`y4m`）：
   - 有狀態 `FLACDemuxer`：`read_header`（STREAMINFO/SEEKTABLE/VORBIS_COMMENT）、串流式 `read_frame`（含幀同步與 CRC-16 邊界掃描），以及 `seek`（透過 SEEKTABLE 二分搜尋與位元組偏移估算重新同步）
   - `MP4Demuxer`：除 H.264/AAC 外，支援 MJPEG 視訊樣本項目（`jpeg`、`mjpa`、`mjpb`、`mjpg` 與 `mp4v` `esds` `objectTypeIndication = 0x6C`）與 FLAC 音訊樣本項目（`fLaC` + `dfLa` STREAMINFO extradata）
-- **Filter**：Filter trait、FilterGraph DAG、Pad/PadDirection、BufferSrc/BufferSink、內建濾鏡（Scale、Trim、Null、Overlay、Transpose）
-- **Scale**：Scaler 含 ScalerConfig builder、7 種內插方法、色彩空間定義（BT.601/709/2020/RGB）
-- **Resample**：Resampler 含 ResamplerConfig、聲道映射矩陣、抖動方法
-- **Player 與 GUI**：`rsmpeg-player` 統一背景播放引擎（原生 `rsmpeg-format` + 純 Rust `FlacDecoder`/`MjpegDecoder`/`RawVideoDecoder`/`PCMAudioDecoder` 管線、OpenH264 與 Symphonia 後端回退、`DecoderInfo` 管線回報與單幀步進）及 `rsmpeg-gui` GPUI 桌面播放器（詳見 [docs/gui.md](docs/gui.md)）
-- **CLI**：`probe`（支援 JSON/verbose 輸出）、`decode`（純 Rust 解碼 FLAC/MJPEG/PCM/RawVideo/SRT/WebVTT，支援 `.wav`/`.ppm` 匯出與 `--max-frames`）、`play`、`gui`、`list-formats`、`list-codecs`、`transcode`（骨架）
+  - `Y4mDemuxer` / `Y4mMuxer` 與 `WAVMuxer`：純 Rust YUV4MPEG2（`C420`/`C422`/`C444`/`Cmono`）與 RIFF/WAVE PCM（`U8`/`S16`/`S32`/`F32`）封裝與解封裝（含 seek 支援）
+- **Filter**：Filter trait、FilterGraph DAG、Pad/PadDirection、BufferSrc/BufferSink、內建濾鏡（Scale、Trim、Null、Overlay、Transpose，以及支援 padded `linesize` 與 RGBA 快速路徑的 `BoxBlurFilter`、`CropFilter`、`GrayscaleFilter`、`MirrorFilter`、`RotateFilter`）
+- **Scale**：Scaler 含 ScalerConfig builder、4 種實作內插核（`nearest`、`bilinear`、`bicubic`、`lanczos`）、色彩空間定義（BT.601/BT.709/BT.2020/RGB，limited/full range），以及 `Yuv420P`/`Yuv422P`/`Yuv444P`/`Nv12`/`Nv21` → packed RGB/BGR/RGBA 1:1 快速路徑
+- **Resample**：Resampler 含 ResamplerConfig、支援 `U8`/`S16`/`S32`/`F32`/`F64` 與 planar（`S16P`/`S32P`/`F32P`/`F64P`）輸入、加權 `ChannelMapping` 矩陣混音（含 5.1 → stereo 降混）與抖動方法
+- **Player 與 GUI**：`rsmpeg-player` 統一背景播放引擎（feature-gated `backend-symphonia`、`backend-openh264`、`audio-rodio`、`pure-rust`、`native-only`；原生 `rsmpeg-format` + 純 Rust `FlacDecoder`/`MjpegDecoder`/`RawVideoDecoder`/`PCMAudioDecoder` 管線、OpenH264 與 Symphonia 後端回退、`DecoderInfo` 管線回報與單幀步進）及 `rsmpeg-gui` GPUI 桌面播放器（詳見 [docs/gui.md](docs/gui.md)）
+- **CLI**：`probe`（支援 JSON/verbose 輸出）、`decode`（純 Rust 解碼 FLAC/MJPEG/PCM/RawVideo/SRT/WebVTT，支援 `.wav`/`.ppm` 匯出與 `--max-frames`）、`transcode`（純 Rust `.flac`/`.wav` → `.wav` 音訊重採樣/混音與 `.avi`/`.mp4`/`.y4m` → `.y4m` 視訊縮放/格式轉換）、`play`、`gui`、`list-formats`（同時列出 demuxer 與 muxer）、`list-codecs`
 
 ### 🚧 進行中
 

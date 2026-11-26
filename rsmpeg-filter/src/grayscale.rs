@@ -19,21 +19,49 @@ impl GrayscaleFilter {
     /// the alpha channel is left untouched. For RGBA, `frame.data[0]` is a single
     /// tightly-packed plane with a 4-byte stride (R, G, B, A).
     pub fn apply(&self, frame: &mut Frame) {
-        // A frame with no plane is a no-op (previously panicked).
+        if frame.pixel_format != rsmpeg_util::PixelFormat::Rgba {
+            return;
+        }
+        let w = frame.width;
+        let h = frame.height;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(row_bytes) = w.checked_mul(4) else {
+            return;
+        };
+        let src_stride = frame
+            .linesize
+            .first()
+            .copied()
+            .filter(|&ls| ls >= row_bytes)
+            .unwrap_or(row_bytes);
+        let Some(needed) = h
+            .checked_sub(1)
+            .and_then(|r| r.checked_mul(src_stride))
+            .and_then(|o| o.checked_add(row_bytes))
+        else {
+            return;
+        };
+        // A frame with no plane or truncated plane is a no-op (previously panicked).
         let Some(buf) = frame.data.first_mut() else {
             return;
         };
-        let mut i = 0usize;
-        while i + 3 < buf.len() {
-            let r = buf[i] as f32;
-            let g = buf[i + 1] as f32;
-            let b = buf[i + 2] as f32;
-            let y = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
-            buf[i] = y;
-            buf[i + 1] = y;
-            buf[i + 2] = y;
-            // buf[i + 3] (alpha) is intentionally preserved.
-            i += 4;
+        if buf.len() < needed {
+            return;
+        }
+        for y in 0..h {
+            let row_start = y * src_stride;
+            for px in buf[row_start..row_start + row_bytes].chunks_exact_mut(4) {
+                let r = px[0] as f32;
+                let g = px[1] as f32;
+                let b = px[2] as f32;
+                let lum = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
+                px[0] = lum;
+                px[1] = lum;
+                px[2] = lum;
+                // px[3] (alpha) is intentionally preserved.
+            }
         }
     }
 }
@@ -141,5 +169,33 @@ mod tests {
         let p = &frame.data[0];
         assert_eq!(&p[0..4], &[0, 0, 0, 255]);
         assert_eq!(&p[4..8], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn grayscale_non_rgba_is_noop() {
+        let mut frame = Frame::new_video(2, 1, PixelFormat::Rgb24);
+        frame.data[0] = vec![200, 100, 50, 10, 20, 30];
+        let orig = frame.data[0].clone();
+        GrayscaleFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], orig);
+    }
+
+    #[test]
+    fn grayscale_honors_padded_linesize_and_1x1() {
+        let mut frame = Frame::new_video(1, 2, PixelFormat::Rgba);
+        let stride = 8usize; // 1 * 4 active + 4 sentinel padding bytes
+        let mut buf = vec![0xEEu8; stride * 2];
+        buf[0..4].copy_from_slice(&[200, 100, 50, 255]);
+        buf[stride..stride + 4].copy_from_slice(&[0, 255, 0, 99]);
+        frame.data[0] = buf;
+        frame.linesize[0] = stride;
+
+        GrayscaleFilter::new().apply(&mut frame);
+        assert_eq!(frame.linesize, vec![stride]);
+        assert_eq!(&frame.data[0][0..4], &[124, 124, 124, 255]);
+        assert_eq!(&frame.data[0][4..8], &[0xEE; 4]);
+        // round(0.587 * 255) = round(149.685) = 150
+        assert_eq!(&frame.data[0][stride..stride + 4], &[150, 150, 150, 99]);
+        assert_eq!(&frame.data[0][stride + 4..stride + 8], &[0xEE; 4]);
     }
 }

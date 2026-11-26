@@ -1,3 +1,28 @@
+# rsmpeg 重構驗收摘要（Round 2 — Pure-Rust Pipeline v2）
+
+## 2026-11-27 — Round 2：Pure-Rust Muxing/Transcoding、Feature Isolation 與管線效能優化
+
+### Wave 1（Codec / Format / Player / Scale / Resample）
+- **Codec & IO 效能優化**：`IOContext` 加入 64 KiB 讀取緩衝減少檔案系統 syscall；`MjpegDecoder` 改採定點整數 IDCT；`FlacDecoder` 採用 64-bit `BitReader` 加速位元流讀取；`PCMAudioCodec` 補齊 `F64` 與單平面直通編碼。
+- **Container Mux/Demux 完整化**：新增純 Rust `Y4mDemuxer`、`WAVMuxer` 與 `Y4mMuxer`（註冊達 **7 個 demuxer + 2 個 muxer**）；`FormatContext` 新增 `open_output`、`open_output_buffer`、`write_header`、`write_frame`、`write_trailer` 完整輸出路徑；`WAVDemuxer`/`AVIDemuxer`/`MKVDemuxer` 統一透過 `PcmLayout` 正規化 24-bit/BE/A-law/µ-law PCM。
+- **Player Feature 解耦與 Scale/Resample 擴充**：`rsmpeg-player` 新增 `pure-rust` 與 `native-only` feature 並隔離 Symphonia/OpenH264/Rodio 相依；`Scaler` 新增 `Yuv422P`→RGB/BGR、`Nv12`→`Bgr24`、`Nv21`、packed RGB/`Gray8` 轉換、BT.709/BT.2020 矩陣與 1:1 快速路徑；`Resampler` 支援 `U8`/`S16`/`S32`/`F32`/`F64`、planar (`S16P`/`S32P`/`F32P`/`F64P`) 輸入與加權 `ChannelMapping`（含 5.1 → stereo 降混）。
+
+### Wave 2（CLI / Filter / CI / Docs）
+- **`rsmpeg-cli` Pure-Rust 解耦與 feature gates**：移除未使用的直接相依 `symphonia`、`rodio`、`openh264`；`rsmpeg-player` 改為 `default-features = false` 並轉暴露 `default`、`backend-symphonia`、`backend-openh264`、`audio-rodio`、`pure-rust`、`native-only`；`rsmpeg-cli/src/lib.rs` 條件編譯 Symphonia-only re-exports，確保 `--no-default-features` 可獨立編譯與測試。
+- **真實純 Rust `transcode` 與 `list-formats`**：`cmd_list_formats` 同步列出已註冊 demuxer 與 muxer；`frame_to_rgb24` 移除 `Yuv422P -> Rgba` 中轉並直接走 `Scaler` 轉 `Rgb24`（同時支援 `Nv21`）；實作 `transcode_media`（`.flac`/`.wav` → `.wav` 經 `Resampler` + `PCMAudioEncoder` + `WAVMuxer`，支援 `--acodec`/`--sample-rate`/`--channels`/`--max-frames`；`.avi`/`.mp4`/`.y4m` → `.y4m` 經 `Scaler`/BT.601 `packed_rgb_to_yuv420p` + `RawVideoEncoder` + `Y4mMuxer`，支援 `--width`/`--height`/`--vcodec`/`--max-frames`）。
+- **`rsmpeg-filter` 效能與步距／格式安全**：`BoxBlurFilter`、`CropFilter`、`GrayscaleFilter`、`MirrorFilter`、`RotateFilter` 全面於非 `PixelFormat::Rgba` 時安全 no-op、正確處理 padded `linesize[0]`（避免跨讀填充位元組）、改採 slice `chunks_exact_mut`/`swap_with_slice`/`copy_from_slice` 優化內層迴圈（`BoxBlurFilter` 內區採無邊界分支 `/ 9` 快速路徑）。
+- **CI 與文件同步**：`.github/workflows/ci.yml` 加入 `--no-default-features` 測試與 clippy gate；同步更新 `README.md`、`README-TW.md`、`final.md`、`test.md`、`todos.md`。
+
+### Round 2 本機驗證結果
+- `cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check`：PASS
+- `cargo +stable-x86_64-pc-windows-msvc clippy --locked --workspace --all-targets --all-features -- -D warnings`：PASS（0 warnings）
+- `cargo +stable-x86_64-pc-windows-msvc clippy --locked -p rsmpeg-player -p rsmpeg-cli --all-targets --no-default-features -- -D warnings`：PASS（0 warnings）
+- `cargo +stable-x86_64-pc-windows-msvc check --workspace --no-default-features`：PASS
+- `cargo +stable-x86_64-pc-windows-msvc test -p rsmpeg-player -p rsmpeg-cli --no-default-features`：PASS（`rsmpeg-player` 162 unit + 13 integration；`rsmpeg-cli` 25 unit；共 200 passed）
+- `cargo +stable-x86_64-pc-windows-msvc test --locked --workspace`：PASS（全 10 個 crate 共 **806 passed, 0 failed**：`rsmpeg-util` 68、`rsmpeg-codec` 82、`rsmpeg-format` 166、`rsmpeg-filter` 48、`rsmpeg-scale` 92、`rsmpeg-resample` 59、`rsmpeg-player` 202 unit + 22 integration、`rsmpeg-gui` 42、`rsmpeg-cli` 25）
+
+---
+
 # rsmpeg 重構驗收摘要（第八刀 — multi-agent round 4）
 
 ## 2026-07-23 — AcmeUI Native GUI 與實機播放

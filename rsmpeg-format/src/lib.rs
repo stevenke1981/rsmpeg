@@ -6,6 +6,7 @@ pub mod format;
 pub mod format_context;
 pub mod format_registry;
 pub mod io_context;
+pub mod muxers;
 pub mod probe;
 pub mod stream;
 pub mod time_util;

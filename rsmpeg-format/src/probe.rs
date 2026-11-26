@@ -104,6 +104,16 @@ pub fn probe_format(buf: &[u8]) -> Vec<ProbeResult> {
         });
     }
 
+    // Y4M: YUV4MPEG2 raw video
+    if buf.starts_with(b"YUV4MPEG2 ") {
+        results.push(ProbeResult {
+            format_name: "y4m",
+            description: "YUV4MPEG2",
+            score: ProbeScore::Certain,
+            extension: "y4m",
+        });
+    }
+
     results
 }
 
@@ -141,6 +151,20 @@ mod tests {
         let buf = b"fLaC\x00\x00\x00\x22\x12\x00\x12\x00";
         let results = probe_format(buf);
         assert!(results.iter().any(|r| r.format_name == "flac"));
+    }
+
+    #[test]
+    fn test_probe_y4m() {
+        let results = probe_format(b"YUV4MPEG2 W320 H240 F25:1\n");
+        let y4m = results
+            .iter()
+            .find(|r| r.format_name == "y4m")
+            .expect("y4m probe match");
+        assert_eq!(y4m.description, "YUV4MPEG2");
+        assert_eq!(y4m.score, ProbeScore::Certain);
+        assert_eq!(y4m.extension, "y4m");
+
+        assert!(probe_format(b"YUV4MPEG2").is_empty());
     }
 
     #[test]

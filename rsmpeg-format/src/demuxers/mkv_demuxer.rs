@@ -16,8 +16,9 @@
 
 use super::avi_demuxer::{
     fourcc_to_codec_id, h264_format_from_extradata, parse_bitmap_info_header, parse_wave_format_ex,
-    raw_pixel_format, wave_format_codec,
+    raw_pixel_format, wave_format_codec, wave_format_layout,
 };
+use super::pcm::PcmLayout;
 use crate::format::InputFormat;
 use crate::format_context::FormatContext;
 use crate::io_context::IOContext;
@@ -796,7 +797,10 @@ fn build_stream(index: usize, t: &TrackEntry, duration_ms: i64) -> Stream {
         "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/AP" => map.codec_id = CodecId::Mpeg4,
         "A_FLAC" => map.codec_id = CodecId::Flac,
         "A_MPEG/L3" | "A_MPEG/L2" => map.codec_id = CodecId::Mp3,
-        "A_PCM/INT/LIT" => {
+        // Packets of every PCM flavour are normalised to canonical
+        // little-endian samples (see `track_pcm_layout`), so the advertised
+        // sample format is the canonical one: 24-bit becomes `S32`.
+        "A_PCM/INT/LIT" | "A_PCM/INT/BIG" => {
             map.codec_id = CodecId::Pcm;
             sample_format = match bit_depth {
                 8 => Some(SampleFormat::U8),
@@ -893,6 +897,27 @@ fn build_stream(index: usize, t: &TrackEntry, duration_ms: i64) -> Stream {
     stream
 }
 
+/// Conversion that turns a track's PCM block payloads into canonical
+/// little-endian samples matching the sample format `build_stream` reports.
+fn track_pcm_layout(t: &TrackEntry) -> PcmLayout {
+    let bit_depth = t.bit_depth.unwrap_or(0);
+    match (t.codec_id.as_str(), bit_depth) {
+        ("A_PCM/INT/LIT", 24) => PcmLayout::S24LeToS32,
+        ("A_PCM/INT/BIG", 16) => PcmLayout::S16BeToLe,
+        ("A_PCM/INT/BIG", 24) => PcmLayout::S24BeToS32,
+        ("A_PCM/INT/BIG", 32) => PcmLayout::S32BeToLe,
+        // `A_PCM/FLOAT/IEEE` is little-endian by definition: already canonical.
+        ("A_MS/ACM", _) => t
+            .codec_private
+            .as_deref()
+            .and_then(parse_wave_format_ex)
+            .map_or(PcmLayout::Passthrough, |wf| {
+                wave_format_layout(wf.format_tag, wf.bits_per_sample)
+            }),
+        _ => PcmLayout::Passthrough,
+    }
+}
+
 // ───────────────────────────── demuxer ─────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -900,6 +925,8 @@ struct TrackRuntime {
     stream_index: usize,
     default_duration_ns: Option<u64>,
     strip_header: Option<Bytes>,
+    /// PCM packet normalisation (endianness / 24-bit width / G.711).
+    pcm: PcmLayout,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1067,6 +1094,7 @@ impl InputFormat for MKVDemuxer {
                     stream_index: index,
                     default_duration_ns: t.default_duration_ns.filter(|&d| d > 0),
                     strip_header: t.strip_header.clone().map(Bytes::from),
+                    pcm: track_pcm_layout(t),
                 },
             );
         }
@@ -1329,6 +1357,7 @@ impl MKVDemuxer {
                 }
                 None => frame,
             };
+            let payload = rt.pcm.apply_bytes(payload);
             let mut pkt = Packet::new(payload, rt.stream_index);
             pkt.pts = Some(ts_ms);
             pkt.dts = Some(ts_ms);
@@ -2488,5 +2517,134 @@ mod tests {
                 let _ = read_all(&mut ctx, &mut d);
             }
         }
+    }
+
+    fn pcm_track(number: u64, codec: &str, bits: u64, private: Option<&[u8]>) -> Vec<u8> {
+        let mut body = vec![
+            uint(ID_TRACKNUMBER, number),
+            uint(ID_TRACKTYPE, 2),
+            string(ID_CODECID, codec),
+            el(
+                ID_AUDIO,
+                &[
+                    float4(ID_SAMPLINGFREQUENCY, 48_000.0),
+                    uint(ID_CHANNELS, 1),
+                    uint(ID_BITDEPTH, bits),
+                ]
+                .concat(),
+            ),
+        ];
+        if let Some(p) = private {
+            body.push(el(ID_CODECPRIVATE, p));
+        }
+        el(ID_TRACKENTRY, &body.concat())
+    }
+
+    #[test]
+    fn pcm_tracks_are_normalised_to_canonical_little_endian() {
+        // WAVEFORMATEX for mu-law mono.
+        let mut mulaw_wfx = Vec::new();
+        mulaw_wfx.extend(7u16.to_le_bytes());
+        mulaw_wfx.extend(1u16.to_le_bytes());
+        mulaw_wfx.extend(8_000u32.to_le_bytes());
+        mulaw_wfx.extend(8_000u32.to_le_bytes());
+        mulaw_wfx.extend(1u16.to_le_bytes());
+        mulaw_wfx.extend(8u16.to_le_bytes());
+        mulaw_wfx.extend(0u16.to_le_bytes());
+
+        let tracks = el(
+            ID_TRACKS,
+            &[
+                pcm_track(1, "A_PCM/INT/BIG", 16, None),
+                pcm_track(2, "A_PCM/INT/BIG", 24, None),
+                pcm_track(3, "A_PCM/INT/BIG", 32, None),
+                pcm_track(4, "A_PCM/INT/LIT", 24, None),
+                pcm_track(5, "A_PCM/FLOAT/IEEE", 64, None),
+                pcm_track(6, "A_MS/ACM", 8, Some(&mulaw_wfx)),
+                pcm_track(7, "A_PCM/INT/LIT", 16, None),
+                pcm_track(8, "A_PCM/INT/BIG", 8, None),
+            ]
+            .concat(),
+        );
+        let f64_payload: Vec<u8> = [0.5f64, -2.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let data = file(&[
+            info(1_000_000, 10.0),
+            tracks,
+            cluster(
+                0,
+                &[
+                    simple_block(1, 0, 0x80, &[0x12, 0x34, 0xFF, 0xFE]),
+                    simple_block(2, 0, 0x80, &[0x12, 0x34, 0x56, 0xFF, 0xFF, 0xFF]),
+                    simple_block(3, 0, 0x80, &[0x01, 0x02, 0x03, 0x04]),
+                    simple_block(4, 0, 0x80, &[0x56, 0x34, 0x12]),
+                    simple_block(5, 0, 0x80, &f64_payload),
+                    simple_block(6, 0, 0x80, &[0xFF, 0x80, 0x00]),
+                    simple_block(7, 0, 0x80, &[0x34, 0x12]),
+                    simple_block(8, 0, 0x80, &[0x80, 0x81]),
+                ],
+            ),
+        ]);
+        let mut ctx = ctx_with(data);
+        let mut d = MKVDemuxer::default();
+        d.read_header(&mut ctx).unwrap();
+        let formats: Vec<Option<SampleFormat>> = ctx
+            .streams
+            .iter()
+            .map(|s| s.codec_params.sample_format)
+            .collect();
+        assert_eq!(
+            formats,
+            vec![
+                Some(SampleFormat::S16),
+                Some(SampleFormat::S32),
+                Some(SampleFormat::S32),
+                Some(SampleFormat::S32),
+                Some(SampleFormat::F64),
+                Some(SampleFormat::S16),
+                Some(SampleFormat::S16),
+                Some(SampleFormat::U8),
+            ]
+        );
+        assert!(ctx.streams.iter().all(|s| s.codec_id == CodecId::Pcm));
+
+        let pkts = read_all(&mut ctx, &mut d);
+        assert_eq!(pkts.len(), 8);
+        let by_stream = |i: usize| -> Vec<u8> {
+            pkts.iter()
+                .find(|p| p.stream_index == i)
+                .unwrap()
+                .data
+                .to_vec()
+        };
+        // s16be -> s16le
+        assert_eq!(by_stream(0), vec![0x34, 0x12, 0xFE, 0xFF]);
+        // s24be -> s32le (<< 8)
+        let s24be = by_stream(1);
+        assert_eq!(
+            i32::from_le_bytes([s24be[0], s24be[1], s24be[2], s24be[3]]),
+            0x12_3456 << 8
+        );
+        assert_eq!(
+            i32::from_le_bytes([s24be[4], s24be[5], s24be[6], s24be[7]]),
+            -1 << 8
+        );
+        // s32be -> s32le
+        assert_eq!(by_stream(2), vec![0x04, 0x03, 0x02, 0x01]);
+        // s24le -> s32le (<< 8)
+        assert_eq!(by_stream(3), vec![0x00, 0x56, 0x34, 0x12]);
+        // f64le untouched
+        assert_eq!(by_stream(4), f64_payload);
+        // A_MS/ACM mu-law -> s16le
+        let mu: Vec<i16> = by_stream(5)
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(mu, vec![0, 32_124, -32_124]);
+        // Canonical tracks pass through.
+        assert_eq!(by_stream(6), vec![0x34, 0x12]);
+        assert_eq!(by_stream(7), vec![0x80, 0x81]);
     }
 }

@@ -1,11 +1,14 @@
-//! Explicit codec detection for Symphonia tracks.
+//! Explicit codec detection from container tags and, with the
+//! `backend-symphonia` feature, for Symphonia tracks.
 //!
 //! Symphonia does not decode video, so H.264 tracks often appear as
 //! `CODEC_TYPE_NULL`.  We must **not** treat every unknown track as H.264 —
 //! only streams whose container tags / extradata prove the codec, and never
 //! feed unsupported codecs into OpenH264.
 
+#[cfg(feature = "backend-symphonia")]
 use symphonia::core::codecs::CODEC_TYPE_NULL;
+#[cfg(feature = "backend-symphonia")]
 use symphonia::core::formats::Track;
 
 /// Video codecs we can name.  Only [`DetectedVideoCodec::H264`] may use OpenH264.
@@ -102,7 +105,7 @@ pub fn looks_like_hvcc(extra: &[u8]) -> bool {
     extra.len() >= 23 && extra[0] == 1
 }
 
-/// Classify a Symphonia track as audio, H.264 video, unsupported video, or ignore.
+/// What a container track holds: audio, video of a named codec, or neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackKind {
     Audio,
@@ -112,6 +115,7 @@ pub enum TrackKind {
 }
 
 /// Detect track kind without assuming `CODEC_TYPE_NULL` ⇒ H.264.
+#[cfg(feature = "backend-symphonia")]
 pub fn classify_track(track: &Track) -> TrackKind {
     let cp = &track.codec_params;
 
@@ -144,6 +148,7 @@ pub fn classify_track(track: &Track) -> TrackKind {
 }
 
 /// Find the first playable audio track.
+#[cfg(feature = "backend-symphonia")]
 pub fn find_audio_track(tracks: &[Track]) -> Option<&Track> {
     tracks
         .iter()
@@ -151,6 +156,7 @@ pub fn find_audio_track(tracks: &[Track]) -> Option<&Track> {
 }
 
 /// Find the first H.264 video track (safe for OpenH264).
+#[cfg(feature = "backend-symphonia")]
 pub fn find_h264_video_track(tracks: &[Track]) -> Option<&Track> {
     tracks.iter().find(|t| {
         matches!(
@@ -161,6 +167,7 @@ pub fn find_h264_video_track(tracks: &[Track]) -> Option<&Track> {
 }
 
 /// Report the first video track that is present but not H.264 (for user messaging).
+#[cfg(feature = "backend-symphonia")]
 pub fn find_unsupported_video(tracks: &[Track]) -> Option<DetectedVideoCodec> {
     tracks.iter().find_map(|t| match classify_track(t) {
         TrackKind::Video(c) if !c.is_h264() => Some(c),

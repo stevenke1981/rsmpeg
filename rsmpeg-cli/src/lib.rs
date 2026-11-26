@@ -8,10 +8,11 @@ pub use rsmpeg_player::h264_bitstream::{
     extract_avcc_streaming, is_annex_b, packet_for_decoder, H264BitstreamError,
     H264BitstreamFormat,
 };
+#[cfg(feature = "backend-symphonia")]
 pub use rsmpeg_player::{
-    classify_track, codec_from_fourcc, find_audio_track, find_h264_video_track,
-    find_unsupported_video, DetectedVideoCodec, TrackKind,
+    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video,
 };
+pub use rsmpeg_player::{codec_from_fourcc, DetectedVideoCodec, TrackKind};
 
 /// Backward-compatible name for streaming avcC extraction.
 pub fn extract_avcc_from_mp4(path: &str) -> Option<Vec<u8>> {

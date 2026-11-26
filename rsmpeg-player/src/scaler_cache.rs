@@ -25,13 +25,17 @@ thread_local! {
     static CACHE: RefCell<HashMap<ScalerKey, Scaler>> = RefCell::new(HashMap::new());
 }
 
-/// Convert a `Yuv420P`, `Yuv422P`, `Yuv444P` or `Nv12` [`Frame`] to
+/// Convert a `Yuv420P`, `Yuv422P`, `Yuv444P`, `Nv12` or `Nv21` [`Frame`] to
 /// tightly-packed RGBA (`w * h * 4`), reusing a cached [`Scaler`] keyed by
 /// `(pixel format, width, height)`. Returns the first (RGBA) data plane.
 pub fn yuv_to_rgba_cached(frame: &Frame) -> RsResult<Vec<u8>> {
     if !matches!(
         frame.pixel_format,
-        PixelFormat::Yuv420P | PixelFormat::Yuv422P | PixelFormat::Yuv444P | PixelFormat::Nv12
+        PixelFormat::Yuv420P
+            | PixelFormat::Yuv422P
+            | PixelFormat::Yuv444P
+            | PixelFormat::Nv12
+            | PixelFormat::Nv21
     ) {
         return Err(RsError::InvalidData(
             format!(
@@ -144,6 +148,10 @@ mod tests {
                 frame.data = vec![vec![y; w * h], [u, v].repeat(cw * ch)];
                 frame.linesize = vec![w, cw * 2];
             }
+            PixelFormat::Nv21 => {
+                frame.data = vec![vec![y; w * h], [v, u].repeat(cw * ch)];
+                frame.linesize = vec![w, cw * 2];
+            }
             other => panic!("unsupported test format {other:?}"),
         }
         frame
@@ -222,6 +230,7 @@ mod tests {
             PixelFormat::Yuv422P,
             PixelFormat::Yuv444P,
             PixelFormat::Nv12,
+            PixelFormat::Nv21,
         ];
         let expected =
             yuv420p_to_rgba_cached(&solid_yuv420p(8, 6, 81, 90, 240)).expect("reference");

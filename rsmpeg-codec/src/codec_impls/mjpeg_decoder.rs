@@ -1,7 +1,8 @@
 //! Pure-Rust ITU-T T.81 Baseline DCT JPEG / Motion-JPEG video decoder.
 //!
 //! Supports:
-//! - Standard Baseline DCT sequential JPEG (`SOF0`)
+//! - Standard Baseline DCT sequential JPEG (`SOF0`) and 8-bit Extended
+//!   sequential DCT, Huffman-coded JPEG (`SOF1`)
 //! - Motion-JPEG frames that omit `DHT` markers (pre-initialized with ITU-T T.81
 //!   Annex K.3.3 default luminance/chrominance DC and AC Huffman tables)
 //! - 8-bit and 16-bit quantization tables (`DQT`)
@@ -12,7 +13,6 @@
 //! - Byte-unstuffing (`0xFF 0x00` -> `0xFF`) and fill `0xFF` bytes
 
 use std::collections::VecDeque;
-use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
 use crate::codec::{Codec, CodecCapabilities, DecodeStatus, Decoder, Encoder};
 use crate::codec_id::CodecId;
@@ -714,7 +714,7 @@ fn parse_dht(
     Ok(())
 }
 
-fn parse_sof0(payload: &[u8]) -> RsResult<FrameHeader> {
+fn parse_sof(payload: &[u8]) -> RsResult<FrameHeader> {
     if payload.len() < 6 {
         return Err(RsError::InvalidData("Truncated JPEG SOF0 header".into()));
     }
@@ -722,7 +722,7 @@ fn parse_sof0(payload: &[u8]) -> RsResult<FrameHeader> {
     if precision != 8 {
         return Err(RsError::Unsupported(
             format!(
-                "Unsupported JPEG sample precision {precision} (only 8-bit Baseline supported)"
+                "Unsupported JPEG sample precision {precision} (only 8-bit Baseline/Extended sequential supported)"
             )
             .into(),
         ));
@@ -888,65 +888,155 @@ fn parse_sos_header(
     Ok(scan_comps)
 }
 
-/// Precomputed cosine table for separable 8x8 IDCT:
-/// `cos_tab[n][k] = cos((2 * n + 1) * k * PI / 16)` for `n in 0..4`, `k in 0..8`.
-fn build_idct_cos_table() -> [[f64; 8]; 4] {
-    let mut table = [[0.0f64; 8]; 4];
-    for (n, row) in table.iter_mut().enumerate() {
-        for (k, cell) in row.iter_mut().enumerate() {
-            *cell = ((2 * n + 1) as f64 * (k as f64) * PI / 16.0).cos();
-        }
-    }
-    table
+// ── Fixed-point integer IDCT (ITU-T T.81 A.3.3, Loeffler/Ligtenberg/Moschytz) ──
+//
+// Separable 2D 8x8 IDCT using the well-known 13-bit fixed-point butterfly
+// (the "islow" factorisation used by the IJG reference decoder). Column pass
+// first, keeping `IDCT_PASS1_BITS` of extra precision in the workspace, then
+// the row pass descales, level-shifts by +128 and clamps to `0..=255`.
+// Accuracy is within ±1 LSB of the exact floating-point IDCT (IEEE 1180).
+
+const IDCT_CONST_BITS: u32 = 13;
+const IDCT_PASS1_BITS: u32 = 2;
+
+const FIX_0_298631336: i64 = 2446;
+const FIX_0_390180644: i64 = 3196;
+const FIX_0_541196100: i64 = 4433;
+const FIX_0_765366865: i64 = 6270;
+const FIX_0_899976223: i64 = 7373;
+const FIX_1_175875602: i64 = 9633;
+const FIX_1_501321110: i64 = 12299;
+const FIX_1_847759065: i64 = 15137;
+const FIX_1_961570560: i64 = 16069;
+const FIX_2_053119869: i64 = 16819;
+const FIX_2_562915447: i64 = 20995;
+const FIX_3_072711026: i64 = 25172;
+
+/// Dequantized coefficients are clamped to this magnitude before the IDCT.
+/// Legal 8-bit JPEG data never exceeds ±2^14 after dequantization, so this
+/// only bounds hostile 16-bit DQT products and keeps every intermediate value
+/// comfortably inside `i64`.
+const MAX_DEQUANT_COEFF: i32 = 1 << 16;
+
+/// Rounding arithmetic right shift (`x / 2^n`, rounded half up).
+#[inline(always)]
+fn descale(x: i64, n: u32) -> i64 {
+    (x + (1i64 << (n - 1))) >> n
 }
 
-/// Separable 2D 8x8 Inverse Discrete Cosine Transform (ITU-T T.81 Section A.3.3)
-/// with level-shift `+128.0` and clamping to `0..=255`.
-fn idct_8x8(coeff: &[f64; 64], out: &mut [u8; 64], cos_tab: &[[f64; 8]; 4]) {
-    if coeff[1..].iter().all(|&c| c == 0.0) {
-        let val = (coeff[0] * 0.125 + 128.0).round().clamp(0.0, 255.0) as u8;
-        out.fill(val);
+#[inline(always)]
+fn clamp_u8(v: i64) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+/// One 1D 8-point IDCT butterfly. Returns the eight outputs scaled by
+/// `2^IDCT_CONST_BITS` (not yet descaled).
+#[inline(always)]
+fn idct_1d(c: [i64; 8]) -> [i64; 8] {
+    // Even part.
+    let z2 = c[2];
+    let z3 = c[6];
+    let z1 = (z2 + z3) * FIX_0_541196100;
+    let tmp2 = z1 - z3 * FIX_1_847759065;
+    let tmp3 = z1 + z2 * FIX_0_765366865;
+
+    let tmp0 = (c[0] + c[4]) << IDCT_CONST_BITS;
+    let tmp1 = (c[0] - c[4]) << IDCT_CONST_BITS;
+
+    let tmp10 = tmp0 + tmp3;
+    let tmp13 = tmp0 - tmp3;
+    let tmp11 = tmp1 + tmp2;
+    let tmp12 = tmp1 - tmp2;
+
+    // Odd part.
+    let mut t0 = c[7];
+    let mut t1 = c[5];
+    let mut t2 = c[3];
+    let mut t3 = c[1];
+
+    let mut z1 = t0 + t3;
+    let mut z2 = t1 + t2;
+    let mut z3 = t0 + t2;
+    let mut z4 = t1 + t3;
+    let z5 = (z3 + z4) * FIX_1_175875602;
+
+    t0 *= FIX_0_298631336;
+    t1 *= FIX_2_053119869;
+    t2 *= FIX_3_072711026;
+    t3 *= FIX_1_501321110;
+    z1 *= -FIX_0_899976223;
+    z2 *= -FIX_2_562915447;
+    z3 *= -FIX_1_961570560;
+    z4 *= -FIX_0_390180644;
+
+    z3 += z5;
+    z4 += z5;
+
+    t0 += z1 + z3;
+    t1 += z2 + z4;
+    t2 += z2 + z3;
+    t3 += z1 + z4;
+
+    [
+        tmp10 + t3,
+        tmp11 + t2,
+        tmp12 + t1,
+        tmp13 + t0,
+        tmp13 - t0,
+        tmp12 - t1,
+        tmp11 - t2,
+        tmp10 - t3,
+    ]
+}
+
+/// Separable 2D 8x8 fixed-point integer IDCT on dequantized coefficients in
+/// natural (row-major) order, with level-shift `+128` and clamping to `0..=255`.
+fn idct_8x8_int(coeff: &[i32; 64], out: &mut [u8; 64]) {
+    // DC-only fast path: every output pixel is DC/8 + 128.
+    if coeff[1..].iter().all(|&c| c == 0) {
+        let dc = i64::from(coeff[0].clamp(-MAX_DEQUANT_COEFF, MAX_DEQUANT_COEFF));
+        out.fill(clamp_u8(descale(dc, 3) + 128));
         return;
     }
 
-    let mut tmp = [0.0f64; 64];
+    let mut ws = [0i64; 64];
 
-    // Row 1D IDCT pass
-    for r in 0..8 {
-        let base = r * 8;
-        let c0 = coeff[base] * FRAC_1_SQRT_2;
-        let c1 = coeff[base + 1];
-        let c2 = coeff[base + 2];
-        let c3 = coeff[base + 3];
-        let c4 = coeff[base + 4];
-        let c5 = coeff[base + 5];
-        let c6 = coeff[base + 6];
-        let c7 = coeff[base + 7];
-        for n in 0..4 {
-            let cos_row = &cos_tab[n];
-            let even = 0.5 * (c0 + c2 * cos_row[2] + c4 * cos_row[4] + c6 * cos_row[6]);
-            let odd = 0.5 * (c1 * cos_row[1] + c3 * cos_row[3] + c5 * cos_row[5] + c7 * cos_row[7]);
-            tmp[base + n] = even + odd;
-            tmp[base + (7 - n)] = even - odd;
+    // Pass 1: columns, results scaled up by 2^IDCT_PASS1_BITS.
+    for col in 0..8 {
+        let mut c = [0i64; 8];
+        for (row, slot) in c.iter_mut().enumerate() {
+            *slot = i64::from(coeff[row * 8 + col].clamp(-MAX_DEQUANT_COEFF, MAX_DEQUANT_COEFF));
+        }
+        if c[1..].iter().all(|&v| v == 0) {
+            // Column AC-zero fast path: the column is flat.
+            let dc = c[0] << IDCT_PASS1_BITS;
+            for row in 0..8 {
+                ws[row * 8 + col] = dc;
+            }
+            continue;
+        }
+        let r = idct_1d(c);
+        for (row, &v) in r.iter().enumerate() {
+            ws[row * 8 + col] = descale(v, IDCT_CONST_BITS - IDCT_PASS1_BITS);
         }
     }
 
-    // Column 1D IDCT pass + level shift
-    for col in 0..8 {
-        let c0 = tmp[col] * FRAC_1_SQRT_2;
-        let c1 = tmp[8 + col];
-        let c2 = tmp[16 + col];
-        let c3 = tmp[24 + col];
-        let c4 = tmp[32 + col];
-        let c5 = tmp[40 + col];
-        let c6 = tmp[48 + col];
-        let c7 = tmp[56 + col];
-        for n in 0..4 {
-            let cos_row = &cos_tab[n];
-            let even = 0.5 * (c0 + c2 * cos_row[2] + c4 * cos_row[4] + c6 * cos_row[6]);
-            let odd = 0.5 * (c1 * cos_row[1] + c3 * cos_row[3] + c5 * cos_row[5] + c7 * cos_row[7]);
-            out[n * 8 + col] = (even + odd + 128.0).round().clamp(0.0, 255.0) as u8;
-            out[(7 - n) * 8 + col] = (even - odd + 128.0).round().clamp(0.0, 255.0) as u8;
+    // Pass 2: rows, final descale by 2^(CONST_BITS + PASS1_BITS + 3)
+    // (the +3 is the 1/8 normalisation of the 2D transform).
+    const FINAL_SHIFT: u32 = IDCT_CONST_BITS + IDCT_PASS1_BITS + 3;
+    for row in 0..8 {
+        let base = row * 8;
+        let mut c = [0i64; 8];
+        c.copy_from_slice(&ws[base..base + 8]);
+        let dst = &mut out[base..base + 8];
+        if c[1..].iter().all(|&v| v == 0) {
+            // Row AC-zero fast path.
+            dst.fill(clamp_u8(descale(c[0], IDCT_PASS1_BITS + 3) + 128));
+            continue;
+        }
+        let r = idct_1d(c);
+        for (d, &v) in dst.iter_mut().zip(r.iter()) {
+            *d = clamp_u8(descale(v, FINAL_SHIFT) + 128);
         }
     }
 }
@@ -955,7 +1045,6 @@ struct BlockTables<'a> {
     dc_table: &'a HuffmanTable,
     ac_table: &'a HuffmanTable,
     qt: &'a [i32; 64],
-    cos_tab: &'a [[f64; 8]; 4],
 }
 
 enum BlockDecodeOutcome {
@@ -1033,13 +1122,13 @@ fn decode_block(
         k += 1;
     }
 
-    let mut dequant = [0.0f64; 64];
+    let mut dequant = [0i32; 64];
     for (idx, (&coeff, &q)) in zz.iter().zip(tables.qt.iter()).enumerate() {
-        dequant[ZIGZAG[idx]] = (coeff as f64) * (q as f64);
+        dequant[ZIGZAG[idx]] = coeff.saturating_mul(q);
     }
 
     let mut pixels = [0u8; 64];
-    idct_8x8(&dequant, &mut pixels, tables.cos_tab);
+    idct_8x8_int(&dequant, &mut pixels);
     if hit_early_eoi {
         Ok(BlockDecodeOutcome::PartialBeforeEoi(pixels))
     } else {
@@ -1054,7 +1143,6 @@ struct ScanDecodeCtx<'a> {
     dc_tables: &'a [Option<HuffmanTable>; 4],
     ac_tables: &'a [Option<HuffmanTable>; 4],
     restart_interval: usize,
-    cos_tab: &'a [[f64; 8]; 4],
 }
 
 fn expected_scan_blocks(frame: &FrameHeader, scan_comps: &[ScanComponent]) -> usize {
@@ -1107,7 +1195,6 @@ fn decode_scan(
             qt: ctx.qt_tables[comp.qt_id]
                 .as_ref()
                 .ok_or_else(|| RsError::InvalidData("Missing JPEG quantization table".into()))?,
-            cos_tab: ctx.cos_tab,
         };
 
         let mut mcu_idx = 0usize;
@@ -1153,7 +1240,6 @@ fn decode_scan(
                         qt: ctx.qt_tables[comp.qt_id].as_ref().ok_or_else(|| {
                             RsError::InvalidData("Missing JPEG quantization table".into())
                         })?,
-                        cos_tab: ctx.cos_tab,
                     };
 
                     for by in 0..comp.v_samp {
@@ -1187,6 +1273,31 @@ fn decode_scan(
     Ok(bit_reader.finish_scan_position())
 }
 
+/// JFIF full-range YCbCr -> RGB in 16-bit fixed point:
+///
+/// ```text
+/// R = Y + 1.402    * Cr'
+/// G = Y - 0.344136 * Cb' - 0.714136 * Cr'
+/// B = Y + 1.772    * Cb'
+/// ```
+///
+/// with `Cb' = Cb - 128`, `Cr' = Cr - 128`, constants scaled by `2^16` and
+/// rounded (`+ 32768`) before the shift.
+#[inline(always)]
+fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let y = i32::from(y);
+    let cb = i32::from(cb) - 128;
+    let cr = i32::from(cr) - 128;
+    let r = y + ((91_881 * cr + 32_768) >> 16);
+    let g = y - ((22_554 * cb + 46_802 * cr + 32_768) >> 16);
+    let b = y + ((116_130 * cb + 32_768) >> 16);
+    [
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    ]
+}
+
 fn assemble_rgb24(frame: &FrameHeader, planes: &[CompPlane]) -> RsResult<Vec<u8>> {
     let width = frame.width;
     let height = frame.height;
@@ -1195,58 +1306,85 @@ fn assemble_rgb24(frame: &FrameHeader, planes: &[CompPlane]) -> RsResult<Vec<u8>
         .and_then(|px| px.checked_mul(3))
         .ok_or_else(|| RsError::InvalidData("JPEG frame size overflow".into()))?;
     let mut rgb = vec![0u8; total_bytes];
+    let row_bytes = width * 3;
 
     if frame.components.len() == 1 {
-        let y_comp = &frame.components[0];
+        // A single component always has the maximum sampling factors, so the
+        // plane maps 1:1 onto output pixels.
         let y_plane = &planes[0];
-        for y in 0..height {
-            let yy = y * y_comp.v_samp / frame.max_v;
-            let row_off = yy * y_plane.stride;
-            for x in 0..width {
-                let yx = x * y_comp.h_samp / frame.max_h;
-                let v = y_plane.data[row_off + yx];
-                let dst = (y * width + x) * 3;
-                rgb[dst] = v;
-                rgb[dst + 1] = v;
-                rgb[dst + 2] = v;
+        for (y, dst_row) in rgb.chunks_exact_mut(row_bytes).enumerate() {
+            let src = &y_plane.data[y * y_plane.stride..y * y_plane.stride + width];
+            for (dst, &v) in dst_row.chunks_exact_mut(3).zip(src) {
+                dst[0] = v;
+                dst[1] = v;
+                dst[2] = v;
             }
         }
-    } else {
-        let y_comp = &frame.components[0];
-        let cb_comp = &frame.components[1];
-        let cr_comp = &frame.components[2];
-        let y_plane = &planes[0];
-        let cb_plane = &planes[1];
-        let cr_plane = &planes[2];
+        return Ok(rgb);
+    }
 
-        for y in 0..height {
-            let yy = y * y_comp.v_samp / frame.max_v;
-            let cby = y * cb_comp.v_samp / frame.max_v;
-            let cry = y * cr_comp.v_samp / frame.max_v;
-            let y_row = yy * y_plane.stride;
-            let cb_row = cby * cb_plane.stride;
-            let cr_row = cry * cr_plane.stride;
+    let y_comp = &frame.components[0];
+    let cb_comp = &frame.components[1];
+    let cr_comp = &frame.components[2];
+    let y_plane = &planes[0];
+    let cb_plane = &planes[1];
+    let cr_plane = &planes[2];
 
-            for x in 0..width {
-                let yx = x * y_comp.h_samp / frame.max_h;
-                let cbx = x * cb_comp.h_samp / frame.max_h;
-                let crx = x * cr_comp.h_samp / frame.max_h;
+    let luma_full = y_comp.h_samp == frame.max_h && y_comp.v_samp == frame.max_v;
+    let chroma_1x1 =
+        cb_comp.h_samp == 1 && cb_comp.v_samp == 1 && cr_comp.h_samp == 1 && cr_comp.v_samp == 1;
 
-                let y_val = f64::from(y_plane.data[y_row + yx]);
-                let cb_val = f64::from(cb_plane.data[cb_row + cbx]) - 128.0;
-                let cr_val = f64::from(cr_plane.data[cr_row + crx]) - 128.0;
-
-                let r = (y_val + 1.402 * cr_val).round().clamp(0.0, 255.0) as u8;
-                let g = (y_val - 0.344136 * cb_val - 0.714136 * cr_val)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                let b = (y_val + 1.772 * cb_val).round().clamp(0.0, 255.0) as u8;
-
-                let dst = (y * width + x) * 3;
-                rgb[dst] = r;
-                rgb[dst + 1] = g;
-                rgb[dst + 2] = b;
+    if luma_full && chroma_1x1 && frame.max_h <= 2 && frame.max_v <= 2 && frame.max_h >= frame.max_v
+    {
+        // Fast paths: 4:4:4 (1x1), 4:2:2 (2x1) and 4:2:0 (2x2). Chroma
+        // coordinates are plain shifts of the luma coordinates — no divisions.
+        let h_shift = u32::from(frame.max_h == 2);
+        let v_shift = u32::from(frame.max_v == 2);
+        for (y, dst_row) in rgb.chunks_exact_mut(row_bytes).enumerate() {
+            let y_row = &y_plane.data[y * y_plane.stride..y * y_plane.stride + width];
+            let cy = y >> v_shift;
+            let cb_row = &cb_plane.data[cy * cb_plane.stride..];
+            let cr_row = &cr_plane.data[cy * cr_plane.stride..];
+            if h_shift == 0 {
+                // 4:4:4
+                for (((dst, &yv), &cb), &cr) in dst_row
+                    .chunks_exact_mut(3)
+                    .zip(y_row)
+                    .zip(&cb_row[..width])
+                    .zip(&cr_row[..width])
+                {
+                    dst.copy_from_slice(&ycbcr_to_rgb(yv, cb, cr));
+                }
+            } else {
+                // 4:2:2 / 4:2:0: each chroma sample covers two luma columns.
+                for (x, (dst, &yv)) in dst_row.chunks_exact_mut(3).zip(y_row).enumerate() {
+                    let cx = x >> 1;
+                    dst.copy_from_slice(&ycbcr_to_rgb(yv, cb_row[cx], cr_row[cx]));
+                }
             }
+        }
+        return Ok(rgb);
+    }
+
+    // General integer fallback for any other sampling ratio (4:1:1, 4:4:0,
+    // subsampled luma, ...).
+    for (y, dst_row) in rgb.chunks_exact_mut(row_bytes).enumerate() {
+        let yy = y * y_comp.v_samp / frame.max_v;
+        let cby = y * cb_comp.v_samp / frame.max_v;
+        let cry = y * cr_comp.v_samp / frame.max_v;
+        let y_row = yy * y_plane.stride;
+        let cb_row = cby * cb_plane.stride;
+        let cr_row = cry * cr_plane.stride;
+
+        for (x, dst) in dst_row.chunks_exact_mut(3).enumerate() {
+            let yx = x * y_comp.h_samp / frame.max_h;
+            let cbx = x * cb_comp.h_samp / frame.max_h;
+            let crx = x * cr_comp.h_samp / frame.max_h;
+            dst.copy_from_slice(&ycbcr_to_rgb(
+                y_plane.data[y_row + yx],
+                cb_plane.data[cb_row + cbx],
+                cr_plane.data[cr_row + crx],
+            ));
         }
     }
 
@@ -1267,7 +1405,6 @@ fn decode_baseline_jpeg(data: &[u8]) -> RsResult<DecodedImage> {
     let mut restart_interval: usize = 0;
     let mut decoded_scan = false;
     let mut saw_eoi = false;
-    let cos_tab = build_idct_cos_table();
 
     while pos < data.len() {
         if data[pos] != 0xFF {
@@ -1306,7 +1443,7 @@ fn decode_baseline_jpeg(data: &[u8]) -> RsResult<DecodedImage> {
                     "Progressive JPEG (SOF2) is not supported".into(),
                 ));
             }
-            0xC1 | 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
                 return Err(RsError::Unsupported(
                     format!("Unsupported JPEG SOF marker 0xFF{marker:02X}").into(),
                 ));
@@ -1329,11 +1466,15 @@ fn decode_baseline_jpeg(data: &[u8]) -> RsResult<DecodedImage> {
                 match marker {
                     0xDB => parse_dqt(seg_payload, &mut qt_tables)?,
                     0xC4 => parse_dht(seg_payload, &mut dc_tables, &mut ac_tables)?,
-                    0xC0 => {
+                    // SOF0 (Baseline DCT) and SOF1 (Extended Sequential DCT,
+                    // Huffman). With 8-bit precision and Ss=0/Se=63/AhAl=0
+                    // scans (enforced by `parse_sof` / `parse_sos_header`) the
+                    // two decode identically.
+                    0xC0 | 0xC1 => {
                         if frame_header.is_some() {
-                            return Err(RsError::InvalidData("Duplicate JPEG SOF0 marker".into()));
+                            return Err(RsError::InvalidData("Duplicate JPEG SOF marker".into()));
                         }
-                        frame_header = Some(parse_sof0(seg_payload)?);
+                        frame_header = Some(parse_sof(seg_payload)?);
                     }
                     0xDD => {
                         if seg_payload.len() != 2 {
@@ -1382,7 +1523,6 @@ fn decode_baseline_jpeg(data: &[u8]) -> RsResult<DecodedImage> {
                             dc_tables: &dc_tables,
                             ac_tables: &ac_tables,
                             restart_interval,
-                            cos_tab: &cos_tab,
                         };
                         pos = decode_scan(data, pos, &scan_ctx, comp_planes)?;
                         decoded_scan = true;
@@ -1426,6 +1566,7 @@ mod tests {
     use crate::packet::PacketFlags;
     use bytes::Bytes;
     use rsmpeg_util::Rational;
+    use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
     #[derive(Clone, Copy)]
     struct HuffEncEntry {
@@ -2323,5 +2464,352 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].width, 16);
         assert_eq!(frames[0].height, 8);
+    }
+
+    /// Floating-point reference IDCT (direct ITU-T T.81 A.3.3 formula) with
+    /// level shift, round-half-away-from-zero and clamping.
+    fn reference_idct(coeff: &[i32; 64]) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                let mut sum = 0.0f64;
+                for v in 0..8 {
+                    let cv = if v == 0 { FRAC_1_SQRT_2 } else { 1.0 };
+                    let cos_y = ((2 * y + 1) as f64 * v as f64 * PI / 16.0).cos();
+                    for u in 0..8 {
+                        let cu = if u == 0 { FRAC_1_SQRT_2 } else { 1.0 };
+                        let cos_x = ((2 * x + 1) as f64 * u as f64 * PI / 16.0).cos();
+                        sum += cu * cv * f64::from(coeff[v * 8 + u]) * cos_x * cos_y;
+                    }
+                }
+                out[y * 8 + x] = (sum / 4.0 + 128.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out
+    }
+
+    /// Small deterministic xorshift PRNG for reproducible fixtures.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % (hi - lo + 1) as u64) as i32
+        }
+    }
+
+    fn max_idct_error(coeff: &[i32; 64]) -> i32 {
+        let mut got = [0u8; 64];
+        idct_8x8_int(coeff, &mut got);
+        let exp = reference_idct(coeff);
+        got.iter()
+            .zip(exp.iter())
+            .map(|(&g, &e)| (i32::from(g) - i32::from(e)).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn integer_idct_matches_float_reference_within_one_lsb() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        // IEEE 1180-style random blocks at several dynamic ranges, plus
+        // sparse blocks that exercise the row/column AC-zero fast paths.
+        for &(lo, hi) in &[(-256, 255), (-5, 5), (-300, 300), (-40, 40)] {
+            for _ in 0..2_000 {
+                let mut c = [0i32; 64];
+                for v in c.iter_mut() {
+                    *v = rng.range(lo, hi);
+                }
+                assert!(max_idct_error(&c) <= 1, "dense block {c:?}");
+
+                let mut sparse = [0i32; 64];
+                sparse[0] = rng.range(-1024, 1016);
+                for _ in 0..3 {
+                    let idx = (rng.next() % 64) as usize;
+                    sparse[idx] = rng.range(lo, hi);
+                }
+                assert!(max_idct_error(&sparse) <= 1, "sparse block {sparse:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn integer_idct_known_fixtures() {
+        // DC-only: DC/8 + 128 everywhere.
+        let mut c = [0i32; 64];
+        let mut out = [0u8; 64];
+        for (dc, expected) in [(0, 128u8), (80, 138), (-80, 118), (1016, 255), (-1024, 0)] {
+            c[0] = dc;
+            idct_8x8_int(&c, &mut out);
+            assert!(out.iter().all(|&p| p == expected), "dc={dc}: {out:?}");
+        }
+        // Huge (hostile 16-bit DQT) products clamp instead of overflowing.
+        c[0] = i32::MAX;
+        c[63] = i32::MIN;
+        idct_8x8_int(&c, &mut out);
+        let _ = out;
+
+        // A single horizontal first-harmonic: columns are flat, rows vary
+        // monotonically from left to right (cos((2x+1)π/16) decreases).
+        let mut h = [0i32; 64];
+        h[1] = 200;
+        idct_8x8_int(&h, &mut out);
+        assert_eq!(out, reference_idct(&h));
+        for row in out.chunks_exact(8) {
+            assert_eq!(row, &out[..8], "every row must be identical");
+            assert!(row.windows(2).all(|w| w[0] >= w[1]), "{row:?}");
+        }
+        // The vertical counterpart is the transpose.
+        let mut v = [0i32; 64];
+        v[8] = 200;
+        let mut out_v = [0u8; 64];
+        idct_8x8_int(&v, &mut out_v);
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(out_v[y * 8 + x], out[x * 8 + y]);
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_point_ycbcr_matches_float_jfif_within_one() {
+        for y in (0..=255u8).step_by(5) {
+            for cb in (0..=255u8).step_by(3) {
+                for cr in (0..=255u8).step_by(7) {
+                    let [r, g, b] = ycbcr_to_rgb(y, cb, cr);
+                    let yf = f64::from(y);
+                    let cbf = f64::from(cb) - 128.0;
+                    let crf = f64::from(cr) - 128.0;
+                    let rf = (yf + 1.402 * crf).round().clamp(0.0, 255.0);
+                    let gf = (yf - 0.344136 * cbf - 0.714136 * crf)
+                        .round()
+                        .clamp(0.0, 255.0);
+                    let bf = (yf + 1.772 * cbf).round().clamp(0.0, 255.0);
+                    for (got, exp) in [(r, rf), (g, gf), (b, bf)] {
+                        assert!(
+                            (f64::from(got) - exp).abs() <= 1.0,
+                            "Y={y} Cb={cb} Cr={cr}: {got} vs {exp}"
+                        );
+                    }
+                }
+            }
+        }
+        // Neutral chroma is exact grey.
+        assert_eq!(ycbcr_to_rgb(77, 128, 128), [77, 77, 77]);
+    }
+
+    fn assert_rgb_close(got: &[u8], exp: &[u8], tol: i16, label: &str) {
+        assert_eq!(got.len(), exp.len(), "{label}: size mismatch");
+        for (i, (g, e)) in got.chunks_exact(3).zip(exp.chunks_exact(3)).enumerate() {
+            for c in 0..3 {
+                let diff = (i16::from(g[c]) - i16::from(e[c])).abs();
+                assert!(
+                    diff <= tol,
+                    "{label} px {i} ch {c}: got {} vs {}",
+                    g[c],
+                    e[c]
+                );
+            }
+        }
+    }
+
+    /// Smooth RGB image whose chroma is constant over 4x2 cells, so every
+    /// supported subsampling ratio reproduces it closely.
+    fn smooth_rgb(w: usize, h: usize) -> Vec<u8> {
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) * 3;
+                let cell = ((x / 4) * 37 + (y / 2) * 53) % 160;
+                rgb[idx] = (40 + cell) as u8;
+                rgb[idx + 1] = (180 - cell / 2) as u8;
+                rgb[idx + 2] = (60 + (cell * 3) % 150) as u8;
+            }
+        }
+        rgb
+    }
+
+    #[test]
+    fn decode_422_fast_path_matches_source() {
+        // Flat 16x8 MCUs per colour: chroma is constant per MCU, so 4:2:2
+        // reconstruction must be near-exact.
+        let w = 32usize;
+        let h = 8usize;
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let color = if x < 16 {
+                    [200u8, 40, 60]
+                } else {
+                    [30, 90, 210]
+                };
+                let idx = (y * w + x) * 3;
+                rgb[idx..idx + 3].copy_from_slice(&color);
+            }
+        }
+        let jpeg = encode_test_jpeg_ycbcr(w, h, &rgb, 2, 1, &TestJpegOpts::default());
+        let mut dec = MjpegDecoder::new();
+        let frames = dec.decode(&make_packet(jpeg)).expect("decode 4:2:2");
+        assert_eq!((frames[0].width, frames[0].height), (32, 8));
+        assert_rgb_close(&frames[0].data[0], &rgb, 4, "4:2:2");
+    }
+
+    #[test]
+    fn decode_general_sampling_fallbacks_411_and_440() {
+        let w = 32usize;
+        let h = 16usize;
+        let rgb = smooth_rgb(w, h);
+        for (y_h, y_v, label) in [(4usize, 1usize, "4:1:1"), (1, 2, "4:4:0")] {
+            let jpeg = encode_test_jpeg_ycbcr(w, h, &rgb, y_h, y_v, &TestJpegOpts::default());
+            let mut dec = MjpegDecoder::new();
+            let frames = dec.decode(&make_packet(jpeg)).expect(label);
+            assert_eq!((frames[0].width, frames[0].height), (w, h), "{label}");
+            // Chroma subsampling is lossy for this pattern; just require it to
+            // stay close (and to agree with the general integer path).
+            assert_rgb_close(&frames[0].data[0], &rgb, 48, label);
+        }
+    }
+
+    #[test]
+    fn fast_paths_agree_with_general_fallback() {
+        // Decode once through the public API (fast path), then re-run the
+        // general per-pixel loop by hand on a frame header that forces it.
+        let w = 24usize;
+        let h = 16usize;
+        let rgb = smooth_rgb(w, h);
+        for (y_h, y_v) in [(1usize, 1usize), (2, 1), (2, 2)] {
+            let jpeg = encode_test_jpeg_ycbcr(w, h, &rgb, y_h, y_v, &TestJpegOpts::default());
+            let mut dec = MjpegDecoder::new();
+            let fast = dec.decode(&make_packet(jpeg)).expect("decode")[0].data[0].clone();
+            assert_rgb_close(&fast, &rgb, 12, "fast path vs source");
+
+            // Synthesize planes and compare fast vs general on the same data.
+            let comps = vec![
+                ComponentInfo {
+                    id: 1,
+                    h_samp: y_h,
+                    v_samp: y_v,
+                    qt_id: 0,
+                },
+                ComponentInfo {
+                    id: 2,
+                    h_samp: 1,
+                    v_samp: 1,
+                    qt_id: 0,
+                },
+                ComponentInfo {
+                    id: 3,
+                    h_samp: 1,
+                    v_samp: 1,
+                    qt_id: 0,
+                },
+            ];
+            let frame = FrameHeader {
+                width: w,
+                height: h,
+                components: comps,
+                max_h: y_h,
+                max_v: y_v,
+                mcu_cols: w.div_ceil(8 * y_h),
+                mcu_rows: h.div_ceil(8 * y_v),
+            };
+            let mut planes = Vec::new();
+            let mut rng = XorShift(7 + (y_h * 10 + y_v) as u64);
+            for c in &frame.components {
+                let mut p =
+                    CompPlane::try_new(frame.mcu_cols * c.h_samp, frame.mcu_rows * c.v_samp)
+                        .unwrap();
+                for b in p.data.iter_mut() {
+                    *b = (rng.next() & 0xFF) as u8;
+                }
+                planes.push(p);
+            }
+            let fast_out = assemble_rgb24(&frame, &planes).unwrap();
+            let mut general = vec![0u8; w * h * 3];
+            for y in 0..h {
+                for x in 0..w {
+                    let yv = planes[0].data[y * planes[0].stride + x];
+                    let cy = y / y_v;
+                    let cx = x / y_h;
+                    let cb = planes[1].data[cy * planes[1].stride + cx];
+                    let cr = planes[2].data[cy * planes[2].stride + cx];
+                    general[(y * w + x) * 3..(y * w + x) * 3 + 3]
+                        .copy_from_slice(&ycbcr_to_rgb(yv, cb, cr));
+                }
+            }
+            assert_eq!(fast_out, general, "{y_h}x{y_v} fast path diverged");
+        }
+    }
+
+    fn to_sof1(mut jpeg: Vec<u8>) -> Vec<u8> {
+        let pos = jpeg
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC0])
+            .expect("SOF0 present");
+        jpeg[pos + 1] = 0xC1;
+        jpeg
+    }
+
+    #[test]
+    fn decode_sof1_extended_sequential_8bit() {
+        let rgb = smooth_rgb(16, 16);
+        let sof0 = encode_test_jpeg_ycbcr(16, 16, &rgb, 2, 2, &TestJpegOpts::default());
+        let sof1 = to_sof1(sof0.clone());
+        assert!(sof1.windows(2).any(|w| w == [0xFF, 0xC1]));
+        assert!(!sof1.windows(2).any(|w| w == [0xFF, 0xC0]));
+
+        let mut dec = MjpegDecoder::new();
+        let a = dec.decode(&make_packet(sof0)).expect("SOF0")[0].data[0].clone();
+        let b = dec.decode(&make_packet(sof1)).expect("SOF1")[0].data[0].clone();
+        assert_eq!(a, b, "8-bit SOF1 must decode identically to SOF0");
+
+        // Gray SOF1 too.
+        let gray = vec![77u8; 64];
+        let g = to_sof1(encode_test_jpeg_gray(8, 8, &gray, &TestJpegOpts::default()));
+        let f = dec.decode(&make_packet(g)).expect("gray SOF1");
+        assert!(f[0].data[0].iter().all(|&p| (i16::from(p) - 77).abs() <= 1));
+    }
+
+    #[test]
+    fn sof1_rejects_12_bit_precision_and_duplicate_sof() {
+        let gray = vec![77u8; 64];
+        let mut jpeg = to_sof1(encode_test_jpeg_gray(8, 8, &gray, &TestJpegOpts::default()));
+        let pos = jpeg.windows(2).position(|w| w == [0xFF, 0xC1]).unwrap();
+        // Precision byte follows the 2-byte segment length.
+        jpeg[pos + 4] = 12;
+        let mut dec = MjpegDecoder::new();
+        assert!(matches!(
+            dec.decode(&make_packet(jpeg)),
+            Err(RsError::Unsupported(_))
+        ));
+
+        // SOF0 followed by SOF1 is a duplicate frame header.
+        let base = encode_test_jpeg_gray(8, 8, &gray, &TestJpegOpts::default());
+        let sof_pos = base.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        let sof_seg = base[sof_pos..sof_pos + 2 + 11].to_vec();
+        let mut dup = base[..sof_pos + 13].to_vec();
+        let mut second = sof_seg;
+        second[1] = 0xC1;
+        dup.extend_from_slice(&second);
+        dup.extend_from_slice(&base[sof_pos + 13..]);
+        assert!(matches!(
+            dec.decode(&make_packet(dup)),
+            Err(RsError::InvalidData(_))
+        ));
+
+        // Other SOF types stay unsupported.
+        let mut sof3 = encode_test_jpeg_gray(8, 8, &gray, &TestJpegOpts::default());
+        let p3 = sof3.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        sof3[p3 + 1] = 0xC3;
+        assert!(matches!(
+            dec.decode(&make_packet(sof3)),
+            Err(RsError::Unsupported(_))
+        ));
     }
 }

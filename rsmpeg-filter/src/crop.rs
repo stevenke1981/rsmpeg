@@ -26,6 +26,9 @@ impl CropFilter {
     /// for RGBA, `frame.data[0]` is a single tightly-packed plane. If the clamped
     /// region has zero area (or the source is empty), the frame is left unchanged.
     pub fn apply(&self, frame: &mut Frame) {
+        if frame.pixel_format != rsmpeg_util::PixelFormat::Rgba {
+            return;
+        }
         let sw = frame.width;
         let sh = frame.height;
         if sw == 0 || sh == 0 {
@@ -38,23 +41,40 @@ impl CropFilter {
         if w == 0 || h == 0 {
             return;
         }
-        let stride = 4usize;
+        let Some(src_row_bytes) = sw.checked_mul(4) else {
+            return;
+        };
+        let src_stride = frame
+            .linesize
+            .first()
+            .copied()
+            .filter(|&ls| ls >= src_row_bytes)
+            .unwrap_or(src_row_bytes);
+        let Some(needed) = sh
+            .checked_sub(1)
+            .and_then(|r| r.checked_mul(src_stride))
+            .and_then(|o| o.checked_add(src_row_bytes))
+        else {
+            return;
+        };
         // Refuse to read outside the packed RGBA plane: a missing or truncated
         // plane leaves the frame unchanged instead of panicking.
         let Some(src) = frame.data.first() else {
             return;
         };
-        if src.len() < sw * sh * stride {
+        if src.len() < needed {
             return;
         }
-        let mut out = vec![0u8; w * h * stride];
+        let out_row_bytes = w * 4;
+        let mut out = vec![0u8; out_row_bytes * h];
+        let x_off = x * 4;
         for row in 0..h {
-            let s_row = (y + row) * sw * stride + x * stride;
-            let d_row = row * w * stride;
-            out[d_row..(w * stride + d_row)].copy_from_slice(&src[s_row..(w * stride + s_row)]);
+            let s_row = (y + row) * src_stride + x_off;
+            let d_row = row * out_row_bytes;
+            out[d_row..d_row + out_row_bytes].copy_from_slice(&src[s_row..s_row + out_row_bytes]);
         }
         frame.data = vec![out];
-        frame.linesize = vec![w * stride];
+        frame.linesize = vec![out_row_bytes];
         frame.width = w;
         frame.height = h;
     }
@@ -103,7 +123,7 @@ mod tests {
         }
         let mut frame = Frame::new_video(width, height, PixelFormat::Rgba);
         frame.data[0] = data;
-        frame.linesize[0] = n * 4;
+        frame.linesize[0] = width * 4;
         frame
     }
 
@@ -217,5 +237,30 @@ mod tests {
         // Metadata is untouched by the geometry change.
         assert_eq!(frame.pts, Some(42));
         assert_eq!(frame.pixel_format, PixelFormat::Rgba);
+    }
+
+    #[test]
+    fn crop_non_rgba_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        let orig = frame.data.clone();
+        CropFilter::new(0, 0, 1, 1).apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (2, 2));
+        assert_eq!(frame.data, orig);
+    }
+
+    #[test]
+    fn crop_honors_padded_linesize_and_1x1() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        let stride = 12usize; // 2 * 4 = 8 active + 4 padding
+        let mut buf = vec![0xEEu8; stride * 2];
+        buf[0..8].copy_from_slice(&[1, 2, 3, 255, 4, 5, 6, 255]);
+        buf[stride..stride + 8].copy_from_slice(&[7, 8, 9, 255, 10, 11, 12, 128]);
+        frame.data[0] = buf;
+        frame.linesize[0] = stride;
+
+        CropFilter::new(1, 1, 1, 1).apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (1, 1));
+        assert_eq!(frame.linesize, vec![4]);
+        assert_eq!(frame.data[0], vec![10, 11, 12, 128]);
     }
 }

@@ -1,26 +1,86 @@
-use rsmpeg_util::RsResult;
+use rsmpeg_util::{RsError, RsResult};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// Capacity of the read/write buffers wrapped around on-disk files.
+///
+/// Demuxers issue many tiny (1–8 byte) reads while walking box / element /
+/// chunk headers; without a buffer every one of those is an OS syscall.
+const FILE_BUFFER_CAPACITY: usize = 64 * 1024;
+
 /// I/O abstraction for media file access.
+///
+/// * [`FileReader`](IOContext::FileReader) — buffered, read-only file input
+///   ([`open_file`](IOContext::open_file)).
+/// * [`FileWriter`](IOContext::FileWriter) — buffered, write-only file output
+///   ([`create_file`](IOContext::create_file)).
+/// * [`Buffer`](IOContext::Buffer) — an in-memory cursor that supports both
+///   reading and writing ([`from_buffer`](IOContext::from_buffer),
+///   [`from_output_buffer`](IOContext::from_output_buffer)).
 pub enum IOContext {
-    File(File),
-    Buffer(std::io::Cursor<Vec<u8>>),
+    FileReader(BufReader<File>),
+    FileWriter(BufWriter<File>),
+    Buffer(Cursor<Vec<u8>>),
+}
+
+fn unsupported(msg: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Unsupported, msg)
 }
 
 impl IOContext {
+    /// Open an existing file for buffered reading.
     pub fn open_file(path: impl AsRef<Path>) -> RsResult<Self> {
-        Ok(IOContext::File(File::open(path.as_ref())?))
+        let file = File::open(path.as_ref())?;
+        Ok(IOContext::FileReader(BufReader::with_capacity(
+            FILE_BUFFER_CAPACITY,
+            file,
+        )))
     }
 
+    /// Create (or truncate) a file for buffered writing.
+    pub fn create_file(path: impl AsRef<Path>) -> RsResult<Self> {
+        let file = File::create(path.as_ref())?;
+        Ok(IOContext::FileWriter(BufWriter::with_capacity(
+            FILE_BUFFER_CAPACITY,
+            file,
+        )))
+    }
+
+    /// Wrap an in-memory buffer (readable and writable, positioned at 0).
     pub fn from_buffer(data: Vec<u8>) -> Self {
-        IOContext::Buffer(std::io::Cursor::new(data))
+        IOContext::Buffer(Cursor::new(data))
+    }
+
+    /// An empty in-memory output buffer, e.g. for muxing into memory.
+    pub fn from_output_buffer() -> Self {
+        Self::from_buffer(Vec::new())
+    }
+
+    /// Borrow the bytes of an in-memory buffer (`None` for file-backed I/O).
+    pub fn buffer_data(&self) -> Option<&[u8]> {
+        match self {
+            IOContext::Buffer(c) => Some(c.get_ref().as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Consume the context and return its in-memory buffer (`None` for files).
+    pub fn into_buffer(self) -> Option<Vec<u8>> {
+        match self {
+            IOContext::Buffer(c) => Some(c.into_inner()),
+            _ => None,
+        }
     }
 
     pub fn read_exact(&mut self, buf: &mut [u8]) -> RsResult<()> {
         match self {
-            IOContext::File(f) => f.read_exact(buf)?,
+            IOContext::FileReader(r) => r.read_exact(buf)?,
+            IOContext::FileWriter(_) => {
+                return Err(RsError::Io(unsupported(
+                    "cannot read from a write-only file IOContext",
+                )))
+            }
             IOContext::Buffer(c) => c.read_exact(buf)?,
         }
         Ok(())
@@ -62,15 +122,47 @@ impl IOContext {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// Seek and return the new absolute position.
+    ///
+    /// For buffered file input, seeks are expressed relative to the current
+    /// position and served with `seek_relative`, so targets that land inside
+    /// the current read buffer (the common "skip a few bytes" / "rewind after
+    /// peek" patterns) do not discard it.
     pub fn seek(&mut self, pos: SeekFrom) -> RsResult<u64> {
         match self {
-            IOContext::File(f) => Ok(f.seek(pos)?),
+            IOContext::FileReader(r) => {
+                let delta = match pos {
+                    SeekFrom::Current(d) => Some(d),
+                    SeekFrom::Start(target) => {
+                        let cur = r.stream_position()?;
+                        if target >= cur {
+                            i64::try_from(target - cur).ok()
+                        } else {
+                            i64::try_from(cur - target).ok().map(|d| -d)
+                        }
+                    }
+                    SeekFrom::End(_) => None,
+                };
+                match delta {
+                    Some(d) => {
+                        r.seek_relative(d)?;
+                        Ok(r.stream_position()?)
+                    }
+                    None => Ok(r.seek(pos)?),
+                }
+            }
+            IOContext::FileWriter(w) => Ok(w.seek(pos)?),
             IOContext::Buffer(c) => Ok(c.seek(pos)?),
         }
     }
 
+    /// Current absolute position. Never discards buffered read data.
     pub fn tell(&mut self) -> RsResult<u64> {
-        self.seek(SeekFrom::Current(0))
+        match self {
+            IOContext::FileReader(r) => Ok(r.stream_position()?),
+            IOContext::FileWriter(w) => Ok(w.stream_position()?),
+            IOContext::Buffer(c) => Ok(c.position()),
+        }
     }
 
     pub fn read_bytes(&mut self, len: usize) -> RsResult<Vec<u8>> {
@@ -120,9 +212,61 @@ impl IOContext {
     /// Unlike [`read_exact`](Self::read_exact) this never fails on a short read.
     pub fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            IOContext::File(f) => f.read(buf),
+            IOContext::FileReader(r) => r.read(buf),
+            IOContext::FileWriter(_) => {
+                Err(unsupported("cannot read from a write-only file IOContext"))
+            }
             IOContext::Buffer(c) => c.read(buf),
         }
+    }
+
+    /// Write the whole buffer at the current position.
+    pub fn write_all(&mut self, buf: &[u8]) -> RsResult<()> {
+        match self {
+            IOContext::FileReader(_) => {
+                return Err(RsError::Io(unsupported(
+                    "cannot write to a read-only file IOContext",
+                )))
+            }
+            IOContext::FileWriter(w) => w.write_all(buf)?,
+            IOContext::Buffer(c) => c.write_all(buf)?,
+        }
+        Ok(())
+    }
+
+    pub fn write_u8(&mut self, val: u8) -> RsResult<()> {
+        self.write_all(&[val])
+    }
+
+    pub fn write_u16_le(&mut self, val: u16) -> RsResult<()> {
+        self.write_all(&val.to_le_bytes())
+    }
+
+    pub fn write_u32_le(&mut self, val: u32) -> RsResult<()> {
+        self.write_all(&val.to_le_bytes())
+    }
+
+    pub fn write_u16_be(&mut self, val: u16) -> RsResult<()> {
+        self.write_all(&val.to_be_bytes())
+    }
+
+    pub fn write_u32_be(&mut self, val: u32) -> RsResult<()> {
+        self.write_all(&val.to_be_bytes())
+    }
+
+    pub fn write_u64_be(&mut self, val: u64) -> RsResult<()> {
+        self.write_all(&val.to_be_bytes())
+    }
+
+    /// Flush buffered output to the underlying file (a no-op for readers and
+    /// in-memory buffers).
+    pub fn flush(&mut self) -> RsResult<()> {
+        match self {
+            IOContext::FileReader(_) => {}
+            IOContext::FileWriter(w) => w.flush()?,
+            IOContext::Buffer(c) => c.flush()?,
+        }
+        Ok(())
     }
 }
 
@@ -233,5 +377,143 @@ mod tests {
         let mut rest = [0u8; 8];
         assert_eq!(io.read(&mut rest).unwrap(), 4, "short read must not error");
         assert_eq!(io.read(&mut rest).unwrap(), 0, "EOF must report 0");
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "rsmpeg_ioctx_{}_{nanos}_{name}",
+            std::process::id()
+        ))
+    }
+
+    fn assert_unsupported(err: &RsError) {
+        assert!(
+            matches!(err, RsError::Io(e) if e.kind() == std::io::ErrorKind::Unsupported),
+            "expected Unsupported I/O error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn buffer_supports_write_then_read_back() {
+        let mut io = IOContext::from_output_buffer();
+        io.write_u8(0xAB).unwrap();
+        io.write_u16_le(0x1234).unwrap();
+        io.write_u32_le(0xDEAD_BEEF).unwrap();
+        io.write_u16_be(0x5678).unwrap();
+        io.write_u32_be(0x0102_0304).unwrap();
+        io.write_u64_be(0x1122_3344_5566_7788).unwrap();
+        io.flush().unwrap();
+        assert_eq!(io.tell().unwrap(), 21);
+
+        io.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(io.read_u8().unwrap(), 0xAB);
+        assert_eq!(io.read_u16_le().unwrap(), 0x1234);
+        assert_eq!(io.read_u32_le().unwrap(), 0xDEAD_BEEF);
+        assert_eq!(io.read_u16_be().unwrap(), 0x5678);
+        assert_eq!(io.read_u32_be().unwrap(), 0x0102_0304);
+        assert_eq!(io.read_u64_be().unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(io.buffer_data().unwrap().len(), 21);
+    }
+
+    #[test]
+    fn buffer_overwrite_in_place_patches_bytes() {
+        let mut io = IOContext::from_output_buffer();
+        io.write_all(&[0u8; 8]).unwrap();
+        io.seek(SeekFrom::Start(2)).unwrap();
+        io.write_u32_le(0x0403_0201).unwrap();
+        io.seek(SeekFrom::End(0)).unwrap();
+        io.write_u8(9).unwrap();
+        assert_eq!(io.into_buffer().unwrap(), vec![0, 0, 1, 2, 3, 4, 0, 0, 9]);
+    }
+
+    #[test]
+    fn file_writer_and_reader_round_trip() {
+        let path = temp_path("rw.bin");
+        {
+            let mut w = IOContext::create_file(&path).unwrap();
+            assert!(w.buffer_data().is_none());
+            w.write_all(b"HEAD").unwrap();
+            w.write_u32_le(0).unwrap();
+            for i in 0..10_000u32 {
+                w.write_u32_be(i).unwrap();
+            }
+            assert_eq!(w.tell().unwrap(), 8 + 40_000);
+            // Patch the placeholder, then return to the end.
+            w.seek(SeekFrom::Start(4)).unwrap();
+            w.write_u32_le(40_000).unwrap();
+            w.seek(SeekFrom::End(0)).unwrap();
+            w.flush().unwrap();
+            // Reading from a writer is unsupported.
+            assert_unsupported(&w.read_u8().unwrap_err());
+            let mut b = [0u8; 1];
+            assert_eq!(
+                w.read(&mut b).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+            assert!(w.peek_prefix(4).is_err());
+        }
+
+        let mut r = IOContext::open_file(&path).unwrap();
+        assert_eq!(r.read_bytes(4).unwrap(), b"HEAD");
+        assert_eq!(r.read_u32_le().unwrap(), 40_000);
+        assert_eq!(r.tell().unwrap(), 8);
+        // Sequential reads across the 64 KiB buffer boundary stay exact.
+        for i in 0..10_000u32 {
+            assert_eq!(r.read_u32_be().unwrap(), i);
+        }
+        assert_eq!(r.tell().unwrap(), 40_008);
+        assert!(r.read_u8().is_err(), "EOF must be an error");
+
+        // Backward / forward / relative / end-relative seeks.
+        assert_eq!(r.seek(SeekFrom::Start(8 + 4 * 5000)).unwrap(), 20_008);
+        assert_eq!(r.read_u32_be().unwrap(), 5000);
+        assert_eq!(r.seek(SeekFrom::Current(-8)).unwrap(), 20_004);
+        assert_eq!(r.read_u32_be().unwrap(), 4999);
+        assert_eq!(r.seek(SeekFrom::Current(4 * 10)).unwrap(), 20_048);
+        assert_eq!(r.read_u32_be().unwrap(), 5010);
+        assert_eq!(r.seek(SeekFrom::End(-4)).unwrap(), 40_004);
+        assert_eq!(r.read_u32_be().unwrap(), 9999);
+        // peek keeps the position.
+        r.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(r.peek(4).unwrap(), b"HEAD");
+        assert_eq!(r.tell().unwrap(), 0);
+        assert_eq!(r.peek_prefix(1 << 20).unwrap().len(), 40_008);
+        assert_eq!(r.tell().unwrap(), 0);
+
+        // Writing to a reader is unsupported.
+        assert_unsupported(&r.write_u8(1).unwrap_err());
+        assert_unsupported(&r.write_all(b"xyz").unwrap_err());
+        r.flush().unwrap();
+        assert!(r.into_buffer().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tell_does_not_disturb_buffered_reads() {
+        let path = temp_path("tell.bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+        std::fs::write(&path, &data).unwrap();
+        let mut r = IOContext::open_file(&path).unwrap();
+        for (i, &expected) in data.iter().enumerate().take(70_000) {
+            assert_eq!(r.tell().unwrap(), i as u64);
+            assert_eq!(r.read_u8().unwrap(), expected);
+        }
+        // Small forward skips inside the buffer stay exact.
+        assert_eq!(r.seek(SeekFrom::Current(3)).unwrap(), 70_003);
+        assert_eq!(r.read_u8().unwrap(), data[70_003]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_missing_file_is_an_io_error() {
+        let err = IOContext::open_file(temp_path("does_not_exist.bin"))
+            .err()
+            .expect("missing file");
+        assert!(matches!(err, RsError::Io(_)), "got {err:?}");
     }
 }

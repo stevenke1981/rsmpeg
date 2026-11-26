@@ -20,28 +20,46 @@ impl MirrorFilter {
     /// swap but is preserved in value because the whole pixel is exchanged. For RGBA,
     /// `frame.data[0]` is a single tightly-packed plane with a 4-byte stride.
     pub fn apply(&self, frame: &mut Frame) {
+        if frame.pixel_format != rsmpeg_util::PixelFormat::Rgba {
+            return;
+        }
         let w = frame.width;
         let h = frame.height;
         if w == 0 || h == 0 {
             return;
         }
-        let stride = 4usize;
+        let Some(row_bytes) = w.checked_mul(4) else {
+            return;
+        };
+        let src_stride = frame
+            .linesize
+            .first()
+            .copied()
+            .filter(|&ls| ls >= row_bytes)
+            .unwrap_or(row_bytes);
+        let Some(needed) = h
+            .checked_sub(1)
+            .and_then(|r| r.checked_mul(src_stride))
+            .and_then(|o| o.checked_add(row_bytes))
+        else {
+            return;
+        };
         // Guard against a frame with no plane / a truncated plane so a malformed
         // input cannot panic the playback thread.
         let Some(buf) = frame.data.first_mut() else {
             return;
         };
-        if buf.len() < w * h * stride {
+        if buf.len() < needed {
             return;
         }
         for y in 0..h {
-            let row = y * w * stride;
+            let row_start = y * src_stride;
+            let row = &mut buf[row_start..row_start + row_bytes];
             for x in 0..w / 2 {
-                let l = row + x * stride;
-                let r = row + (w - 1 - x) * stride;
-                for c in 0..stride {
-                    buf.swap(l + c, r + c);
-                }
+                let l_start = x * 4;
+                let r_start = (w - 1 - x) * 4;
+                let (left_part, right_part) = row.split_at_mut(r_start);
+                left_part[l_start..l_start + 4].swap_with_slice(&mut right_part[..4]);
             }
         }
     }
@@ -90,7 +108,7 @@ mod tests {
         }
         let mut frame = Frame::new_video(width, height, PixelFormat::Rgba);
         frame.data[0] = data;
-        frame.linesize[0] = n * 4;
+        frame.linesize[0] = width * 4;
         frame
     }
 
@@ -184,5 +202,39 @@ mod tests {
         frame.data[0] = vec![5u8; 4];
         MirrorFilter::new().apply(&mut frame);
         assert_eq!(frame.data[0], vec![5u8; 4]);
+    }
+
+    #[test]
+    fn mirror_non_rgba_is_noop() {
+        let mut frame = Frame::new_video(2, 1, PixelFormat::Bgra);
+        frame.data[0] = vec![1, 2, 3, 255, 4, 5, 6, 255];
+        let orig = frame.data[0].clone();
+        MirrorFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], orig);
+    }
+
+    #[test]
+    fn mirror_honors_padded_linesize_and_1x1() {
+        let mut single = rgba_frame(1, 1, &[(7, 8, 9, 10)]);
+        MirrorFilter::new().apply(&mut single);
+        assert_eq!(single.data[0], vec![7, 8, 9, 10]);
+
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        let stride = 12usize; // 2 * 4 active + 4 padding
+        let mut buf = vec![0xEEu8; stride * 2];
+        buf[0..8].copy_from_slice(&[1, 0, 0, 255, 2, 0, 0, 255]);
+        buf[stride..stride + 8].copy_from_slice(&[3, 0, 0, 128, 4, 0, 0, 64]);
+        frame.data[0] = buf;
+        frame.linesize[0] = stride;
+
+        MirrorFilter::new().apply(&mut frame);
+        assert_eq!(frame.linesize, vec![stride]);
+        assert_eq!(&frame.data[0][0..8], &[2, 0, 0, 255, 1, 0, 0, 255]);
+        assert_eq!(&frame.data[0][8..12], &[0xEE; 4]);
+        assert_eq!(
+            &frame.data[0][stride..stride + 8],
+            &[4, 0, 0, 64, 3, 0, 0, 128]
+        );
+        assert_eq!(&frame.data[0][stride + 8..stride + 12], &[0xEE; 4]);
     }
 }

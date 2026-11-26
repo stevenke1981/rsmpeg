@@ -1,7 +1,11 @@
-//! Native demux path: `rsmpeg-format` packets → backend OpenH264 / Symphonia decode.
+//! Native demux path: `rsmpeg-format` packets → rsmpeg or backend decoders.
 //!
-//! Used when `prefer_native_pipeline` is true and the container yields a real
-//! sample index (currently non-fragmented MP4, and WAV PCM).
+//! Used when `prefer_native_pipeline` is true (always, without the
+//! `backend-symphonia` fallback) and the container yields a real sample index.
+//!
+//! It builds under every feature combination. MJPEG, raw video, PCM and FLAC
+//! are always decoded; H.264 needs `backend-openh264`; AAC, MP3, Vorbis and
+//! ALAC need `backend-symphonia`; and sound output needs `audio-rodio`.
 
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -31,11 +35,6 @@ fn emit_preview(tx: &EventSender, ev: PlayerEvent) {
     tx.send_preview(ev);
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 fn emit_native_video_frame(
     event_tx: &EventSender,
     frame: &rsmpeg_codec::Frame,
@@ -84,17 +83,105 @@ fn snap(
     })
 }
 
+/// Audio output queue: a `rodio::Sink` with the `audio-rodio` feature.
+///
+/// Without that feature [`AudioSink::try_open_sink`] always returns `None`, so
+/// playback runs silently and the other methods are never reached.
+#[cfg_attr(not(feature = "audio-rodio"), allow(dead_code))]
+pub(crate) struct AudioSink {
+    #[cfg(feature = "audio-rodio")]
+    inner: rodio::Sink,
+}
+
+#[cfg_attr(
+    not(feature = "audio-rodio"),
+    allow(dead_code, unused_variables, clippy::unused_self)
+)]
+impl AudioSink {
+    /// Open a sink on the default output device at `volume`, if there is one.
+    pub(crate) fn try_open_sink(volume: f32) -> Option<Self> {
+        #[cfg(feature = "audio-rodio")]
+        {
+            crate::audio_output::try_open_sink(volume).map(|inner| Self { inner })
+        }
+        #[cfg(not(feature = "audio-rodio"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn play(&self) {
+        #[cfg(feature = "audio-rodio")]
+        self.inner.play();
+    }
+
+    pub(crate) fn pause(&self) {
+        #[cfg(feature = "audio-rodio")]
+        self.inner.pause();
+    }
+
+    /// Discard everything queued.
+    pub(crate) fn clear(&self) {
+        #[cfg(feature = "audio-rodio")]
+        self.inner.clear();
+    }
+
+    pub(crate) fn set_volume(&self, volume: f32) {
+        #[cfg(feature = "audio-rodio")]
+        self.inner.set_volume(volume);
+    }
+
+    pub(crate) fn set_speed(&self, speed: f32) {
+        #[cfg(feature = "audio-rodio")]
+        self.inner.set_speed(speed);
+    }
+
+    /// Number of queued buffers.
+    pub(crate) fn len(&self) -> usize {
+        #[cfg(feature = "audio-rodio")]
+        {
+            self.inner.len()
+        }
+        #[cfg(not(feature = "audio-rodio"))]
+        {
+            0
+        }
+    }
+
+    /// Whether everything queued has been played.
+    pub(crate) fn empty(&self) -> bool {
+        #[cfg(feature = "audio-rodio")]
+        {
+            self.inner.empty()
+        }
+        #[cfg(not(feature = "audio-rodio"))]
+        {
+            true
+        }
+    }
+
+    /// Queue interleaved signed 16-bit PCM.
+    pub(crate) fn append_i16(&self, channels: u16, rate: u32, samples: Vec<i16>) {
+        #[cfg(feature = "audio-rodio")]
+        self.inner
+            .append(rodio::buffer::SamplesBuffer::new(channels, rate, samples));
+    }
+}
+
+/// Video codecs the native path can open a decoder for.
+fn is_native_video_codec(codec_id: CodecId) -> bool {
+    matches!(codec_id, CodecId::Mjpeg | CodecId::RawVideo)
+        || (cfg!(feature = "backend-openh264") && codec_id == CodecId::H264)
+}
+
 /// Audio codecs the native path can open a decoder for.
 fn is_native_audio_codec(codec_id: CodecId) -> bool {
-    matches!(
-        codec_id,
-        CodecId::Flac
-            | CodecId::Pcm
-            | CodecId::Aac
-            | CodecId::Mp3
-            | CodecId::Vorbis
-            | CodecId::Alac
-    )
+    matches!(codec_id, CodecId::Flac | CodecId::Pcm)
+        || (cfg!(feature = "backend-symphonia")
+            && matches!(
+                codec_id,
+                CodecId::Aac | CodecId::Mp3 | CodecId::Vorbis | CodecId::Alac
+            ))
 }
 
 /// Trim interleaved audio that plays before a precise-seek `target`.
@@ -107,14 +194,6 @@ fn is_native_audio_codec(codec_id: CodecId) -> bool {
 /// `target` (and `samples` is cleared), or `samples` was already empty. With a
 /// zero `sample_rate` or `channels` the timeline is unknown and `samples` is
 /// left untouched.
-#[cfg_attr(
-    not(all(
-        feature = "backend-symphonia",
-        feature = "backend-openh264",
-        feature = "audio-rodio"
-    )),
-    allow(dead_code)
-)]
 pub(crate) fn trim_audio_samples_before_target(
     frame_start: Duration,
     sample_rate: u32,
@@ -147,11 +226,6 @@ pub(crate) fn trim_audio_samples_before_target(
 
 /// Media time of a timestamp expressed in `time_base` units, or `None` when it
 /// cannot be determined. Negative timestamps clamp to zero.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 fn timestamp_to_duration(ts: Option<i64>, time_base: rsmpeg_util::Rational) -> Option<Duration> {
     if time_base.num <= 0 || time_base.den <= 0 {
         return None;
@@ -163,11 +237,6 @@ fn timestamp_to_duration(ts: Option<i64>, time_base: rsmpeg_util::Rational) -> O
 /// Apply the pending precise-seek target to one decoded audio frame, clearing
 /// `drop_until` once the target has been reached. A frame without a usable
 /// timestamp cannot be placed on the timeline, so it ends trimming.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 fn apply_audio_seek_trim(
     drop_until: &mut Option<Duration>,
     frame_start: Option<Duration>,
@@ -199,10 +268,7 @@ pub(crate) fn collect_native_tracks(
         let language = s.metadata.get("language").map(ToOwned::to_owned);
         match s.media_type {
             MediaType::Video => {
-                let supported = matches!(
-                    s.codec_id,
-                    CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo
-                );
+                let supported = is_native_video_codec(s.codec_id);
                 video_tracks.push(PlayerTrackInfo {
                     index: s.index,
                     is_video: true,
@@ -235,18 +301,8 @@ pub(crate) fn collect_native_tracks(
     (video_tracks, audio_tracks)
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 type NativeVideoDecoderBundle = (Option<Box<dyn rsmpeg_codec::Decoder>>, Option<String>);
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 type NativeAudioDecoderBundle = (
     Option<Box<dyn rsmpeg_codec::Decoder>>,
     Option<String>,
@@ -254,11 +310,6 @@ type NativeAudioDecoderBundle = (
     u32,
 );
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 fn open_native_video_decoder(
     ctx: &FormatContext,
     stream_idx: usize,
@@ -287,6 +338,7 @@ fn open_native_video_decoder(
             d.set_parameters(stream.codec_params.clone());
             (Some(Box::new(d)), Some("rsmpeg-rust (RawVideo)".into()))
         }
+        #[cfg(feature = "backend-openh264")]
         CodecId::H264 => match crate::backend::OpenH264Decoder::from_params(&stream.codec_params) {
             Ok(d) => (Some(Box::new(d)), Some("OpenH264 (H.264)".into())),
             Err(e) => {
@@ -316,19 +368,12 @@ fn open_native_video_decoder(
     }
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 fn open_native_audio_decoder(
     ctx: &FormatContext,
     stream_idx: usize,
     generation: u64,
     event_tx: &EventSender,
 ) -> NativeAudioDecoderBundle {
-    use crate::backend::symphonia_audio::SymphoniaAudioDecoder;
-
     let Some(stream) = ctx.streams.get(stream_idx) else {
         return (None, None, 2, 44_100);
     };
@@ -371,8 +416,9 @@ fn open_native_audio_decoder(
                 (None, None, ch, rate)
             }
         },
+        #[cfg(feature = "backend-symphonia")]
         CodecId::Aac | CodecId::Mp3 | CodecId::Vorbis | CodecId::Alac => {
-            match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
+            match crate::backend::SymphoniaAudioDecoder::try_new(&stream.codec_params) {
                 Ok(d) => (
                     Some(Box::new(d)),
                     Some(format!(
@@ -430,31 +476,9 @@ pub(crate) fn try_run_native_with_sender(
     cmd_rx: &Receiver<PlayerCommand>,
     event_tx: &EventSender,
 ) -> Result<(), String> {
-    #[cfg(not(all(
-        feature = "backend-symphonia",
-        feature = "backend-openh264",
-        feature = "audio-rodio"
-    )))]
-    {
-        let _ = (path, volume, cmd_rx, event_tx);
-        return Err("backends disabled".into());
-    }
-
-    #[cfg(all(
-        feature = "backend-symphonia",
-        feature = "backend-openh264",
-        feature = "audio-rodio"
-    ))]
-    {
-        run_native_inner(path, volume, cmd_rx, event_tx)
-    }
+    run_native_inner(path, volume, cmd_rx, event_tx)
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
 fn run_native_inner(
     path: &std::path::Path,
     mut volume: f32,
@@ -494,6 +518,7 @@ fn run_native_inner(
             | "webm"
             | "mka"
             | "avi"
+            | "y4m"
     );
     if !native_ok {
         return Err(format!(
@@ -508,13 +533,10 @@ fn run_native_inner(
         .ok_or_else(|| "native demux produced no packets (fragmented or empty stbl)".to_string())?;
     let mut pending: Option<rsmpeg_codec::Packet> = Some(first);
 
-    let mut video_si = ctx.streams.iter().position(|s| {
-        s.media_type == MediaType::Video
-            && matches!(
-                s.codec_id,
-                CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo
-            )
-    });
+    let mut video_si = ctx
+        .streams
+        .iter()
+        .position(|s| s.media_type == MediaType::Video && is_native_video_codec(s.codec_id));
     let mut audio_si = ctx
         .streams
         .iter()
@@ -528,10 +550,8 @@ fn run_native_inner(
 
     if let Some(u) = ctx.streams.iter().find(|s| {
         s.media_type == MediaType::Video
-            && !matches!(
-                s.codec_id,
-                CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo | CodecId::Unknown
-            )
+            && !is_native_video_codec(s.codec_id)
+            && s.codec_id != CodecId::Unknown
     }) {
         emit(
             event_tx,
@@ -583,7 +603,7 @@ fn run_native_inner(
         None => (None, None, 2u16, 44_100u32),
     };
 
-    let mut sink = audio_si.and_then(|_| crate::audio_output::try_open_sink(volume));
+    let mut sink = audio_si.and_then(|_| AudioSink::try_open_sink(volume));
 
     emit(
         event_tx,
@@ -823,7 +843,7 @@ fn run_native_inner(
                                 audio_channels = ch;
                                 audio_rate = rate;
                                 if audio_dec.is_some() && sink.is_none() {
-                                    sink = crate::audio_output::try_open_sink(volume);
+                                    sink = AudioSink::try_open_sink(volume);
                                 }
                                 if eof_draining {
                                     let ts_ms = (position.as_secs_f64().max(0.0) * 1000.0) as i64;
@@ -900,6 +920,8 @@ fn run_native_inner(
                                     tb.num as f64 / tb.den.max(1) as f64
                                 });
                                 base_video_pts = Some(0);
+                                appended_samples =
+                                    MasterClock::duration_to_audio_samples(position, audio_rate);
                                 let ts_ms = (position.as_secs_f64().max(0.0) * 1000.0) as i64;
                                 let _ = ctx.seek(ts_ms);
                                 pending = ctx.read_frame().ok().flatten();
@@ -972,7 +994,7 @@ fn run_native_inner(
             if sink_empty {
                 break;
             }
-            if video_si.is_none() && playing && clock_started {
+            if video_dec.is_none() && playing && clock_started {
                 let now = playback_clock.now();
                 position = if duration > Duration::ZERO {
                     now.min(duration)
@@ -991,7 +1013,7 @@ fn run_native_inner(
             continue;
         }
 
-        if video_si.is_none() && playing && clock_started {
+        if video_dec.is_none() && playing && clock_started {
             let queued_pos =
                 PlaybackClock::duration_from_audio_samples(appended_samples, audio_rate);
             let now = playback_clock.now();
@@ -1135,9 +1157,7 @@ fn run_native_inner(
                                     );
                                     if !samples.is_empty() {
                                         if let Some(ref s) = sink {
-                                            s.append(rodio::buffer::SamplesBuffer::new(
-                                                ch, rate, samples,
-                                            ));
+                                            s.append_i16(ch, rate, samples);
                                         }
                                     }
                                 }
@@ -1330,15 +1350,11 @@ fn run_native_inner(
                                         last_level_emit = Some(Instant::now());
                                     }
                                     if let Some(ref s) = sink {
-                                        s.append(rodio::buffer::SamplesBuffer::new(
-                                            device_ch,
-                                            device_rate,
-                                            samples,
-                                        ));
+                                        s.append_i16(device_ch, device_rate, samples);
                                     }
                                 }
-                                // Drive position from audio when no video.
-                                if video_si.is_none() {
+                                // Drive position from audio when no video is decoded.
+                                if video_dec.is_none() {
                                     if !clock_started {
                                         playback_clock.seek(position);
                                         playback_clock.start();
@@ -1440,12 +1456,12 @@ mod tests {
         let (v, a) = collect_native_tracks(&ctx);
         assert_eq!(v.len(), 2);
         assert_eq!(a.len(), 2);
-        assert!(v[0].supported);
+        assert_eq!(v[0].supported, cfg!(feature = "backend-openh264"));
         assert_eq!(v[0].width, Some(1280));
         assert!(!v[1].supported);
         assert_eq!(a[0].language.as_deref(), Some("eng"));
         assert_eq!(a[1].language.as_deref(), Some("zho"));
-        assert!(a[0].supported);
+        assert_eq!(a[0].supported, cfg!(feature = "backend-symphonia"));
     }
 
     #[test]
@@ -1497,13 +1513,14 @@ mod tests {
             filename: None,
             format_name: Some("matroska".into()),
         };
+        let symphonia = cfg!(feature = "backend-symphonia");
         let codecs = [
             (CodecId::Flac, true),
             (CodecId::Pcm, true),
-            (CodecId::Aac, true),
-            (CodecId::Mp3, true),
-            (CodecId::Vorbis, true),
-            (CodecId::Alac, true),
+            (CodecId::Aac, symphonia),
+            (CodecId::Mp3, symphonia),
+            (CodecId::Vorbis, symphonia),
+            (CodecId::Alac, symphonia),
             (CodecId::Opus, false),
             (CodecId::Unknown, false),
         ];
@@ -1527,6 +1544,24 @@ mod tests {
             assert_eq!(track.sample_rate, None);
             assert_eq!(track.channels, None);
         }
+    }
+
+    #[test]
+    fn video_codec_support_follows_the_compiled_backends() {
+        assert!(is_native_video_codec(CodecId::Mjpeg));
+        assert!(is_native_video_codec(CodecId::RawVideo));
+        assert_eq!(
+            is_native_video_codec(CodecId::H264),
+            cfg!(feature = "backend-openh264")
+        );
+        assert!(!is_native_video_codec(CodecId::Hevc));
+        assert!(!is_native_video_codec(CodecId::Unknown));
+    }
+
+    #[cfg(not(feature = "audio-rodio"))]
+    #[test]
+    fn no_sink_opens_without_rodio() {
+        assert!(AudioSink::try_open_sink(1.0).is_none());
     }
 
     /// Stereo ramp whose value identifies the sample frame it came from.
@@ -1631,11 +1666,6 @@ mod tests {
         ));
     }
 
-    #[cfg(all(
-        feature = "backend-symphonia",
-        feature = "backend-openh264",
-        feature = "audio-rodio"
-    ))]
     #[test]
     fn audio_seek_trim_stays_armed_until_the_target_is_reached() {
         let target = Duration::from_millis(15);
@@ -1666,11 +1696,6 @@ mod tests {
         assert_eq!(drop_until, None);
     }
 
-    #[cfg(all(
-        feature = "backend-symphonia",
-        feature = "backend-openh264",
-        feature = "audio-rodio"
-    ))]
     #[test]
     fn timestamps_convert_through_the_stream_time_base() {
         use rsmpeg_util::Rational;

@@ -12,6 +12,7 @@
 //! instead of a panic or an out-of-memory abort. Packet payloads are read one
 //! chunk at a time; the file is never loaded into memory as a whole.
 
+use super::pcm::{wave_pcm_layout, PcmLayout};
 use crate::format::InputFormat;
 use crate::format_context::FormatContext;
 use crate::io_context::IOContext;
@@ -188,30 +189,27 @@ pub(crate) fn parse_wave_format_ex(buf: &[u8]) -> Option<WaveFormat> {
 }
 
 /// Map a `WAVEFORMATEX.wFormatTag` (+ bit depth) to a codec and sample format.
+///
+/// PCM-family tags report the *canonical* sample format packets are
+/// normalised to (see [`wave_format_layout`]): 24-bit integer PCM is `S32`,
+/// G.711 A-law / µ-law (`0x0006` / `0x0007`) is `S16`.
 pub(crate) fn wave_format_codec(tag: u16, bits: u16) -> (CodecId, Option<SampleFormat>) {
+    if let Some((sample_format, _)) = wave_pcm_layout(tag, bits) {
+        return (CodecId::Pcm, Some(sample_format));
+    }
     match tag {
-        0x0001 => (
-            CodecId::Pcm,
-            match bits {
-                8 => Some(SampleFormat::U8),
-                16 => Some(SampleFormat::S16),
-                24 | 32 => Some(SampleFormat::S32),
-                _ => None,
-            },
-        ),
-        0x0003 => (
-            CodecId::Pcm,
-            Some(if bits == 64 {
-                SampleFormat::F64
-            } else {
-                SampleFormat::F32
-            }),
-        ),
+        0x0001 | 0x0003 | 0x0006 | 0x0007 => (CodecId::Pcm, None),
         0x0050 | 0x0055 => (CodecId::Mp3, None),
         0x00FF | 0x706D => (CodecId::Aac, None),
         0xF1AC => (CodecId::Flac, None),
         _ => (CodecId::Unknown, None),
     }
+}
+
+/// Packet conversion needed for a `WAVEFORMATEX` PCM stream (passthrough for
+/// anything that is already canonical or not PCM at all).
+pub(crate) fn wave_format_layout(tag: u16, bits: u16) -> PcmLayout {
+    wave_pcm_layout(tag, bits).map_or(PcmLayout::Passthrough, |(_, layout)| layout)
 }
 
 /// Pixel format of an uncompressed `BITMAPINFOHEADER` / raw FourCC.
@@ -305,6 +303,8 @@ struct AviStream {
     start: i64,
     time_base: Rational,
     intra_only: bool,
+    /// Audio packet normalisation (24-bit widening, G.711 expansion).
+    pcm: PcmLayout,
 }
 
 impl AviStream {
@@ -619,7 +619,7 @@ fn make_packet(
     key: bool,
     pos: u64,
 ) -> Packet {
-    let mut pkt = Packet::new(Bytes::from(data), st.stream_index);
+    let mut pkt = Packet::new(Bytes::from(st.pcm.apply(data)), st.stream_index);
     pkt.pts = Some(pts);
     pkt.dts = Some(pts);
     pkt.duration = duration as i64;
@@ -807,6 +807,7 @@ impl AVIDemuxer {
         let mut stream;
         let mut time_base = reduced_rational(scale as u64, rate as u64);
         let mut intra_only = false;
+        let mut pcm = PcmLayout::Passthrough;
         match &fcc_type {
             b"vids" => {
                 let bih = strf.as_deref().and_then(parse_bitmap_info_header);
@@ -856,6 +857,9 @@ impl AVIDemuxer {
                 let (codec, sample_format) = wf.as_ref().map_or((CodecId::Unknown, None), |w| {
                     wave_format_codec(w.format_tag, w.bits_per_sample)
                 });
+                if let Some(w) = &wf {
+                    pcm = wave_format_layout(w.format_tag, w.bits_per_sample);
+                }
                 stream = Stream::new(index, codec);
                 stream.media_type = MediaType::Audio;
                 let p = &mut stream.codec_params;
@@ -903,6 +907,7 @@ impl AVIDemuxer {
             start: start_ticks as i64,
             time_base,
             intra_only,
+            pcm,
         });
         Ok(stream)
     }
@@ -1657,5 +1662,116 @@ mod tests {
                 let _ = read_all(&mut ctx, &mut d);
             }
         }
+    }
+
+    /// Audio-only AVI: one `auds` stream with the given WAVEFORMATEX.
+    fn audio_only_avi(tag: u16, ch: u16, rate: u32, bits: u16, chunks: &[Vec<u8>]) -> Vec<u8> {
+        let align = bits.div_ceil(8) * ch;
+        let a = list(
+            b"strl",
+            &[
+                strh(
+                    b"auds",
+                    &[0; 4],
+                    u32::from(align),
+                    rate * u32::from(align),
+                    0,
+                    0,
+                    u32::from(align),
+                ),
+                wfx(tag, ch, rate, align, bits),
+            ]
+            .concat(),
+        );
+        let hdrl = list(b"hdrl", &[avih(0, 0, 1, 0, 0), a].concat());
+        let named: Vec<(&[u8; 4], Vec<u8>)> = chunks.iter().map(|c| (b"00wb", c.clone())).collect();
+        build(hdrl, &movi(&named), None, false)
+    }
+
+    #[test]
+    fn pcm24_audio_chunks_are_widened_to_s32() {
+        // Stereo 24-bit: (1, -1) then (0x7FFFFF, -0x800000).
+        let samples = [1i32, -1, 0x7F_FFFF, -0x80_0000];
+        let raw: Vec<u8> = samples
+            .iter()
+            .flat_map(|&s| {
+                let b = s.to_le_bytes();
+                [b[0], b[1], b[2]]
+            })
+            .collect();
+        let data = audio_only_avi(1, 2, 48_000, 24, &[raw.clone(), raw[..6].to_vec()]);
+        let mut ctx = ctx_with(data);
+        let mut d = AVIDemuxer::default();
+        d.read_header(&mut ctx).unwrap();
+        let a = &ctx.streams[0];
+        assert_eq!(a.codec_id, CodecId::Pcm);
+        assert_eq!(a.codec_params.sample_format, Some(SampleFormat::S32));
+
+        let pkts = read_all(&mut ctx, &mut d);
+        assert_eq!(pkts.len(), 2);
+        let decoded: Vec<i32> = pkts[0]
+            .data
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(decoded, samples.iter().map(|&s| s << 8).collect::<Vec<_>>());
+        // Timing still comes from the on-disk chunk size (12 bytes / 6 per frame).
+        assert_eq!(pkts[0].duration, 2);
+        assert_eq!(pkts[1].pts, Some(2));
+        assert_eq!(pkts[1].duration, 1);
+        assert_eq!(pkts[1].data.len(), 8);
+    }
+
+    #[test]
+    fn g711_audio_chunks_expand_to_s16() {
+        use super::super::pcm::{alaw_to_linear, mulaw_to_linear};
+        for (tag, expand) in [
+            (6u16, alaw_to_linear as fn(u8) -> i16),
+            (7u16, mulaw_to_linear as fn(u8) -> i16),
+        ] {
+            let codes = vec![0x00u8, 0x55, 0x80, 0xD5, 0xFF, 0x7F];
+            let data = audio_only_avi(tag, 1, 8_000, 8, std::slice::from_ref(&codes));
+            let mut ctx = ctx_with(data);
+            let mut d = AVIDemuxer::default();
+            d.read_header(&mut ctx).unwrap();
+            let a = &ctx.streams[0];
+            assert_eq!(a.codec_id, CodecId::Pcm);
+            assert_eq!(a.codec_params.sample_format, Some(SampleFormat::S16));
+            let pkts = read_all(&mut ctx, &mut d);
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0].duration, 6, "6 one-byte G.711 frames");
+            let pcm: Vec<i16> = pkts[0]
+                .data
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(pcm, codes.iter().map(|&c| expand(c)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn pcm16_audio_chunks_pass_through_untouched() {
+        let raw = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let data = audio_only_avi(1, 2, 44_100, 16, std::slice::from_ref(&raw));
+        let mut ctx = ctx_with(data);
+        let mut d = AVIDemuxer::default();
+        d.read_header(&mut ctx).unwrap();
+        let pkts = read_all(&mut ctx, &mut d);
+        assert_eq!(pkts[0].data.as_ref(), raw.as_slice());
+        assert_eq!(
+            wave_format_codec(6, 8),
+            (CodecId::Pcm, Some(SampleFormat::S16))
+        );
+        assert_eq!(
+            wave_format_codec(1, 24),
+            (CodecId::Pcm, Some(SampleFormat::S32))
+        );
+        assert_eq!(
+            wave_format_codec(3, 64),
+            (CodecId::Pcm, Some(SampleFormat::F64))
+        );
+        assert_eq!(wave_format_codec(1, 0), (CodecId::Pcm, None));
+        assert_eq!(wave_format_layout(1, 24), PcmLayout::S24LeToS32);
+        assert_eq!(wave_format_layout(0x55, 0), PcmLayout::Passthrough);
     }
 }
