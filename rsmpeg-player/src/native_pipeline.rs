@@ -84,6 +84,111 @@ fn snap(
     })
 }
 
+/// Audio codecs the native path can open a decoder for.
+fn is_native_audio_codec(codec_id: CodecId) -> bool {
+    matches!(
+        codec_id,
+        CodecId::Flac
+            | CodecId::Pcm
+            | CodecId::Aac
+            | CodecId::Mp3
+            | CodecId::Vorbis
+            | CodecId::Alac
+    )
+}
+
+/// Trim interleaved audio that plays before a precise-seek `target`.
+///
+/// `frame_start` is the media time of `samples[0]`. Leading sample frames that
+/// precede `target` (to the nearest sample) are removed in place.
+///
+/// Returns `true` when output remains, meaning playback has reached `target`.
+/// Returns `false` when nothing remains: the whole frame ends at or before
+/// `target` (and `samples` is cleared), or `samples` was already empty. With a
+/// zero `sample_rate` or `channels` the timeline is unknown and `samples` is
+/// left untouched.
+#[cfg_attr(
+    not(all(
+        feature = "backend-symphonia",
+        feature = "backend-openh264",
+        feature = "audio-rodio"
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn trim_audio_samples_before_target(
+    frame_start: Duration,
+    sample_rate: u32,
+    channels: u16,
+    target: Duration,
+    samples: &mut Vec<i16>,
+) -> bool {
+    if target <= frame_start || sample_rate == 0 || channels == 0 {
+        return !samples.is_empty();
+    }
+    let channels = usize::from(channels);
+    let frames = samples.len() / channels;
+    let frame_len = Duration::from_secs_f64(frames as f64 / f64::from(sample_rate));
+    let frame_end = frame_start.saturating_add(frame_len);
+    // Round to the nearest sample: timestamps carry nanosecond truncation.
+    let skip = if frame_end <= target {
+        frames
+    } else {
+        let lead_nanos = (target - frame_start).as_nanos();
+        let rounded = (lead_nanos * u128::from(sample_rate) + 500_000_000) / 1_000_000_000;
+        usize::try_from(rounded).map_or(frames, |n| n.min(frames))
+    };
+    if skip >= frames {
+        samples.clear();
+        return false;
+    }
+    samples.drain(..skip * channels);
+    true
+}
+
+/// Media time of a timestamp expressed in `time_base` units, or `None` when it
+/// cannot be determined. Negative timestamps clamp to zero.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn timestamp_to_duration(ts: Option<i64>, time_base: rsmpeg_util::Rational) -> Option<Duration> {
+    if time_base.num <= 0 || time_base.den <= 0 {
+        return None;
+    }
+    let secs = ts? as f64 * f64::from(time_base.num) / f64::from(time_base.den);
+    Duration::try_from_secs_f64(secs.max(0.0)).ok()
+}
+
+/// Apply the pending precise-seek target to one decoded audio frame, clearing
+/// `drop_until` once the target has been reached. A frame without a usable
+/// timestamp cannot be placed on the timeline, so it ends trimming.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn apply_audio_seek_trim(
+    drop_until: &mut Option<Duration>,
+    frame_start: Option<Duration>,
+    sample_rate: u32,
+    channels: u16,
+    samples: &mut Vec<i16>,
+) {
+    let Some(target) = *drop_until else {
+        return;
+    };
+    let reached = match frame_start {
+        Some(start) => {
+            trim_audio_samples_before_target(start, sample_rate, channels, target, samples)
+        }
+        None => true,
+    };
+    if reached {
+        *drop_until = None;
+    }
+}
+
 /// Build selectable video and audio track lists from a parsed [`FormatContext`].
 pub(crate) fn collect_native_tracks(
     ctx: &FormatContext,
@@ -111,10 +216,7 @@ pub(crate) fn collect_native_tracks(
                 });
             }
             MediaType::Audio => {
-                let supported = matches!(
-                    s.codec_id,
-                    CodecId::Flac | CodecId::Pcm | CodecId::Aac | CodecId::Mp3
-                );
+                let supported = is_native_audio_codec(s.codec_id);
                 audio_tracks.push(PlayerTrackInfo {
                     index: s.index,
                     is_video: false,
@@ -269,29 +371,31 @@ fn open_native_audio_decoder(
                 (None, None, ch, rate)
             }
         },
-        CodecId::Aac | CodecId::Mp3 => match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
-            Ok(d) => (
-                Some(Box::new(d)),
-                Some(format!(
-                    "Symphonia ({})",
-                    stream.codec_id.name().to_ascii_uppercase()
-                )),
-                ch,
-                rate,
-            ),
-            Err(e) => {
-                emit(
-                    event_tx,
-                    PlayerEvent::Warning {
-                        message: format!(
-                            "native path: failed to open Symphonia audio decoder: {e}"
-                        ),
-                        generation,
-                    },
-                );
-                (None, None, ch, rate)
+        CodecId::Aac | CodecId::Mp3 | CodecId::Vorbis | CodecId::Alac => {
+            match SymphoniaAudioDecoder::try_new(&stream.codec_params) {
+                Ok(d) => (
+                    Some(Box::new(d)),
+                    Some(format!(
+                        "Symphonia ({})",
+                        stream.codec_id.name().to_ascii_uppercase()
+                    )),
+                    ch,
+                    rate,
+                ),
+                Err(e) => {
+                    emit(
+                        event_tx,
+                        PlayerEvent::Warning {
+                            message: format!(
+                                "native path: failed to open Symphonia audio decoder: {e}"
+                            ),
+                            generation,
+                        },
+                    );
+                    (None, None, ch, rate)
+                }
             }
-        },
+        }
         other => {
             emit(
                 event_tx,
@@ -379,7 +483,17 @@ fn run_native_inner(
     let format_name = ctx.format_name.clone().unwrap_or_default();
     let native_ok = matches!(
         format_name.as_str(),
-        "mp4" | "mov" | "m4a" | "m4v" | "wav" | "flac"
+        "mp4"
+            | "mov"
+            | "m4a"
+            | "m4v"
+            | "wav"
+            | "flac"
+            | "matroska"
+            | "mkv"
+            | "webm"
+            | "mka"
+            | "avi"
     );
     if !native_ok {
         return Err(format!(
@@ -401,13 +515,10 @@ fn run_native_inner(
                 CodecId::H264 | CodecId::Mjpeg | CodecId::RawVideo
             )
     });
-    let mut audio_si = ctx.streams.iter().position(|s| {
-        s.media_type == MediaType::Audio
-            && matches!(
-                s.codec_id,
-                CodecId::Flac | CodecId::Pcm | CodecId::Aac | CodecId::Mp3 | CodecId::Alac
-            )
-    });
+    let mut audio_si = ctx
+        .streams
+        .iter()
+        .position(|s| s.media_type == MediaType::Audio && is_native_audio_codec(s.codec_id));
 
     if video_si.is_none() && audio_si.is_none() {
         return Err("native demux: no supported video or audio stream".into());
@@ -457,6 +568,8 @@ fn run_native_inner(
     let mut video_scheduler = VideoScheduler::new();
     let mut drop_until: Option<Duration> = None;
     let mut last_dropped_frame: Option<(rsmpeg_codec::Frame, Duration)> = None;
+    // Precise-seek target still to be reached by the audio stream.
+    let mut audio_drop_until: Option<Duration> = None;
 
     // ── Video decoder ──
     let (mut video_dec, mut video_dec_name) = match video_si {
@@ -590,6 +703,7 @@ fn run_native_inner(
                             position = Duration::from_secs_f64(capped);
                             drop_until =
                                 (mode == crate::command::SeekMode::Precise).then_some(position);
+                            audio_drop_until = drop_until;
                             last_dropped_frame = None;
                             let ts_ms = (capped * 1000.0) as i64;
                             let _ = ctx.seek(ts_ms);
@@ -701,6 +815,7 @@ fn run_native_inner(
                                 );
                             } else {
                                 audio_si = Some(index);
+                                audio_drop_until = None;
                                 let (dec, dec_name, ch, rate) =
                                     open_native_audio_decoder(&ctx, index, g, event_tx);
                                 audio_dec = dec;
@@ -778,6 +893,7 @@ fn run_native_inner(
                                 video_dec = dec;
                                 video_dec_name = dec_name;
                                 drop_until = None;
+                                audio_drop_until = None;
                                 last_dropped_frame = None;
                                 video_time_base = Some({
                                     let tb = &ctx.streams[index].time_base;
@@ -999,13 +1115,24 @@ fn run_native_inner(
                     // Soft-flush audio decoder (append tail to sink, then drain inside main loop).
                     if let Some(ref mut dec) = audio_dec {
                         let _ = dec.send_packet(None);
+                        let audio_time_base = audio_si
+                            .and_then(|si| ctx.streams.get(si))
+                            .map(|s| s.time_base);
                         loop {
                             match dec.receive_frame() {
                                 Ok(DecodeStatus::Frame(f)) => {
                                     let ch = f.channels.max(1);
                                     let rate = f.sample_rate.max(1);
-                                    let samples =
+                                    let mut samples =
                                         frame_to_s16_device(&f, rate, ch).unwrap_or_default();
+                                    apply_audio_seek_trim(
+                                        &mut audio_drop_until,
+                                        audio_time_base
+                                            .and_then(|tb| timestamp_to_duration(f.pts, tb)),
+                                        rate,
+                                        ch,
+                                        &mut samples,
+                                    );
                                     if !samples.is_empty() {
                                         if let Some(ref s) = sink {
                                             s.append(rodio::buffer::SamplesBuffer::new(
@@ -1021,6 +1148,7 @@ fn run_native_inner(
                             }
                         }
                     }
+                    audio_drop_until = None;
                     force_one_frame = false;
                     eof_draining = true;
                     continue;
@@ -1161,6 +1289,7 @@ fn run_native_inner(
             }
             if let Some(ref mut dec) = audio_dec {
                 if dec.send_packet(Some(&packet)).is_ok() {
+                    let audio_time_base = ctx.streams.get(si).map(|s| s.time_base);
                     loop {
                         match dec.receive_frame() {
                             Ok(DecodeStatus::Frame(f)) => {
@@ -1172,8 +1301,18 @@ fn run_native_inner(
                                 }
                                 let device_ch = audio_channels.max(1);
                                 let device_rate = audio_rate.max(1);
-                                let samples = frame_to_s16_device(&f, device_rate, device_ch)
+                                let mut samples = frame_to_s16_device(&f, device_rate, device_ch)
                                     .unwrap_or_default();
+                                let frame_start = audio_time_base.and_then(|tb| {
+                                    timestamp_to_duration(f.pts.or(packet.pts).or(packet.dts), tb)
+                                });
+                                apply_audio_seek_trim(
+                                    &mut audio_drop_until,
+                                    frame_start,
+                                    device_rate,
+                                    device_ch,
+                                    &mut samples,
+                                );
                                 let sample_count = samples.len();
                                 if !samples.is_empty() {
                                     let should_emit_level = last_level_emit
@@ -1343,5 +1482,209 @@ mod tests {
         assert!(a[0].supported, "Flac should be supported");
         assert!(a[1].supported, "Pcm should be supported");
         assert!(!a[2].supported, "Opus should remain unsupported");
+    }
+
+    #[test]
+    fn collect_native_tracks_covers_every_wired_audio_codec() {
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: None,
+            metadata: Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("matroska".into()),
+        };
+        let codecs = [
+            (CodecId::Flac, true),
+            (CodecId::Pcm, true),
+            (CodecId::Aac, true),
+            (CodecId::Mp3, true),
+            (CodecId::Vorbis, true),
+            (CodecId::Alac, true),
+            (CodecId::Opus, false),
+            (CodecId::Unknown, false),
+        ];
+        for (idx, (codec, _)) in codecs.into_iter().enumerate() {
+            let mut s = Stream::new(idx, codec);
+            s.media_type = MediaType::Audio;
+            ctx.add_stream(s);
+        }
+        // Non-A/V streams are not selectable.
+        let mut data = Stream::new(codecs.len(), CodecId::Srt);
+        data.media_type = MediaType::Subtitle;
+        ctx.add_stream(data);
+
+        let (v, a) = collect_native_tracks(&ctx);
+        assert!(v.is_empty());
+        assert_eq!(a.len(), codecs.len());
+        for (idx, ((codec, supported), track)) in codecs.into_iter().zip(&a).enumerate() {
+            assert_eq!(track.index, idx);
+            assert_eq!(track.codec, codec.name());
+            assert_eq!(track.supported, supported, "{codec:?}");
+            assert_eq!(track.sample_rate, None);
+            assert_eq!(track.channels, None);
+        }
+    }
+
+    /// Stereo ramp whose value identifies the sample frame it came from.
+    fn stereo_ramp(frames: i16) -> Vec<i16> {
+        (0..frames).flat_map(|f| [f, -f]).collect()
+    }
+
+    /// Trim a 10 ms (480 frames @ 48 kHz) stereo frame starting at 100 ms.
+    fn trim_10ms_at_100ms(target: Duration) -> (bool, Vec<i16>) {
+        let mut samples = stereo_ramp(480);
+        let kept = trim_audio_samples_before_target(
+            Duration::from_millis(100),
+            48_000,
+            2,
+            target,
+            &mut samples,
+        );
+        (kept, samples)
+    }
+
+    #[test]
+    fn trim_keeps_frames_at_or_after_the_target() {
+        for target_ms in [0, 50, 100] {
+            let (kept, samples) = trim_10ms_at_100ms(Duration::from_millis(target_ms));
+            assert!(kept);
+            assert_eq!(samples, stereo_ramp(480), "target {target_ms} ms");
+        }
+    }
+
+    #[test]
+    fn trim_drops_frames_ending_at_or_before_the_target() {
+        for target_ms in [110, 111, 5_000] {
+            let (kept, samples) = trim_10ms_at_100ms(Duration::from_millis(target_ms));
+            assert!(!kept, "target {target_ms} ms");
+            assert!(samples.is_empty());
+        }
+    }
+
+    #[test]
+    fn trim_cuts_a_straddling_frame_on_a_channel_boundary() {
+        // 2.5 ms into the frame = 120 sample frames.
+        let (kept, samples) = trim_10ms_at_100ms(Duration::from_micros(102_500));
+        assert!(kept);
+        assert_eq!(samples.len(), (480 - 120) * 2);
+        assert_eq!(&samples[..4], &[120, -120, 121, -121]);
+        assert_eq!(&samples[samples.len() - 2..], &[479, -479]);
+    }
+
+    #[test]
+    fn trim_rounds_truncated_timestamps_to_the_nearest_sample() {
+        // 1024 samples @ 48 kHz = 21.333… ms, truncated to whole nanoseconds.
+        let start = Duration::from_nanos(21_333_333);
+        let target = Duration::from_millis(25); // 176.000016 samples later
+        let mut samples: Vec<i16> = (0..1024).collect();
+        assert!(trim_audio_samples_before_target(
+            start,
+            48_000,
+            1,
+            target,
+            &mut samples
+        ));
+        assert_eq!(samples[0], 176);
+        assert_eq!(samples.len(), 1024 - 176);
+    }
+
+    #[test]
+    fn trim_drops_a_frame_with_less_than_half_a_sample_left() {
+        let almost_end = Duration::from_nanos(110_000_000 - 1_000);
+        let (kept, samples) = trim_10ms_at_100ms(almost_end);
+        assert!(!kept);
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn trim_handles_empty_input_and_unknown_layouts() {
+        let (zero, later) = (Duration::ZERO, Duration::from_secs(1));
+        let mut empty = Vec::new();
+        for target in [zero, later] {
+            assert!(!trim_audio_samples_before_target(
+                zero, 48_000, 2, target, &mut empty
+            ));
+        }
+        for (rate, channels) in [(0, 2), (48_000, 0)] {
+            let mut samples = vec![1, 2, 3, 4];
+            assert!(trim_audio_samples_before_target(
+                zero,
+                rate,
+                channels,
+                later,
+                &mut samples
+            ));
+            assert_eq!(samples, vec![1, 2, 3, 4]);
+        }
+        // An extreme start time must not overflow the frame end.
+        let mut samples = vec![1, 2];
+        assert!(!trim_audio_samples_before_target(
+            Duration::MAX - Duration::from_nanos(1),
+            48_000,
+            2,
+            Duration::MAX,
+            &mut samples
+        ));
+    }
+
+    #[cfg(all(
+        feature = "backend-symphonia",
+        feature = "backend-openh264",
+        feature = "audio-rodio"
+    ))]
+    #[test]
+    fn audio_seek_trim_stays_armed_until_the_target_is_reached() {
+        let target = Duration::from_millis(15);
+        let mut drop_until = Some(target);
+        let frame = |ms| Some(Duration::from_millis(ms));
+
+        // Entirely before the target: dropped, still armed.
+        let mut samples = vec![7i16; 10];
+        apply_audio_seek_trim(&mut drop_until, frame(0), 1_000, 1, &mut samples);
+        assert!(samples.is_empty());
+        assert_eq!(drop_until, Some(target));
+
+        // Straddling: trimmed, disarmed.
+        let mut samples = vec![7i16; 10];
+        apply_audio_seek_trim(&mut drop_until, frame(10), 1_000, 1, &mut samples);
+        assert_eq!(samples.len(), 5);
+        assert_eq!(drop_until, None);
+
+        // Disarmed: even an early frame passes through.
+        let mut samples = vec![7i16; 10];
+        apply_audio_seek_trim(&mut drop_until, frame(0), 1_000, 1, &mut samples);
+        assert_eq!(samples.len(), 10);
+
+        // No timestamp: nothing to compare against, so trimming ends.
+        let mut drop_until = Some(target);
+        apply_audio_seek_trim(&mut drop_until, None, 1_000, 1, &mut samples);
+        assert_eq!(samples.len(), 10);
+        assert_eq!(drop_until, None);
+    }
+
+    #[cfg(all(
+        feature = "backend-symphonia",
+        feature = "backend-openh264",
+        feature = "audio-rodio"
+    ))]
+    #[test]
+    fn timestamps_convert_through_the_stream_time_base() {
+        use rsmpeg_util::Rational;
+
+        assert_eq!(
+            timestamp_to_duration(Some(24_000), Rational::new(1, 48_000)),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            timestamp_to_duration(Some(-5), Rational::new(1, 1_000)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(timestamp_to_duration(None, Rational::new(1, 1_000)), None);
+        assert_eq!(timestamp_to_duration(Some(1), Rational::new(1, 0)), None);
+        assert_eq!(timestamp_to_duration(Some(1), Rational::new(0, 1)), None);
     }
 }

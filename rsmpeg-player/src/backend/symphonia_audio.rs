@@ -10,8 +10,8 @@ use rsmpeg_codec::{CodecId, CodecParameters, DecodeStatus, Decoder, Frame, Packe
 use rsmpeg_util::{PixelFormat, Rational, RsError, RsResult, SampleFormat};
 use symphonia::core::audio::{AudioBufferRef, Channels, SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{
-    DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_MP3, CODEC_TYPE_PCM_F32LE, CODEC_TYPE_PCM_S16LE,
-    CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8,
+    DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_MP3, CODEC_TYPE_PCM_F32LE,
+    CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8, CODEC_TYPE_VORBIS,
 };
 use symphonia::core::formats::Packet as SymPacket;
 use symphonia::core::sample::SampleFormat as SymphoniaSampleFormat;
@@ -31,10 +31,15 @@ pub struct SymphoniaAudioDecoder {
 impl SymphoniaAudioDecoder {
     /// Construct from rsmpeg [`CodecParameters`].
     ///
-    /// Supported: [`CodecId::Aac`], [`CodecId::Pcm`], [`CodecId::Mp3`].
+    /// Supported: [`CodecId::Aac`], [`CodecId::Pcm`], [`CodecId::Mp3`],
+    /// [`CodecId::Vorbis`], [`CodecId::Alac`].
     ///
     /// For AAC, `params.extradata` may be a raw AudioSpecificConfig or an MPEG-4
     /// `esds` payload — ASC is extracted automatically when present.
+    ///
+    /// Vorbis and ALAC require `params.extradata`, which is passed to Symphonia
+    /// unchanged: the identification header followed by the setup header for
+    /// Vorbis, and the 24- or 48-byte magic cookie for ALAC.
     pub fn try_new(params: &CodecParameters) -> RsResult<Self> {
         if !Self::supported(params.codec_id) {
             return Err(RsError::Unsupported(std::borrow::Cow::Owned(format!(
@@ -57,6 +62,16 @@ impl SymphoniaAudioDecoder {
             }
             CodecId::Mp3 => {
                 sym_params.for_codec(CODEC_TYPE_MP3);
+            }
+            CodecId::Vorbis | CodecId::Alac => {
+                sym_params.for_codec(if params.codec_id == CodecId::Vorbis {
+                    CODEC_TYPE_VORBIS
+                } else {
+                    CODEC_TYPE_ALAC
+                });
+                if let Some(ref extra) = params.extradata {
+                    sym_params.with_extra_data(extra.clone().into_boxed_slice());
+                }
             }
             CodecId::Pcm => {
                 let fmt = params.sample_format.unwrap_or(SampleFormat::S16);
@@ -118,7 +133,10 @@ impl SymphoniaAudioDecoder {
 
     /// Whether this backend can decode the given codec id.
     pub fn supported(codec_id: CodecId) -> bool {
-        matches!(codec_id, CodecId::Aac | CodecId::Pcm | CodecId::Mp3)
+        matches!(
+            codec_id,
+            CodecId::Aac | CodecId::Pcm | CodecId::Mp3 | CodecId::Vorbis | CodecId::Alac
+        )
     }
 
     fn packet_to_frame(&mut self, packet: &Packet) -> RsResult<Option<Frame>> {
@@ -603,6 +621,80 @@ mod tests {
             p.extradata = Some(asc);
             let dec = SymphoniaAudioDecoder::try_new(&p).expect("aac decoder");
             assert_eq!(dec.codec_id(), CodecId::Aac);
+        }
+    }
+
+    /// 24-byte ALAC magic cookie: 4096-sample frames, 16-bit stereo, 44.1 kHz.
+    fn alac_magic_cookie() -> Vec<u8> {
+        let mut cookie = Vec::with_capacity(24);
+        cookie.extend_from_slice(&4096u32.to_be_bytes()); // frame length
+        cookie.extend_from_slice(&[0, 16, 40, 10, 14, 2]); // version, depth, pb, mb, kb, channels
+        cookie.extend_from_slice(&255u16.to_be_bytes()); // max run
+        cookie.extend_from_slice(&0u32.to_be_bytes()); // max frame bytes
+        cookie.extend_from_slice(&0u32.to_be_bytes()); // average bit rate
+        cookie.extend_from_slice(&44_100u32.to_be_bytes());
+        cookie
+    }
+
+    fn open_error(params: &CodecParameters) -> String {
+        match SymphoniaAudioDecoder::try_new(params) {
+            Err(RsError::Codec(message)) => message.into_owned(),
+            Err(other) => panic!("expected a codec error, got {other:?}"),
+            Ok(_) => panic!("expected {:?} to fail to open", params.codec_id),
+        }
+    }
+
+    #[test]
+    fn vorbis_and_alac_are_supported() {
+        assert!(SymphoniaAudioDecoder::supported(CodecId::Vorbis));
+        assert!(SymphoniaAudioDecoder::supported(CodecId::Alac));
+    }
+
+    #[test]
+    fn construct_alac_from_magic_cookie() {
+        let mut p = CodecParameters::new(CodecId::Alac);
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p.extradata = Some(alac_magic_cookie());
+        let dec = SymphoniaAudioDecoder::try_new(&p).expect("alac decoder");
+        assert_eq!(dec.codec_id(), CodecId::Alac);
+    }
+
+    #[test]
+    fn vorbis_and_alac_without_extradata_fail_cleanly() {
+        for codec in [CodecId::Vorbis, CodecId::Alac] {
+            let message = open_error(&CodecParameters::new(codec));
+            assert!(message.contains("missing extra data"), "{message}");
+        }
+    }
+
+    #[test]
+    fn vorbis_extradata_reaches_symphonia() {
+        // An invalid header is rejected on its content, which is only possible
+        // if the bytes were forwarded.
+        let mut p = CodecParameters::new(CodecId::Vorbis);
+        p.extradata = Some(vec![0u8; 32]);
+        let message = open_error(&p);
+        assert!(message.contains("identification header"), "{message}");
+    }
+
+    #[test]
+    fn non_audio_and_unwired_codecs_are_rejected() {
+        for codec in [
+            CodecId::H264,
+            CodecId::Mjpeg,
+            CodecId::RawVideo,
+            CodecId::Opus,
+            CodecId::Flac,
+            CodecId::Srt,
+            CodecId::Unknown,
+        ] {
+            assert!(!SymphoniaAudioDecoder::supported(codec), "{codec:?}");
+            let result = SymphoniaAudioDecoder::try_new(&CodecParameters::new(codec));
+            assert!(
+                matches!(result, Err(RsError::Unsupported(_))),
+                "{codec:?} must be rejected as unsupported"
+            );
         }
     }
 

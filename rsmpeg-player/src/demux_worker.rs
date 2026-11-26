@@ -134,6 +134,72 @@ fn snap(
     })
 }
 
+/// Media time at which an audio buffer starts, used to anchor the audio sync
+/// clock. Falls back to `fallback` without a usable timestamp or time base.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn audio_anchor_position(
+    pts: Option<i64>,
+    time_base: rsmpeg_util::Rational,
+    fallback: Duration,
+) -> Duration {
+    match pts {
+        Some(ts) if time_base.num > 0 && time_base.den > 0 => {
+            let secs = ts as f64 * f64::from(time_base.num) / f64::from(time_base.den);
+            Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(fallback)
+        }
+        _ => fallback,
+    }
+}
+
+/// Media time of a frame drained from the video decoder at end of stream,
+/// relative to `base_pts`. Falls back to `fallback` without a usable timestamp.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn flushed_frame_position(
+    pts: Option<i64>,
+    sec_per_tick: Option<f64>,
+    base_pts: &mut Option<i64>,
+    fallback: Duration,
+) -> Duration {
+    match (pts, sec_per_tick) {
+        (Some(pts), Some(spt)) if spt > 0.0 && spt.is_finite() => {
+            let base = *base_pts.get_or_insert(0);
+            let secs = pts.saturating_sub(base) as f64 * spt;
+            Duration::try_from_secs_f64(secs.max(0.0)).unwrap_or(fallback)
+        }
+        _ => fallback,
+    }
+}
+
+/// Convert a decoded picture into a [`PlayerEvent::VideoFrame`], or `None` when
+/// it is empty or cannot be converted.
+#[cfg(all(
+    feature = "backend-symphonia",
+    feature = "backend-openh264",
+    feature = "audio-rodio"
+))]
+fn video_frame_event(
+    frame: &rsmpeg_codec::Frame,
+    pts: Duration,
+    generation: u64,
+) -> Option<PlayerEvent> {
+    let rgba = crate::video_convert::frame_to_rgba_cached(frame).ok()?;
+    Some(PlayerEvent::VideoFrame {
+        width: frame.width,
+        height: frame.height,
+        rgba: std::sync::Arc::new(rgba),
+        pts,
+        generation,
+    })
+}
+
 /// Map a Symphonia track + optional avcC blob into rsmpeg H.264 codec parameters.
 #[cfg(all(
     feature = "backend-symphonia",
@@ -599,7 +665,10 @@ fn run_worker(
     const AUDIO_TARGET_MS: u64 = 200;
     let mut audio_target_samples: usize = 0;
     let mut audio_ring = PcmRingBuffer::new(0);
-    let mut audio_play_start: Option<Instant> = None;
+    // Media-time audio position that video is synchronised against.
+    let mut audio_sync_clock = crate::clock::AudioPlaybackClock::new();
+    // 0-relative output pacing: compared with `appended_audio_frames`, which
+    // restarts at zero after every seek.
     let mut audio_throttle_clock = crate::clock::AudioPlaybackClock::new();
     let mut audio_played_base: u64 = 0;
     let mut appended_audio_frames: u64 = 0;
@@ -705,6 +774,7 @@ fn run_worker(
                                     playback_clock.resume();
                                 }
                                 audio_throttle_clock.resume();
+                                audio_sync_clock.resume();
                                 if let Some(ref s) = sink {
                                     s.play();
                                 }
@@ -721,6 +791,7 @@ fn run_worker(
                             was_playing = false;
                             playback_clock.pause();
                             audio_throttle_clock.pause();
+                            audio_sync_clock.pause();
                             if let Some(ref s) = sink {
                                 s.pause();
                             }
@@ -762,7 +833,7 @@ fn run_worker(
                             // Reset the approximate sample throttle so a seek
                             // while paused can never leave the ring permanently full.
                             audio_ring.clear();
-                            audio_play_start = None;
+                            audio_sync_clock.seek(position);
                             audio_throttle_clock.seek(Duration::ZERO);
                             audio_played_base = 0;
                             appended_audio_frames = 0;
@@ -837,6 +908,7 @@ fn run_worker(
                             };
                             playback_clock.set_rate(playback_rate);
                             audio_throttle_clock.set_rate(playback_rate);
+                            audio_sync_clock.set_rate(playback_rate);
                             if let Some(ref s) = sink {
                                 s.set_speed(playback_rate as f32);
                             }
@@ -851,6 +923,7 @@ fn run_worker(
                             was_playing = false;
                             playback_clock.pause();
                             audio_throttle_clock.pause();
+                            audio_sync_clock.pause();
                             if let Some(ref s) = sink {
                                 s.pause();
                             }
@@ -899,7 +972,7 @@ fn run_worker(
                                     video_track.as_ref().or(audio_track.as_ref()).map(|t| t.id);
                                 audio_ring.clear();
                                 audio_target_samples = 0;
-                                audio_play_start = None;
+                                audio_sync_clock.seek(position);
                                 audio_throttle_clock.seek(Duration::ZERO);
                                 audio_played_base = 0;
                                 appended_audio_frames = 0;
@@ -1038,7 +1111,7 @@ fn run_worker(
                                     d.reset();
                                 }
                                 audio_ring.clear();
-                                audio_play_start = None;
+                                audio_sync_clock.seek(position);
                                 audio_throttle_clock.seek(Duration::ZERO);
                                 audio_played_base = 0;
                                 appended_audio_frames = 0;
@@ -1164,25 +1237,52 @@ fn run_worker(
             Err(Error::ResetRequired) | Err(_) => {
                 // EOS: send_packet(None) + drain remaining frames, then drain sink inside main loop.
                 if let Some(ref mut dec) = video_dec {
+                    // Newest flushed frame discarded by the precise-seek filter,
+                    // previewed if nothing reaches the target.
+                    let mut dropped_preview: Option<(rsmpeg_codec::Frame, Duration)> = None;
                     if dec.send_packet(None).is_ok() {
                         loop {
                             match dec.receive_frame() {
                                 Ok(DecodeStatus::Frame(f)) => {
-                                    if let Ok(rgba) = yuv420p_frame_to_rgba_cached(&f) {
-                                        let w = f.width;
-                                        let h = f.height;
-                                        if w > 0 && h > 0 {
-                                            emit(
-                                                &event_tx,
-                                                PlayerEvent::VideoFrame {
-                                                    width: w,
-                                                    height: h,
-                                                    rgba: std::sync::Arc::new(rgba),
-                                                    pts: position,
-                                                    generation,
-                                                },
-                                            );
+                                    if f.width == 0 || f.height == 0 {
+                                        continue;
+                                    }
+                                    let frame_pts = flushed_frame_position(
+                                        f.pts,
+                                        sec_per_tick,
+                                        &mut base_video_pts,
+                                        position,
+                                    );
+                                    if let Some(t) = drop_until {
+                                        if video_scheduler.drop_before_seek(frame_pts, t) {
+                                            if force_one_frame {
+                                                dropped_preview = Some((f, frame_pts));
+                                            }
+                                            continue;
                                         }
+                                        drop_until = None;
+                                    }
+                                    let Some(ev) = video_frame_event(&f, frame_pts, generation)
+                                    else {
+                                        continue;
+                                    };
+                                    position = frame_pts;
+                                    dropped_preview = None;
+                                    if force_one_frame {
+                                        emit_preview(&event_tx, ev);
+                                        if !playing {
+                                            playback_clock.seek(position);
+                                        }
+                                        force_one_frame = false;
+                                        emit(
+                                            &event_tx,
+                                            PlayerEvent::PositionChanged {
+                                                position,
+                                                generation,
+                                            },
+                                        );
+                                    } else {
+                                        emit(&event_tx, ev);
                                     }
                                 }
                                 Ok(DecodeStatus::NeedMoreInput) | Ok(DecodeStatus::EndOfStream) => {
@@ -1192,7 +1292,26 @@ fn run_worker(
                             }
                         }
                     }
+                    if force_one_frame {
+                        if let Some((f, frame_pts)) = dropped_preview {
+                            if let Some(ev) = video_frame_event(&f, frame_pts, generation) {
+                                position = frame_pts;
+                                emit_preview(&event_tx, ev);
+                                if !playing {
+                                    playback_clock.seek(position);
+                                }
+                                emit(
+                                    &event_tx,
+                                    PlayerEvent::PositionChanged {
+                                        position,
+                                        generation,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
+                drop_until = None;
                 if let Some(ref mut dec) = audio_dec {
                     let _ = dec.send_packet(None);
                     loop {
@@ -1312,18 +1431,16 @@ fn run_worker(
                                     video_frame_index += 1;
                                     position = Duration::from_secs_f64(abs_pos.max(0.0));
                                     let frame_pts_secs = abs_pos.max(0.0);
-                                    // Approximate audio playback position: elapsed since the
-                                    // first audio sample was appended to the output sink. With
-                                    // no audio master, align audio position to the frame's own
+                                    // Approximate audio playback position on the media
+                                    // timeline. Until audio output has started (or with
+                                    // no audio at all), align it to the frame's own
                                     // timestamp so we always render (no drift to correct).
-                                    let audio_pos_secs = if has_audio {
-                                        match audio_play_start {
-                                            Some(t0) => t0.elapsed().as_secs_f64(),
-                                            None => 0.0,
-                                        }
-                                    } else {
-                                        frame_pts_secs
-                                    };
+                                    let audio_pos_secs =
+                                        if has_audio && audio_sync_clock.is_output_active() {
+                                            audio_sync_clock.now().as_secs_f64()
+                                        } else {
+                                            frame_pts_secs
+                                        };
                                     let sync_action =
                                         sync_state.sync_decision(frame_pts_secs, audio_pos_secs);
 
@@ -1453,9 +1570,12 @@ fn run_worker(
                                         ));
                                     }
                                     if playing {
-                                        if audio_play_start.is_none() {
-                                            audio_play_start = Some(Instant::now());
-                                        }
+                                        let audio_pts = f.pts.or(Some(packet.ts() as i64));
+                                        audio_sync_clock.start_output_at(audio_anchor_position(
+                                            audio_pts,
+                                            default_audio_tb,
+                                            position,
+                                        ));
                                         audio_throttle_clock.start_output_at(Duration::ZERO);
                                     }
                                 }
@@ -1515,9 +1635,11 @@ fn run_worker(
                                 ));
                             }
                             if playing {
-                                if audio_play_start.is_none() {
-                                    audio_play_start = Some(Instant::now());
-                                }
+                                audio_sync_clock.start_output_at(audio_anchor_position(
+                                    Some(packet.ts() as i64),
+                                    default_audio_tb,
+                                    position,
+                                ));
                                 audio_throttle_clock.start_output_at(Duration::ZERO);
                             }
                         }
@@ -1572,8 +1694,91 @@ fn run_worker(
 ))]
 #[cfg(test)]
 mod tests {
-    use super::WorkerSync;
+    use super::{audio_anchor_position, flushed_frame_position, video_frame_event, WorkerSync};
+    use crate::event::PlayerEvent;
     use crate::sync::SyncAction;
+    use rsmpeg_util::{PixelFormat, Rational};
+    use std::time::Duration;
+
+    #[test]
+    fn audio_anchor_uses_the_media_timestamp() {
+        let fallback = Duration::from_secs(9);
+        let tb = Rational::new(1, 48_000);
+        assert_eq!(
+            audio_anchor_position(Some(240_000), tb, fallback),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            audio_anchor_position(Some(-1), tb, fallback),
+            Duration::ZERO
+        );
+        assert_eq!(audio_anchor_position(None, tb, fallback), fallback);
+        for bad in [Rational::new(0, 1), Rational::new(1, 0)] {
+            assert_eq!(audio_anchor_position(Some(1), bad, fallback), fallback);
+        }
+    }
+
+    #[test]
+    fn sync_clock_anchored_after_a_seek_renders_matching_video() {
+        // A 0-relative audio position would make every post-seek frame "ahead".
+        let mut clock = crate::clock::AudioPlaybackClock::new();
+        clock.seek(Duration::from_secs(5));
+        assert!(!clock.is_output_active());
+        clock.start_output_at(audio_anchor_position(
+            Some(240_000),
+            Rational::new(1, 48_000),
+            Duration::ZERO,
+        ));
+        clock.pause();
+        let audio = clock.now().as_secs_f64();
+        assert_eq!(
+            WorkerSync::new().sync_decision(5.02, audio),
+            SyncAction::Render
+        );
+    }
+
+    #[test]
+    fn flushed_frames_keep_their_own_timestamps() {
+        let fallback = Duration::from_secs(7);
+        let mut base = Some(1_000);
+        assert_eq!(
+            flushed_frame_position(Some(3_500), Some(0.001), &mut base, fallback),
+            Duration::from_millis(2_500)
+        );
+        let mut unset = None;
+        assert_eq!(
+            flushed_frame_position(Some(500), Some(0.001), &mut unset, fallback),
+            Duration::from_millis(500)
+        );
+        assert_eq!(unset, Some(0));
+        for (pts, spt) in [(None, Some(0.001)), (Some(1), None), (Some(1), Some(0.0))] {
+            assert_eq!(
+                flushed_frame_position(pts, spt, &mut base, fallback),
+                fallback
+            );
+        }
+    }
+
+    #[test]
+    fn video_frame_event_converts_supported_frames_only() {
+        let pts = Duration::from_millis(40);
+        let frame = rsmpeg_codec::Frame::new_video(2, 2, PixelFormat::Yuv420P);
+        match video_frame_event(&frame, pts, 3) {
+            Some(PlayerEvent::VideoFrame {
+                width,
+                height,
+                rgba,
+                pts: got,
+                generation,
+            }) => {
+                assert_eq!((width, height, got, generation), (2, 2, pts, 3));
+                assert_eq!(rgba.len(), 2 * 2 * 4);
+            }
+            other => panic!("expected a video frame, got {other:?}"),
+        }
+        let empty = rsmpeg_codec::Frame::new_video(0, 0, PixelFormat::Yuv420P);
+        assert!(video_frame_event(&empty, pts, 3).is_none());
+    }
 
     #[test]
     fn sync_drop_when_video_ahead() {
