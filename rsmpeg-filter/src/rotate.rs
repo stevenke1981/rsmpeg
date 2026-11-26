@@ -23,34 +23,52 @@ impl RotateFilter {
     /// a 4-byte stride (R, G, B, A); for RGBA, `frame.data[0]` is a single tightly-packed
     /// plane. If the source is empty, the frame is left unchanged.
     pub fn apply(&self, frame: &mut Frame) {
+        if frame.pixel_format != rsmpeg_util::PixelFormat::Rgba {
+            return;
+        }
         let sw = frame.width;
         let sh = frame.height;
         if sw == 0 || sh == 0 {
             return;
         }
-        let dw = sh;
-        let dh = sw;
-        let stride = 4usize;
+        let Some(src_row_bytes) = sw.checked_mul(4) else {
+            return;
+        };
+        let src_stride = frame
+            .linesize
+            .first()
+            .copied()
+            .filter(|&ls| ls >= src_row_bytes)
+            .unwrap_or(src_row_bytes);
+        let Some(needed) = sh
+            .checked_sub(1)
+            .and_then(|r| r.checked_mul(src_stride))
+            .and_then(|o| o.checked_add(src_row_bytes))
+        else {
+            return;
+        };
         // Bail out on a missing or truncated packed RGBA plane rather than
         // indexing past its end.
         let Some(src) = frame.data.first() else {
             return;
         };
-        if src.len() < sw * sh * stride {
+        if src.len() < needed {
             return;
         }
-        let mut out = vec![0u8; dw * dh * stride];
-        for dy in 0..dh {
-            for dx in 0..dw {
-                let sx = dy;
+        let dw = sh;
+        let dh = sw;
+        let out_stride = dw * 4;
+        let mut out = vec![0u8; out_stride * dh];
+        for (dy, out_row) in out.chunks_exact_mut(out_stride).enumerate() {
+            let sx_off = dy * 4;
+            for (dx, dst_px) in out_row.chunks_exact_mut(4).enumerate() {
                 let sy = sh - 1 - dx;
-                let s_off = (sy * sw + sx) * stride;
-                let d_off = (dy * dw + dx) * stride;
-                out[d_off..(d_off + stride)].copy_from_slice(&src[s_off..(s_off + stride)]);
+                let s_off = sy * src_stride + sx_off;
+                dst_px.copy_from_slice(&src[s_off..s_off + 4]);
             }
         }
         frame.data = vec![out];
-        frame.linesize = vec![dw * stride];
+        frame.linesize = vec![out_stride];
         frame.width = dw;
         frame.height = dh;
     }
@@ -99,7 +117,7 @@ mod tests {
         }
         let mut frame = Frame::new_video(width, height, PixelFormat::Rgba);
         frame.data[0] = data;
-        frame.linesize[0] = n * 4;
+        frame.linesize[0] = width * 4;
         frame
     }
 
@@ -231,5 +249,38 @@ mod tests {
         RotateFilter::new().apply(&mut frame);
         assert_eq!(frame.data[0], vec![3u8; 4]);
         assert_eq!((frame.width, frame.height), (2, 2));
+    }
+
+    #[test]
+    fn rotate_non_rgba_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        let orig = vec![1u8; 12];
+        frame.data[0] = orig.clone();
+        RotateFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], orig);
+    }
+
+    #[test]
+    fn rotate_honors_padded_linesize_and_1x1() {
+        let mut single = rgba_frame(1, 1, &[(42, 43, 44, 45)]);
+        RotateFilter::new().apply(&mut single);
+        assert_eq!((single.width, single.height), (1, 1));
+        assert_eq!(single.data[0], vec![42, 43, 44, 45]);
+
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        let stride = 12usize; // 2 * 4 active + 4 padding
+        let mut buf = vec![0xEEu8; stride * 2];
+        buf[0..8].copy_from_slice(&[1, 0, 0, 11, 2, 0, 0, 22]);
+        buf[stride..stride + 8].copy_from_slice(&[3, 0, 0, 33, 4, 0, 0, 44]);
+        frame.data[0] = buf;
+        frame.linesize[0] = stride;
+
+        RotateFilter::new().apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (2, 2));
+        assert_eq!(frame.linesize, vec![8]);
+        assert_eq!(
+            frame.data[0],
+            vec![3, 0, 0, 33, 1, 0, 0, 11, 4, 0, 0, 44, 2, 0, 0, 22]
+        );
     }
 }

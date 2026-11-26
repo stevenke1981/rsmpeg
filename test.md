@@ -1,5 +1,22 @@
 # rsmpeg 測試紀錄
 
+## 2026-11-27 — Round 2：Pure-Rust Pipeline v2（Wave 1 + Wave 2）
+
+| 指令／驗證 | 結果 |
+|---|---|
+| `cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check` | PASS |
+| `cargo +stable-x86_64-pc-windows-msvc clippy --locked --workspace --all-targets --all-features -- -D warnings` | PASS（0 warnings） |
+| `cargo +stable-x86_64-pc-windows-msvc clippy --locked -p rsmpeg-player -p rsmpeg-cli --all-targets --no-default-features -- -D warnings` | PASS（0 warnings） |
+| `cargo +stable-x86_64-pc-windows-msvc check --workspace --no-default-features` | PASS |
+| `cargo +stable-x86_64-pc-windows-msvc test -p rsmpeg-player -p rsmpeg-cli --no-default-features` | PASS（200 passed：`rsmpeg-player` 162 unit + 13 integration；`rsmpeg-cli` 25 unit） |
+| `cargo +stable-x86_64-pc-windows-msvc test --locked --workspace` | PASS（**806 passed, 0 failed**：util 68 / codec 82 / format 166 / filter 48 / scale 92 / resample 59 / player 202+22 / gui 42 / cli 25） |
+
+Wave 2 新增測試重點：
+- `rsmpeg-cli`：WAV → 重採樣/混音 WAV（44.1 kHz stereo → 48 kHz mono S16，輸出透過 `FormatContext` + `PCMAudioDecoder` 驗證 480 samples）；`Y4mMuxer` 8×8 `Yuv420P` → `transcode_media` 縮放至 16×16 `Yuv420P` `.y4m` 並透過 `Y4mDemuxer` + `RawVideoDecoder` 雙幀還原驗證；`packed_rgb_to_yuv420p` 黑白轉換、不支援副檔名拒絕、`frame_to_rgb24` 新增 `Nv21` 測試。
+- `rsmpeg-filter`：5 個 RGBA 濾鏡（`BoxBlurFilter`、`CropFilter`、`GrayscaleFilter`、`MirrorFilter`、`RotateFilter`）皆補齊非 RGBA 格式 no-op、padded `linesize[0] > w * 4` 防越界與 `0xEE` 填充不滲漏測試，以及 1×1 邊界測試；同時修正既有 4 個測試輔助函式 `rgba_frame` 誤將 `linesize[0]` 設為 `w * h * 4` 的問題。
+
+---
+
 ## 2026-07-23 — AcmeUI Native 播放器遷移
 
 | 指令／驗證 | 結果 |

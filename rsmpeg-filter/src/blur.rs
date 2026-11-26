@@ -24,52 +24,150 @@ impl BoxBlurFilter {
     /// single tightly-packed plane. The output frame keeps the same dimensions and
     /// stride. If the source is empty, the frame is left unchanged.
     pub fn apply(&self, frame: &mut Frame) {
+        if frame.pixel_format != rsmpeg_util::PixelFormat::Rgba {
+            return;
+        }
         let w = frame.width;
         let h = frame.height;
         if w == 0 || h == 0 {
             return;
         }
-        let stride = 4usize;
+        let Some(row_bytes) = w.checked_mul(4) else {
+            return;
+        };
+        let src_stride = frame
+            .linesize
+            .first()
+            .copied()
+            .filter(|&ls| ls >= row_bytes)
+            .unwrap_or(row_bytes);
+        let Some(needed) = h
+            .checked_sub(1)
+            .and_then(|r| r.checked_mul(src_stride))
+            .and_then(|o| o.checked_add(row_bytes))
+        else {
+            return;
+        };
         // A frame without a packed RGBA plane (or with a plane shorter than the
         // declared geometry) cannot be blurred; leave it untouched instead of
         // panicking on the index.
         let Some(src) = frame.data.first() else {
             return;
         };
-        if src.len() < w * h * stride {
+        if src.len() < needed {
             return;
         }
-        let mut out = vec![0u8; w * h * stride];
-        for y in 0..h {
-            for x in 0..w {
-                let mut sum_r = 0u32;
-                let mut sum_g = 0u32;
-                let mut sum_b = 0u32;
-                let mut count = 0u32;
-                for dy in -1i32..=1 {
-                    for dx in -1i32..=1 {
-                        let nx = x as i32 + dx;
-                        let ny = y as i32 + dy;
-                        if nx < 0 || nx >= w as i32 || ny < 0 || ny >= h as i32 {
-                            continue;
-                        }
-                        let off = ((ny as usize) * w + (nx as usize)) * stride;
-                        sum_r += src[off] as u32;
-                        sum_g += src[off + 1] as u32;
-                        sum_b += src[off + 2] as u32;
-                        count += 1;
-                    }
+        let mut out = vec![0u8; row_bytes * h];
+        for (y, out_row) in out.chunks_exact_mut(row_bytes).enumerate() {
+            if y == 0 || y + 1 == h {
+                for (x, dst_px) in out_row.chunks_exact_mut(4).enumerate() {
+                    blur_clamped_pixel(src, src_stride, w, h, x, y, dst_px);
                 }
-                let off = (y * w + x) * stride;
-                out[off] = (sum_r / count) as u8;
-                out[off + 1] = (sum_g / count) as u8;
-                out[off + 2] = (sum_b / count) as u8;
-                out[off + 3] = src[off + 3];
+                continue;
+            }
+            let r0 = (y - 1) * src_stride;
+            let r1 = y * src_stride;
+            let r2 = (y + 1) * src_stride;
+
+            // Left border column (x = 0)
+            blur_clamped_pixel(src, src_stride, w, h, 0, y, &mut out_row[0..4]);
+
+            // Fast interior path: all 9 neighbors are in bounds (count == 9).
+            if w >= 3 {
+                for (dx, dst_px) in out_row[4..row_bytes - 4].chunks_exact_mut(4).enumerate() {
+                    let x = dx + 1;
+                    let xl = (x - 1) * 4;
+                    let xm = x * 4;
+                    let xr = (x + 1) * 4;
+                    let sum_r = src[r0 + xl] as u32
+                        + src[r0 + xm] as u32
+                        + src[r0 + xr] as u32
+                        + src[r1 + xl] as u32
+                        + src[r1 + xm] as u32
+                        + src[r1 + xr] as u32
+                        + src[r2 + xl] as u32
+                        + src[r2 + xm] as u32
+                        + src[r2 + xr] as u32;
+                    let sum_g = src[r0 + xl + 1] as u32
+                        + src[r0 + xm + 1] as u32
+                        + src[r0 + xr + 1] as u32
+                        + src[r1 + xl + 1] as u32
+                        + src[r1 + xm + 1] as u32
+                        + src[r1 + xr + 1] as u32
+                        + src[r2 + xl + 1] as u32
+                        + src[r2 + xm + 1] as u32
+                        + src[r2 + xr + 1] as u32;
+                    let sum_b = src[r0 + xl + 2] as u32
+                        + src[r0 + xm + 2] as u32
+                        + src[r0 + xr + 2] as u32
+                        + src[r1 + xl + 2] as u32
+                        + src[r1 + xm + 2] as u32
+                        + src[r1 + xr + 2] as u32
+                        + src[r2 + xl + 2] as u32
+                        + src[r2 + xm + 2] as u32
+                        + src[r2 + xr + 2] as u32;
+                    dst_px.copy_from_slice(&[
+                        (sum_r / 9) as u8,
+                        (sum_g / 9) as u8,
+                        (sum_b / 9) as u8,
+                        src[r1 + xm + 3],
+                    ]);
+                }
+            }
+
+            // Right border column (x = w - 1) when w >= 2
+            if w >= 2 {
+                blur_clamped_pixel(
+                    src,
+                    src_stride,
+                    w,
+                    h,
+                    w - 1,
+                    y,
+                    &mut out_row[row_bytes - 4..],
+                );
             }
         }
         frame.data = vec![out];
-        frame.linesize = vec![w * stride];
+        frame.linesize = vec![row_bytes];
     }
+}
+
+#[inline]
+fn blur_clamped_pixel(
+    src: &[u8],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    dst_px: &mut [u8],
+) {
+    let x_start = x.saturating_sub(1);
+    let x_end = (x + 1).min(w - 1);
+    let y_start = y.saturating_sub(1);
+    let y_end = (y + 1).min(h - 1);
+    let mut sum_r = 0u32;
+    let mut sum_g = 0u32;
+    let mut sum_b = 0u32;
+    let mut count = 0u32;
+    for ny in y_start..=y_end {
+        let row_off = ny * src_stride;
+        for nx in x_start..=x_end {
+            let off = row_off + nx * 4;
+            sum_r += src[off] as u32;
+            sum_g += src[off + 1] as u32;
+            sum_b += src[off + 2] as u32;
+            count += 1;
+        }
+    }
+    let center = y * src_stride + x * 4;
+    dst_px.copy_from_slice(&[
+        (sum_r / count) as u8,
+        (sum_g / count) as u8,
+        (sum_b / count) as u8,
+        src[center + 3],
+    ]);
 }
 
 impl Default for BoxBlurFilter {
@@ -115,7 +213,7 @@ mod tests {
         }
         let mut frame = Frame::new_video(width, height, PixelFormat::Rgba);
         frame.data[0] = data;
-        frame.linesize[0] = n * 4;
+        frame.linesize[0] = width * 4;
         frame
     }
 
@@ -226,5 +324,47 @@ mod tests {
         assert_eq!(p[3], 255);
         assert_eq!(p[7], 7);
         assert_eq!(p[11], 255);
+    }
+
+    #[test]
+    fn blur_non_rgba_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgb24);
+        let orig = vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        frame.data[0] = orig.clone();
+        BoxBlurFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], orig);
+        assert_eq!(frame.pixel_format, PixelFormat::Rgb24);
+    }
+
+    #[test]
+    fn blur_honors_padded_linesize() {
+        // 3x3 frame with 4 padding bytes (0xEE) per row: linesize = 3*4 + 4 = 16.
+        let mut frame = Frame::new_video(3, 3, PixelFormat::Rgba);
+        let stride = 16usize;
+        let mut buf = vec![0xEEu8; stride * 3];
+        for y in 0..3 {
+            for x in 0..3 {
+                let off = y * stride + x * 4;
+                let v = if x == 1 && y == 1 { 90 } else { 0 };
+                buf[off] = v;
+                buf[off + 1] = v;
+                buf[off + 2] = v;
+                buf[off + 3] = 255;
+            }
+        }
+        frame.data[0] = buf;
+        frame.linesize[0] = stride;
+
+        BoxBlurFilter::new().apply(&mut frame);
+        assert_eq!(frame.linesize, vec![12]);
+        assert_eq!(frame.data[0].len(), 3 * 12);
+        // Center pixel averages 8 zeros + 90 -> 10; padding 0xEE must never bleed in.
+        let center_off = 4 * 4;
+        assert_eq!(
+            &frame.data[0][center_off..center_off + 4],
+            &[10, 10, 10, 255]
+        );
+        // Top-left corner averages 4 pixels: (0+0+0+90)/4 = 22.
+        assert_eq!(&frame.data[0][0..4], &[22, 22, 22, 255]);
     }
 }

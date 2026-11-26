@@ -1,5 +1,12 @@
 # rsmpeg 改善開發待辦清單
 
+## 2026-11-27 Round 2 Pure-Rust Pipeline v2
+
+- [x] 新增純 Rust `Y4mDemuxer`、`WAVMuxer` 與 `Y4mMuxer`，並將 `FormatContext` 擴充支援 `open_output` / `open_output_buffer` / `write_header` / `write_frame` / `write_trailer`（共 7 demuxers + 2 muxers）。
+- [x] 完成 `rsmpeg-cli` 純 Rust `transcode`（`.flac`/`.wav` → `.wav` 與 `.avi`/`.mp4`/`.y4m` → `.y4m`）及 `list-formats` muxer 列出。
+- [x] 清理 `rsmpeg-cli` 重複直接相依（`symphonia`/`rodio`/`openh264`）並補齊 `pure-rust` / `native-only` / `--no-default-features` feature gates 與 CI 驗證。
+- [x] 優化 `rsmpeg-filter` 5 個 RGBA 濾鏡之內層迴圈、padded `linesize` 支援與非 RGBA 安全防護。
+
 ## 2026-07-23 AcmeUI Native GUI
 
 - [x] 移除 `eframe/egui`，以 AcmeUI Native `Application` + wgpu Scene 取代。
@@ -113,7 +120,7 @@
 
 - [x] 所有修改先建立獨立分支，例如 `feat/native-playback-pipeline`
 - [x] 每個階段完成後執行 `cargo fmt --all`
-- [ ] 每個階段完成後執行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [x] 每個階段完成後執行 `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [x] 每個階段完成後執行 `cargo test --workspace`
 - [x] 所有播放器 queue 必須有容量上限，禁止無限增長
 - [x] 禁止 UI 執行緒直接執行 demux、decode、resample、scale 或等待播放執行緒
@@ -641,13 +648,13 @@ pub trait Decoder: Send {
 
 待辦：
 
-- [ ] 將輸入 sample format 轉成裝置格式
-- [ ] 支援 sample rate conversion
-- [ ] 支援 mono → stereo
-- [ ] 支援 stereo → mono
-- [ ] 支援 5.1 → stereo downmix
-- [ ] 支援 channel mapping matrix
-- [ ] 支援 planar ↔ interleaved
+- [x] 將輸入 sample format 轉成裝置格式
+- [x] 支援 sample rate conversion
+- [x] 支援 mono → stereo
+- [x] 支援 stereo → mono
+- [x] 支援 5.1 → stereo downmix
+- [x] 支援 channel mapping matrix
+- [x] 支援 planar → interleaved（`S16P`/`S32P`/`F32P`/`F64P` 輸入轉交錯輸出）
 - [ ] 支援 drift compensation
 - [ ] 支援 flush 剩餘 samples
 - [ ] 支援重新配置輸入格式
@@ -711,13 +718,13 @@ pub trait Decoder: Send {
 - [x] OpenH264 backend 輸出原始 YUV frame
 - [x] 使用 `rsmpeg-scale` 進行 YUV → RGBA
 - [x] 支援 YUV420P
-- [ ] 支援 YUV422P
-- [ ] 支援 YUV444P
-- [ ] 支援 NV12
+- [x] 支援 YUV422P
+- [x] 支援 YUV444P
+- [x] 支援 NV12（及 NV21）
 - [ ] 支援 10-bit 輸入
 - [x] 支援 BT.601
-- [ ] 支援 BT.709
-- [ ] 支援 BT.2020
+- [x] 支援 BT.709
+- [x] 支援 BT.2020
 - [x] 支援 limited range
 - [x] 支援 full range
 - [ ] 支援 gamma／transfer metadata
@@ -726,7 +733,7 @@ pub trait Decoder: Send {
 - [x] 解析度不變時不得每 frame 重建 scaler（ScalerCache 按 (w,h) 重用）
 - [ ] resolution change 時可重新配置
 - [x] 新增色彩準確度測試
-- [ ] 新增 stride 非等於 width 的測試
+- [x] 新增 stride 非等於 width 的測試
 
 ---
 
@@ -939,10 +946,10 @@ native-only = []
 
 待辦：
 
-- [ ] 將外部 decoder 全部 feature-gate
-- [ ] native pipeline 可獨立編譯
-- [ ] `--no-default-features` 可通過編譯
-- [ ] feature 組合加入 CI
+- [x] 將外部 decoder 全部 feature-gate（`rsmpeg-player` 與 `rsmpeg-cli`）
+- [x] native pipeline 可獨立編譯
+- [x] `--no-default-features` 可通過編譯
+- [x] feature 組合加入 CI（`rsmpeg-player` + `rsmpeg-cli` `--no-default-features` test 與 clippy）
 - [ ] README 清楚標示哪些 backend 為 pure Rust
 - [ ] README 清楚標示 OpenH264 的 native library 性質
 - [ ] 修正「完全無 C dependencies」與實作不一致
@@ -1063,10 +1070,10 @@ native-only = []
 - [x] Ubuntu stable Rust
 - [x] macOS stable Rust
 - [x] `cargo fmt --check`
-- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`（soft / continue-on-error）
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`（required gate，含 `--no-default-features` core crates clippy）
 - [x] `cargo test --workspace`
 - [ ] `cargo test --workspace --no-default-features`
-- [ ] 常用 feature 組合測試
+- [x] 常用 feature 組合測試（`cargo test -p rsmpeg-player -p rsmpeg-cli --no-default-features`）
 - [ ] `cargo deny check`
 - [ ] dependency license check
 - [ ] `cargo audit`
