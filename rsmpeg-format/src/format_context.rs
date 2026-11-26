@@ -109,10 +109,10 @@ impl FormatContext {
                 demuxer = Some(Box::new(crate::demuxers::MP4Demuxer::default()));
             }
             "matroska" | "mkv" | "webm" | "mka" | "mks" => {
-                demuxer = Some(Box::new(crate::demuxers::MKVDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::MKVDemuxer::default()));
             }
             "avi" => {
-                demuxer = Some(Box::new(crate::demuxers::AVIDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::AVIDemuxer::default()));
             }
             "flac" => {
                 demuxer = Some(Box::new(crate::demuxers::FLACDemuxer::default()));
