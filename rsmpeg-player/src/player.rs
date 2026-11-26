@@ -1152,4 +1152,125 @@ mod tests {
         assert!((p.volume() - vol_before).abs() < 1e-6);
         assert!(p.position() >= pos_before);
     }
+
+    #[test]
+    fn shutdown_rejects_every_control_method_without_mutating_state() {
+        let (mut p, cmd_rx, _evt_tx) = make_channel_player();
+        assert!(p.shutdown().is_ok(), "first shutdown must succeed");
+
+        // The only command that reaches the worker is the Shutdown itself.
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(PlayerCommand::Shutdown { .. })
+        ));
+
+        let gen_before = p.generation();
+        let state_before = p.state();
+        let playing_before = p.is_playing();
+        let pos_before = p.position();
+
+        assert!(matches!(p.play(), Err(PlayerError::ShutDown)));
+        assert!(matches!(p.pause(), Err(PlayerError::ShutDown)));
+        assert!(matches!(p.stop(), Err(PlayerError::ShutDown)));
+        assert!(matches!(
+            p.seek(Duration::from_secs(1)),
+            Err(PlayerError::ShutDown)
+        ));
+        assert!(matches!(
+            p.seek_precise(Duration::from_secs(2)),
+            Err(PlayerError::ShutDown)
+        ));
+        assert!(matches!(p.step_forward(), Err(PlayerError::ShutDown)));
+        assert!(matches!(p.set_volume(0.3), Err(PlayerError::ShutDown)));
+        assert!(matches!(
+            p.set_playback_rate(2.0),
+            Err(PlayerError::ShutDown)
+        ));
+        assert!(matches!(
+            p.select_audio_track(1),
+            Err(PlayerError::ShutDown)
+        ));
+        assert!(matches!(
+            p.select_video_track(0),
+            Err(PlayerError::ShutDown)
+        ));
+
+        assert_eq!(p.generation(), gen_before, "generation must not advance");
+        assert_eq!(p.state(), state_before, "state must not change");
+        assert_eq!(p.is_playing(), playing_before);
+        assert_eq!(p.position(), pos_before);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "rejected controls must not enqueue anything"
+        );
+
+        // A second shutdown is idempotent and enqueues nothing further.
+        assert!(p.shutdown().is_ok(), "second shutdown must return Ok");
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(p.generation(), gen_before);
+        assert_eq!(p.state(), state_before);
+    }
+
+    #[test]
+    fn rapid_seek_burst_advances_generation_monotonically_then_saturates() {
+        let (mut p, cmd_rx, _evt_tx) = make_channel_player();
+        let g0 = p.generation();
+
+        // 50 back-to-back seeks alternate between coarse and precise and must
+        // each advance the generation by exactly one.
+        for i in 0..50u64 {
+            let target = Duration::from_millis(i * 100);
+            if i % 2 == 0 {
+                p.seek(target).expect("coarse seek within capacity");
+            } else {
+                p.seek_precise(target)
+                    .expect("precise seek within capacity");
+            }
+            assert_eq!(
+                p.generation(),
+                g0 + i + 1,
+                "seek #{i} must bump generation once"
+            );
+            assert_eq!(p.position(), target);
+            assert_eq!(p.state(), PlayerState::Seeking);
+        }
+
+        // Fill the remaining command slots so the queue is exactly at capacity.
+        for i in 50..(CMD_CAPACITY as u64) {
+            p.seek(Duration::from_millis(i))
+                .expect("fill remaining slots");
+        }
+        let gen_full = p.generation();
+        assert_eq!(gen_full, g0 + CMD_CAPACITY as u64);
+        let pos_full = p.position();
+        let state_full = p.state();
+
+        assert!(matches!(
+            p.seek(Duration::from_secs(9)),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert!(matches!(
+            p.seek_precise(Duration::from_secs(9)),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert!(matches!(
+            p.step_forward(),
+            Err(PlayerError::CommandQueueFull)
+        ));
+        assert_eq!(
+            p.generation(),
+            gen_full,
+            "rejected seeks must not bump generation"
+        );
+        assert_eq!(p.position(), pos_full);
+        assert_eq!(p.state(), state_full);
+
+        // Every accepted command reached the worker in strict generation order.
+        let mut generations = Vec::with_capacity(CMD_CAPACITY);
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            generations.push(cmd.generation());
+        }
+        let expected: Vec<u64> = (g0 + 1..=g0 + CMD_CAPACITY as u64).collect();
+        assert_eq!(generations, expected);
+    }
 }

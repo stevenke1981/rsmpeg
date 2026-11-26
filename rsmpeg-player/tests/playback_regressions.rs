@@ -420,17 +420,43 @@ fn build_pcm_wav(duration_secs: u32) -> Vec<u8> {
 /// Build a valid self-contained H.264 baseline 16×16 MP4 with `frame_count` IDR keyframes
 /// spaced at `frame_duration_ms` intervals (timescale = 1000).
 fn build_h264_mp4(frame_count: u32, frame_duration_ms: u32) -> Vec<u8> {
+    build_h264_movie(1, frame_count, frame_duration_ms, false)
+}
+
+/// Build a self-contained MP4 with `video_tracks` identical H.264 16×16 tracks (track ids
+/// `1..=video_tracks`, each with `frame_count` IDR samples spaced `frame_duration_ms` apart).
+/// When `with_aac` is set, a trailing 48 kHz mono AAC track (track id `video_tracks + 1`)
+/// covers the same duration.
+fn build_h264_movie(
+    video_tracks: u32,
+    frame_count: u32,
+    frame_duration_ms: u32,
+    with_aac: bool,
+) -> Vec<u8> {
     let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isomiso2avc1mp41");
 
     let sample_size = H264_16X16_IDR_SAMPLE.len() as u32;
-    let mut mdat_payload = Vec::with_capacity((sample_size * frame_count) as usize);
-    for _ in 0..frame_count {
-        mdat_payload.extend_from_slice(H264_16X16_IDR_SAMPLE);
+    let track_bytes = sample_size * frame_count;
+    let duration_ms = frame_count * frame_duration_ms;
+    let audio_frames = if with_aac {
+        (u64::from(duration_ms) * 48_000).div_ceil(1024 * 1000) as u32
+    } else {
+        0
+    };
+
+    let mut mdat_payload = Vec::with_capacity((track_bytes * video_tracks) as usize);
+    for _ in 0..video_tracks {
+        for _ in 0..frame_count {
+            mdat_payload.extend_from_slice(H264_16X16_IDR_SAMPLE);
+        }
+    }
+    for _ in 0..audio_frames {
+        mdat_payload.extend_from_slice(AAC_MONO_48K_FRAME);
     }
     let mdat = box_bytes(b"mdat", &mdat_payload);
 
-    let data_offset = (ftyp.len() + 8) as u32;
-    let duration_ms = frame_count * frame_duration_ms;
+    let first_offset = (ftyp.len() + 8) as u32;
+    let track_count = video_tracks + u32::from(with_aac);
 
     // mvhd
     let mut mvhd_body = vec![0u8; 96];
@@ -441,12 +467,52 @@ fn build_h264_mp4(frame_count: u32, frame_duration_ms: u32) -> Vec<u8> {
     mvhd_body[32..36].copy_from_slice(&be32(0x0001_0000));
     mvhd_body[48..52].copy_from_slice(&be32(0x0001_0000));
     mvhd_body[64..68].copy_from_slice(&be32(0x4000_0000));
-    mvhd_body[92..96].copy_from_slice(&be32(2));
+    mvhd_body[92..96].copy_from_slice(&be32(track_count + 1));
     let mvhd = box_bytes(b"mvhd", &fullbox(0, 0, &mvhd_body));
+
+    let mut moov_body = Vec::new();
+    moov_body.extend_from_slice(&mvhd);
+    for t in 0..video_tracks {
+        let offset = first_offset + t * track_bytes;
+        moov_body.extend_from_slice(&build_h264_trak(
+            t + 1,
+            frame_count,
+            frame_duration_ms,
+            offset,
+        ));
+    }
+    if with_aac {
+        let audio_offset = first_offset + video_tracks * track_bytes;
+        moov_body.extend_from_slice(&build_aac_trak(
+            video_tracks + 1,
+            audio_frames,
+            audio_offset,
+            AAC_MONO_48K_FRAME.len() as u32,
+            b"eng",
+        ));
+    }
+    let moov = box_bytes(b"moov", &moov_body);
+
+    let mut file = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&mdat);
+    file.extend_from_slice(&moov);
+    file
+}
+
+/// One H.264 `trak` with track id `track_id` whose samples live at `data_offset`.
+fn build_h264_trak(
+    track_id: u32,
+    frame_count: u32,
+    frame_duration_ms: u32,
+    data_offset: u32,
+) -> Vec<u8> {
+    let sample_size = H264_16X16_IDR_SAMPLE.len() as u32;
+    let duration_ms = frame_count * frame_duration_ms;
 
     // tkhd
     let mut tkhd_body = vec![0u8; 80];
-    tkhd_body[8..12].copy_from_slice(&be32(1));
+    tkhd_body[8..12].copy_from_slice(&be32(track_id));
     tkhd_body[16..20].copy_from_slice(&be32(duration_ms));
     tkhd_body[36..40].copy_from_slice(&be32(0x0001_0000));
     tkhd_body[52..56].copy_from_slice(&be32(0x0001_0000));
@@ -542,18 +608,7 @@ fn build_h264_mp4(frame_count: u32, frame_duration_ms: u32) -> Vec<u8> {
     let mut trak_body = Vec::new();
     trak_body.extend_from_slice(&tkhd);
     trak_body.extend_from_slice(&mdia);
-    let trak = box_bytes(b"trak", &trak_body);
-
-    let mut moov_body = Vec::new();
-    moov_body.extend_from_slice(&mvhd);
-    moov_body.extend_from_slice(&trak);
-    let moov = box_bytes(b"moov", &moov_body);
-
-    let mut file = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
-    file.extend_from_slice(&ftyp);
-    file.extend_from_slice(&mdat);
-    file.extend_from_slice(&moov);
-    file
+    box_bytes(b"trak", &trak_body)
 }
 
 /// P1-03a regression: seeking an audio-only file while paused must NOT trigger `Ended`
@@ -1657,5 +1712,425 @@ fn native_mjpeg_mp4_seek_precise_lands_at_target_while_paused() {
     );
 
     let _ = player.shutdown();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Upper bound for any single control acknowledgement; generous for CI, but tight enough to
+/// catch a worker that stops servicing commands while it waits for the next frame.
+const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn is_warning_for(ev: &PlayerEvent, generation: u64, needle: &str) -> bool {
+    matches!(
+        ev,
+        PlayerEvent::Warning { message, generation: g }
+            if *g == generation && message.contains(needle)
+    )
+}
+
+/// Wait for an acknowledgement of a command issued just before this call, asserting it arrives
+/// within [`ACK_TIMEOUT`].
+fn expect_ack_within(
+    player: &mut Player,
+    what: &str,
+    accept: impl FnMut(PlayerEvent) -> bool,
+) -> Duration {
+    let started = Instant::now();
+    assert!(
+        watch(player, ACK_TIMEOUT, accept),
+        "{what}: no acknowledgement within {ACK_TIMEOUT:?}"
+    );
+    started.elapsed()
+}
+
+/// Invalid track indices must surface as `Warning` events on both pipelines (never a crash or
+/// hang), and the player must still shut down cleanly afterwards.
+#[test]
+fn invalid_track_indices_emit_warning_without_crashing_native_and_fallback() {
+    // One H.264 video track plus one AAC track so both selection paths are exercised.
+    let path = unique_temp_path("invalid_track_idx", "mp4");
+    std::fs::write(&path, build_h264_movie(1, 14, 500, true)).expect("write h264+aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(false)
+            .volume(0.0)
+            .build()
+            .expect("build h264+aac player");
+
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                matches!(ev, PlayerEvent::Tracks { .. })
+            }),
+            "native={prefer_native}: expected Tracks event"
+        );
+
+        player
+            .select_audio_track(99)
+            .expect("enqueue invalid audio track");
+        let audio_gen = player.generation();
+        assert!(
+            watch(&mut player, ACK_TIMEOUT, |ev| {
+                is_warning_for(&ev, audio_gen, "invalid audio track")
+            }),
+            "native={prefer_native}: expected invalid-audio-track Warning at gen={audio_gen}"
+        );
+
+        player
+            .select_video_track(99)
+            .expect("enqueue invalid video track");
+        let video_gen = player.generation();
+        assert!(
+            watch(&mut player, ACK_TIMEOUT, |ev| {
+                is_warning_for(&ev, video_gen, "invalid video track")
+            }),
+            "native={prefer_native}: expected invalid-video-track Warning at gen={video_gen}"
+        );
+
+        assert!(
+            player.shutdown().is_ok(),
+            "native={prefer_native}: shutdown after invalid track selection must succeed"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Stepping while paused must advance the generation once per step and leave the player paused.
+/// On the native pipeline each step must also emit exactly one advancing preview frame.
+#[test]
+fn step_forward_while_paused_emits_frame_and_stays_paused_native_and_fallback() {
+    // 20 keyframes × 250 ms = 5 s of 16×16 H.264, plus an AAC track so the fallback opens the file.
+    // Only the native pipeline decodes H.264 MP4 video; the fallback is held to the control
+    // contract (generation, paused state, no playing snapshot) without expecting preview frames.
+    let path = unique_temp_path("step_forward_paused", "mp4");
+    std::fs::write(&path, build_h264_movie(1, 20, 250, true)).expect("write h264+aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(false)
+            .volume(0.0)
+            .build()
+            .expect("build paused h264 player");
+
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                matches!(ev, PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing)
+            }),
+            "native={prefer_native}: expected initial paused snapshot"
+        );
+        let base_gen = player.generation();
+
+        let mut prev_pts: Option<Duration> = None;
+        for step in 1..=2u64 {
+            player.step_forward().expect("step_forward while paused");
+            let step_gen = player.generation();
+            assert_eq!(step_gen, base_gen + step, "step must bump generation once");
+            assert!(!player.is_playing());
+            assert_eq!(player.state(), PlayerState::Paused);
+
+            let mut frame_pts = None;
+            let mut saw_playing = false;
+            // Native: wait for the preview frame. Fallback: nothing to wait for, so only
+            // check that no playing snapshot is produced within a short window.
+            let window = if prefer_native {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_millis(300)
+            };
+            let got = watch(&mut player, window, |ev| match ev {
+                PlayerEvent::VideoFrame {
+                    pts, generation, ..
+                } if generation == step_gen => {
+                    frame_pts = Some(pts);
+                    true
+                }
+                PlayerEvent::Snapshot(s) if s.playing => {
+                    saw_playing = true;
+                    false
+                }
+                _ => false,
+            });
+            assert!(
+                !saw_playing,
+                "native={prefer_native}: step {step} must not report a playing snapshot"
+            );
+            if prefer_native {
+                assert!(
+                    got,
+                    "native={prefer_native}: expected preview VideoFrame for step {step} (gen={step_gen})"
+                );
+                let pts = frame_pts.expect("frame pts recorded");
+                if let Some(prev) = prev_pts {
+                    assert!(
+                        pts > prev,
+                        "native={prefer_native}: step {step} must advance PTS past {prev:?}, got {pts:?}"
+                    );
+                }
+                prev_pts = Some(pts);
+            }
+        }
+
+        // Settle, then confirm no further frames or playing snapshots appear on their own.
+        thread::sleep(Duration::from_millis(150));
+        let mut extra_frames = 0usize;
+        let mut playing_snapshots = 0usize;
+        while let Some(ev) = player.poll_event() {
+            match ev {
+                PlayerEvent::VideoFrame { .. } => extra_frames += 1,
+                PlayerEvent::Snapshot(s) if s.playing => playing_snapshots += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            extra_frames, 0,
+            "native={prefer_native}: stepping must not keep emitting frames"
+        );
+        assert_eq!(
+            playing_snapshots, 0,
+            "native={prefer_native}: player must stay paused after stepping"
+        );
+        assert!(!player.is_playing());
+        assert!(!player.snapshot().playing);
+
+        assert!(player.shutdown().is_ok());
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A burst of 12 rapid seeks (alternating coarse and precise) on a paused H.264+AAC file must
+/// settle on the final generation: one `SeekCompleted` at the last target (plus its preview frame
+/// on the native pipeline), with no `Error` and no hang.
+#[test]
+fn rapid_consecutive_seeks_deliver_final_generation_preview_native_and_fallback() {
+    let path = unique_temp_path("rapid_seeks", "mp4");
+    std::fs::write(&path, build_h264_movie(1, 14, 500, true)).expect("write h264+aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(false)
+            .volume(0.0)
+            .build()
+            .expect("build paused h264+aac player");
+
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                matches!(ev, PlayerEvent::Snapshot(s) if s.status == "paused")
+            }),
+            "native={prefer_native}: expected initial paused snapshot"
+        );
+        let start_gen = player.generation();
+
+        let mut last_target = Duration::ZERO;
+        for i in 1..=12u64 {
+            last_target = Duration::from_millis(i * 300);
+            let issued = if i % 2 == 0 {
+                player.seek(last_target)
+            } else {
+                player.seek_precise(last_target)
+            };
+            issued.expect("rapid seek must enqueue within capacity");
+        }
+        let final_gen = player.generation();
+        assert_eq!(
+            final_gen,
+            start_gen + 12,
+            "each seek must bump generation once"
+        );
+
+        let mut ack = None;
+        let mut preview = false;
+        let mut error = None;
+        let settled = watch(&mut player, Duration::from_secs(5), |ev| {
+            match ev {
+                PlayerEvent::SeekCompleted {
+                    position,
+                    generation,
+                } if generation == final_gen => ack = Some(position),
+                PlayerEvent::VideoFrame { generation, .. } if generation == final_gen => {
+                    preview = true;
+                }
+                PlayerEvent::Error {
+                    message,
+                    generation,
+                } if generation == final_gen => error = Some(message),
+                _ => {}
+            }
+            // Only native decodes this H.264 MP4 video, so the preview is required there alone.
+            ack.is_some() && (preview || !prefer_native)
+        });
+
+        assert!(
+            error.is_none(),
+            "native={prefer_native}: unexpected error for final seek: {error:?}"
+        );
+        assert!(
+            settled,
+            "native={prefer_native}: expected SeekCompleted (+ preview on native) at gen={final_gen} (ack={ack:?}, preview={preview})"
+        );
+        assert_eq!(
+            ack,
+            Some(last_target),
+            "native={prefer_native}: final SeekCompleted must report the last target"
+        );
+
+        assert!(player.shutdown().is_ok());
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// With a slow 2 fps stream the worker spends most of its time waiting for the next frame. Rate
+/// changes, pause, play and stop issued during that wait must each be acknowledged promptly.
+#[test]
+fn wait_loop_responds_promptly_to_rate_change_pause_and_stop() {
+    // 10 keyframes × 500 ms = 5 s at 2 fps, plus an AAC track so the fallback opens the file.
+    let path = unique_temp_path("wait_loop_ack", "mp4");
+    std::fs::write(&path, build_h264_movie(1, 10, 500, true)).expect("write slow h264+aac fixture");
+
+    for prefer_native in [true, false] {
+        let mut player = Player::builder()
+            .input(&path)
+            .prefer_native_pipeline(prefer_native)
+            .autoplay(true)
+            .volume(0.0)
+            .build()
+            .expect("build slow h264 player");
+
+        // Native decodes the first frame; the fallback has no video decoder for this file, so
+        // a playing snapshot is the only start signal it provides.
+        assert!(
+            watch(&mut player, Duration::from_secs(3), |ev| {
+                matches!(ev, PlayerEvent::VideoFrame { .. })
+                    || matches!(&ev, PlayerEvent::Snapshot(s) if s.playing)
+            }),
+            "native={prefer_native}: expected playback to start"
+        );
+
+        player
+            .set_playback_rate(2.0)
+            .expect("enqueue playback rate");
+        let rate_wait = expect_ack_within(
+            &mut player,
+            "set_playback_rate",
+            |ev| matches!(ev, PlayerEvent::Snapshot(s) if s.status == "rate"),
+        );
+        assert!(
+            rate_wait < ACK_TIMEOUT,
+            "native={prefer_native}: rate ack took {rate_wait:?}"
+        );
+
+        player.pause().expect("enqueue pause");
+        let pause_wait = expect_ack_within(
+            &mut player,
+            "pause",
+            |ev| matches!(ev, PlayerEvent::Snapshot(s) if s.status == "paused" && !s.playing),
+        );
+        assert!(
+            pause_wait < ACK_TIMEOUT,
+            "native={prefer_native}: pause ack took {pause_wait:?}"
+        );
+        assert!(!player.is_playing());
+
+        player.play().expect("enqueue play");
+        let play_wait = expect_ack_within(
+            &mut player,
+            "play",
+            |ev| matches!(ev, PlayerEvent::Snapshot(s) if s.status == "playing" && s.playing),
+        );
+        assert!(
+            play_wait < ACK_TIMEOUT,
+            "native={prefer_native}: play ack took {play_wait:?}"
+        );
+        assert!(player.is_playing());
+
+        player.stop().expect("enqueue stop");
+        let stop_wait = expect_ack_within(
+            &mut player,
+            "stop",
+            |ev| matches!(ev, PlayerEvent::Snapshot(s) if s.status == "stopped" && !s.playing),
+        );
+        assert!(
+            stop_wait < ACK_TIMEOUT,
+            "native={prefer_native}: stop ack took {stop_wait:?}"
+        );
+        assert_eq!(player.state(), PlayerState::Ready);
+
+        assert!(player.shutdown().is_ok());
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Switching between two H.264 video tracks on the native pipeline must report the new active
+/// track in `Tracks` and deliver a preview frame stamped with the new generation.
+#[test]
+fn multi_video_track_switch_native_updates_active_video_and_emits_frame() {
+    // Two identical H.264 tracks (ids 1 and 2), 10 frames × 200 ms each.
+    let path = unique_temp_path("multi_video_switch", "mp4");
+    std::fs::write(&path, build_h264_movie(2, 10, 200, false)).expect("write 2-video fixture");
+
+    let mut player = Player::builder()
+        .input(&path)
+        .prefer_native_pipeline(true)
+        .autoplay(false)
+        .volume(0.0)
+        .build()
+        .expect("build 2-video player");
+
+    let mut initial_tracks = None;
+    let found = watch(&mut player, Duration::from_secs(3), |ev| {
+        if let PlayerEvent::Tracks { video_tracks, .. } = ev {
+            let two = video_tracks.len() == 2;
+            initial_tracks = Some(video_tracks);
+            return two;
+        }
+        false
+    });
+    assert!(found, "expected initial Tracks event with two video tracks");
+    let tracks = initial_tracks.expect("tracks recorded");
+    assert!(tracks.iter().all(|t| t.is_video));
+    let second_idx = tracks[1].index;
+    assert_ne!(
+        tracks[0].index, second_idx,
+        "video track indices must differ"
+    );
+
+    player
+        .select_video_track(second_idx)
+        .expect("enqueue video track switch");
+    let switch_gen = player.generation();
+
+    let mut active_ok = false;
+    let mut frame_ok = false;
+    let done = watch(&mut player, Duration::from_secs(3), |ev| {
+        match ev {
+            PlayerEvent::Tracks {
+                active_video,
+                generation,
+                ..
+            } if generation == switch_gen => {
+                active_ok = active_video == Some(second_idx);
+            }
+            PlayerEvent::VideoFrame { generation, .. } if generation == switch_gen => {
+                frame_ok = true;
+            }
+            _ => {}
+        }
+        active_ok && frame_ok
+    });
+    assert!(
+        done,
+        "expected Tracks(active_video={second_idx}) and VideoFrame at gen={switch_gen} \
+         (active_ok={active_ok}, frame_ok={frame_ok})"
+    );
+
+    assert!(player.shutdown().is_ok());
     let _ = std::fs::remove_file(&path);
 }

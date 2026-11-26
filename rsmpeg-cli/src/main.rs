@@ -130,8 +130,13 @@ fn cmd_probe(input: &str, json: bool, verbose: bool) {
                             "index": s.index,
                             "codec": format!("{:?}", s.codec_id),
                             "media_type": format!("{:?}", s.media_type),
-                            "duration_ms": s.duration,
+                            "duration_ms": (s.duration_seconds() * 1000.0).round() as i64,
+                            "duration_ticks": s.duration,
                             "duration_sec": s.duration_seconds(),
+                            "width": s.codec_params.width,
+                            "height": s.codec_params.height,
+                            "sample_rate": s.codec_params.sample_rate,
+                            "channels": s.codec_params.channels,
                         })
                     })
                     .collect();
@@ -190,9 +195,9 @@ fn cmd_probe(input: &str, json: bool, verbose: bool) {
                         println!("     Codec:     {}", codec_name);
                         println!("     Type:      {}", media_name);
                         println!(
-                            "     Duration:  {} ms ({:.3}s)",
-                            stream.duration,
-                            stream.duration_seconds()
+                            "     Duration:  {:.3}s ({} ticks)",
+                            stream.duration_seconds(),
+                            stream.duration
                         );
                         // `if let` + shadowed value: the previous
                         // `unwrap_or(0) > 0` guard followed by `unwrap()` was
@@ -466,12 +471,60 @@ fn init_pure_rust_audio_decoder(
     Ok(Some((stream.index, sample_rate, channels, dec)))
 }
 
-fn frame_to_rgb24(frame: &rsmpeg::Frame) -> Option<Vec<u8>> {
-    let w = frame.width;
-    let h = frame.height;
-    if w == 0 || h == 0 || frame.data.is_empty() {
+/// Run `frame` through [`rsmpeg::scale::Scaler`] at its native size and return
+/// the tightly packed `dst` pixels (`bytes_per_pixel` per pixel, no row padding).
+fn scale_frame_to_packed(
+    frame: &rsmpeg::Frame,
+    dst: rsmpeg::PixelFormat,
+    bytes_per_pixel: usize,
+) -> Option<Vec<u8>> {
+    let w = u32::try_from(frame.width).ok()?;
+    let h = u32::try_from(frame.height).ok()?;
+    let config = rsmpeg::scale::ScalerConfig::new(w, h, frame.pixel_format, w, h, dst);
+    let scaler = rsmpeg::scale::Scaler::new(config).ok()?;
+    let out = scaler.scale(frame).ok()?;
+
+    let row_bytes = frame.width.checked_mul(bytes_per_pixel)?;
+    let plane = out.data.first()?;
+    let stride = out.linesize.first().copied().unwrap_or(row_bytes);
+    if stride < row_bytes {
         return None;
     }
+    let mut packed = Vec::with_capacity(row_bytes.checked_mul(frame.height)?);
+    for y in 0..frame.height {
+        let start = y.checked_mul(stride)?;
+        packed.extend_from_slice(plane.get(start..start.checked_add(row_bytes)?)?);
+    }
+    Some(packed)
+}
+
+fn frame_to_rgb24(frame: &rsmpeg::Frame) -> Option<Vec<u8>> {
+    if frame.width == 0 || frame.height == 0 || frame.data.is_empty() {
+        return None;
+    }
+    match frame.pixel_format {
+        rsmpeg::PixelFormat::Yuv420P | rsmpeg::PixelFormat::Nv12 => {
+            scale_frame_to_packed(frame, rsmpeg::PixelFormat::Rgb24, 3)
+        }
+        // The Scaler has no Yuv422P -> Rgb24 kernel, so take the Rgba path and
+        // drop the constant alpha byte.
+        rsmpeg::PixelFormat::Yuv422P => {
+            let rgba = scale_frame_to_packed(frame, rsmpeg::PixelFormat::Rgba, 4)?;
+            Some(
+                rgba.chunks_exact(4)
+                    .flat_map(|px| [px[0], px[1], px[2]])
+                    .collect(),
+            )
+        }
+        _ => packed_frame_to_rgb24(frame),
+    }
+}
+
+/// Convert an already-packed RGB24/BGR24/RGBA/BGRA/Gray8 frame, honouring
+/// `linesize` padding.
+fn packed_frame_to_rgb24(frame: &rsmpeg::Frame) -> Option<Vec<u8>> {
+    let w = frame.width;
+    let h = frame.height;
     let plane = &frame.data[0];
     let row_bytes = match frame.pixel_format {
         rsmpeg::PixelFormat::Rgb24 | rsmpeg::PixelFormat::Bgr24 => w.checked_mul(3)?,
@@ -577,8 +630,10 @@ fn write_ppm_to<W: Write>(
 }
 
 fn write_ppm_file(path: &Path, width: usize, height: usize, rgb24: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    write_ppm_to(&mut file, width, height, rgb24)
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    write_ppm_to(&mut writer, width, height, rgb24)?;
+    writer.flush()
 }
 
 fn append_pcm_samples_i16(frame: &rsmpeg::Frame, out: &mut Vec<i16>) {
@@ -681,8 +736,10 @@ fn write_wav_file(
     channels: u16,
     samples: &[i16],
 ) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    write_wav_to(&mut file, sample_rate, channels, samples)
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    write_wav_to(&mut writer, sample_rate, channels, samples)?;
+    writer.flush()
 }
 
 struct DecodeStats {
@@ -1068,5 +1125,212 @@ mod tests {
             frame_to_rgb24(&f_gray),
             Some(vec![77, 77, 77, 200, 200, 200])
         );
+    }
+
+    /// Build a packed frame whose plane 0 carries filler bytes (`0xEE`) after
+    /// every `row_bytes` of pixel data, so `linesize` padding must be skipped.
+    fn padded_packed_frame(
+        w: usize,
+        h: usize,
+        pix: rsmpeg::PixelFormat,
+        row_bytes: usize,
+        stride: usize,
+        rows: &[&[u8]],
+    ) -> rsmpeg::Frame {
+        let mut frame = rsmpeg::Frame::new_video(w, h, pix);
+        let mut plane = vec![0xEE; stride * h];
+        for (y, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), row_bytes);
+            plane[y * stride..y * stride + row_bytes].copy_from_slice(row);
+        }
+        frame.data = vec![plane];
+        frame.linesize = vec![stride];
+        frame
+    }
+
+    #[test]
+    fn frame_to_rgb24_packed_formats_ignore_padded_linesize() {
+        let expected = Some(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+        let rgb = padded_packed_frame(
+            2,
+            2,
+            rsmpeg::PixelFormat::Rgb24,
+            6,
+            10,
+            &[&[1, 2, 3, 4, 5, 6], &[7, 8, 9, 10, 11, 12]],
+        );
+        assert_eq!(frame_to_rgb24(&rgb), expected);
+
+        let bgr = padded_packed_frame(
+            2,
+            2,
+            rsmpeg::PixelFormat::Bgr24,
+            6,
+            10,
+            &[&[3, 2, 1, 6, 5, 4], &[9, 8, 7, 12, 11, 10]],
+        );
+        assert_eq!(frame_to_rgb24(&bgr), expected);
+
+        let rgba = padded_packed_frame(
+            2,
+            2,
+            rsmpeg::PixelFormat::Rgba,
+            8,
+            12,
+            &[&[1, 2, 3, 255, 4, 5, 6, 255], &[7, 8, 9, 0, 10, 11, 12, 0]],
+        );
+        assert_eq!(frame_to_rgb24(&rgba), expected);
+
+        let bgra = padded_packed_frame(
+            2,
+            2,
+            rsmpeg::PixelFormat::Bgra,
+            8,
+            12,
+            &[&[3, 2, 1, 255, 6, 5, 4, 255], &[9, 8, 7, 0, 12, 11, 10, 0]],
+        );
+        assert_eq!(frame_to_rgb24(&bgra), expected);
+
+        let gray = padded_packed_frame(
+            2,
+            2,
+            rsmpeg::PixelFormat::Gray8,
+            2,
+            5,
+            &[&[10, 20], &[30, 40]],
+        );
+        assert_eq!(
+            frame_to_rgb24(&gray),
+            Some(vec![10, 10, 10, 20, 20, 20, 30, 30, 30, 40, 40, 40])
+        );
+    }
+
+    /// Build a 2×2 YUV frame with explicit plane buffers and strides.
+    fn yuv_frame(
+        pix: rsmpeg::PixelFormat,
+        planes: Vec<Vec<u8>>,
+        linesize: Vec<usize>,
+    ) -> rsmpeg::Frame {
+        let mut frame = rsmpeg::Frame::new_video(2, 2, pix);
+        frame.data = planes;
+        frame.linesize = linesize;
+        frame
+    }
+
+    #[test]
+    fn frame_to_rgb24_converts_planar_and_semi_planar_yuv_via_scaler() {
+        // Limited-range Y 16 is black and Y 235 is white; neutral chroma (128)
+        // keeps every pixel on the grey axis.
+        let black_white = vec![0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255];
+        let y_plane = vec![16, 235, 16, 235];
+
+        let yuv420 = yuv_frame(
+            rsmpeg::PixelFormat::Yuv420P,
+            vec![y_plane.clone(), vec![128], vec![128]],
+            vec![2, 1, 1],
+        );
+        assert_eq!(frame_to_rgb24(&yuv420), Some(black_white.clone()));
+
+        // Padded strides: Y has 2 filler bytes per row, chroma has 2 per row.
+        let yuv420_padded = yuv_frame(
+            rsmpeg::PixelFormat::Yuv420P,
+            vec![
+                vec![16, 235, 0xEE, 0xEE, 16, 235, 0xEE, 0xEE],
+                vec![128, 0xEE, 0xEE],
+                vec![128, 0xEE, 0xEE],
+            ],
+            vec![4, 3, 3],
+        );
+        assert_eq!(frame_to_rgb24(&yuv420_padded), Some(black_white.clone()));
+
+        let nv12 = yuv_frame(
+            rsmpeg::PixelFormat::Nv12,
+            vec![y_plane.clone(), vec![128, 128]],
+            vec![2, 2],
+        );
+        assert_eq!(frame_to_rgb24(&nv12), Some(black_white.clone()));
+
+        let yuv422 = yuv_frame(
+            rsmpeg::PixelFormat::Yuv422P,
+            vec![y_plane, vec![128, 128], vec![128, 128]],
+            vec![2, 1, 1],
+        );
+        assert_eq!(frame_to_rgb24(&yuv422), Some(black_white));
+    }
+
+    #[test]
+    fn append_pcm_samples_f32_clamps_and_maps_non_finite_to_zero() {
+        let samples = [-1.0f32, 0.0, 1.0, 2.5, -2.5, f32::NAN, f32::INFINITY];
+        let mut frame =
+            rsmpeg::Frame::new_audio(rsmpeg::SampleFormat::F32, 48_000, 1, samples.len());
+        frame.data[0].clear();
+        for s in samples {
+            frame.data[0].extend_from_slice(&s.to_le_bytes());
+        }
+
+        let mut out = Vec::new();
+        append_pcm_samples_i16(&frame, &mut out);
+        assert_eq!(out, vec![-32767, 0, 32767, 32767, -32767, 0, 0]);
+    }
+
+    fn empty_decode_stats(max_frames: Option<usize>) -> DecodeStats {
+        DecodeStats {
+            video_frames: 0,
+            audio_frames: 0,
+            total_audio_samples: 0,
+            audio_sample_rate: 0,
+            audio_channels: 0,
+            pcm_samples: Vec::new(),
+            ppm_written: false,
+            wrote_path: None,
+            want_ppm: false,
+            want_wav: false,
+            output: None,
+            max_frames,
+        }
+    }
+
+    fn stereo_audio_frame() -> rsmpeg::Frame {
+        rsmpeg::Frame::new_audio(rsmpeg::SampleFormat::S16, 48_000, 2, 4)
+    }
+
+    fn tiny_video_frame() -> rsmpeg::Frame {
+        rsmpeg::Frame::new_video(2, 2, rsmpeg::PixelFormat::Rgb24)
+    }
+
+    #[test]
+    fn decode_stats_stops_counting_once_max_frames_reached() {
+        let mut stats = empty_decode_stats(Some(3));
+        stats.handle_audio_frames(&[stereo_audio_frame(), stereo_audio_frame()]);
+        assert!(!stats.at_limit());
+        assert_eq!(stats.audio_frames, 2);
+
+        // Only one of the two video frames fits under the limit of 3.
+        stats.handle_video_frames(&[tiny_video_frame(), tiny_video_frame()]);
+        assert_eq!(stats.video_frames, 1);
+        assert_eq!(stats.audio_frames, 2);
+        assert!(stats.at_limit());
+        assert_eq!(stats.total_audio_samples, 8);
+
+        // Once at the limit, further frames of either kind are ignored.
+        stats.handle_audio_frames(&[stereo_audio_frame()]);
+        stats.handle_video_frame(&tiny_video_frame());
+        assert_eq!(stats.video_frames, 1);
+        assert_eq!(stats.audio_frames, 2);
+        assert_eq!(stats.total_audio_samples, 8);
+    }
+
+    #[test]
+    fn decode_stats_without_limit_counts_every_frame() {
+        let mut stats = empty_decode_stats(None);
+        stats.handle_audio_frames(&[
+            stereo_audio_frame(),
+            stereo_audio_frame(),
+            stereo_audio_frame(),
+        ]);
+        assert!(!stats.at_limit());
+        assert_eq!(stats.audio_frames, 3);
+        assert_eq!(stats.total_audio_samples, 12);
     }
 }
