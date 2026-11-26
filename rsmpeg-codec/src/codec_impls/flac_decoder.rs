@@ -66,46 +66,88 @@ fn crc16(data: &[u8]) -> u16 {
     crc
 }
 
-/// MSB-first bitstream reader with byte position tracking.
+/// MSB-first bitstream reader backed by a 64-bit bit reservoir.
+///
+/// `bit_buf` holds the next `bit_count` unread bits left-aligned (bit 63 is
+/// the next bit); every bit below that window is kept zero so `read_unary`
+/// can use `leading_zeros()` directly. Only whole bytes are ever loaded into
+/// the reservoir, so the consumed-bit position — and with it
+/// [`byte_position`](Self::byte_position), which the CRC-8 / CRC-16 checks
+/// depend on — stays exact.
 struct BitReader<'a> {
     data: &'a [u8],
-    byte_pos: usize,
-    bit_offset: u8,
+    /// Index of the next byte to load into the reservoir.
+    raw_pos: usize,
+    bit_buf: u64,
+    bit_count: u8,
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self {
             data,
-            byte_pos: 0,
-            bit_offset: 0,
+            raw_pos: 0,
+            bit_buf: 0,
+            bit_count: 0,
         }
     }
 
+    /// Byte offset of the next unread bit (exact when byte-aligned, which is
+    /// the only place the decoder asks for it; otherwise the byte containing
+    /// the next bit).
     fn byte_position(&self) -> usize {
-        self.byte_pos
+        (self.raw_pos * 8 - usize::from(self.bit_count)) / 8
     }
 
+    /// Discard the bits remaining in the current partially-consumed byte.
     fn align_to_byte(&mut self) {
-        if self.bit_offset != 0 {
-            self.bit_offset = 0;
-            self.byte_pos += 1;
+        let drop = self.bit_count % 8;
+        if drop != 0 {
+            self.bit_buf <<= drop;
+            self.bit_count -= drop;
         }
+    }
+
+    /// Top up the reservoir with as many whole bytes as fit.
+    #[inline]
+    fn refill(&mut self) {
+        let room_bytes = usize::from((64 - self.bit_count) / 8);
+        if room_bytes == 0 {
+            return;
+        }
+        if let Some(chunk) = self.data.get(self.raw_pos..self.raw_pos + 8) {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            let new_count = self.bit_count + (room_bytes as u8) * 8;
+            // `bit_count <= 56` here because `room_bytes >= 1`.
+            let mut add = u64::from_be_bytes(word) >> self.bit_count;
+            if new_count < 64 {
+                add &= !(u64::MAX >> new_count);
+            }
+            self.bit_buf |= add;
+            self.bit_count = new_count;
+            self.raw_pos += room_bytes;
+        } else {
+            while self.bit_count <= 56 && self.raw_pos < self.data.len() {
+                self.bit_buf |= u64::from(self.data[self.raw_pos]) << (56 - self.bit_count);
+                self.bit_count += 8;
+                self.raw_pos += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn consume(&mut self, n: u8) {
+        self.bit_buf = self.bit_buf.checked_shl(u32::from(n)).unwrap_or(0);
+        self.bit_count -= n;
+    }
+
+    fn eof_err() -> RsError {
+        RsError::InvalidData("FLAC: unexpected end of bitstream".into())
     }
 
     fn read_bit(&mut self) -> RsResult<u8> {
-        if self.byte_pos >= self.data.len() {
-            return Err(RsError::InvalidData(
-                "FLAC: unexpected end of bitstream".into(),
-            ));
-        }
-        let bit = (self.data[self.byte_pos] >> (7 - self.bit_offset)) & 1;
-        self.bit_offset += 1;
-        if self.bit_offset == 8 {
-            self.bit_offset = 0;
-            self.byte_pos += 1;
-        }
-        Ok(bit)
+        Ok(self.read_bits(1)? as u8)
     }
 
     fn read_bits(&mut self, n: u8) -> RsResult<u64> {
@@ -117,28 +159,21 @@ impl<'a> BitReader<'a> {
                 "FLAC: cannot read more than 64 bits at once".into(),
             ));
         }
-        let mut out: u64 = 0;
-        let mut rem = n;
-        while rem > 0 {
-            if self.byte_pos >= self.data.len() {
-                return Err(RsError::InvalidData(
-                    "FLAC: unexpected end of bitstream".into(),
-                ));
-            }
-            let avail = 8 - self.bit_offset;
-            let take = rem.min(avail);
-            let shift = avail - take;
-            let mask = if take == 8 { 0xFF } else { (1u8 << take) - 1 };
-            let bits = (self.data[self.byte_pos] >> shift) & mask;
-            out = (out << take) | u64::from(bits);
-            self.bit_offset += take;
-            if self.bit_offset == 8 {
-                self.bit_offset = 0;
-                self.byte_pos += 1;
-            }
-            rem -= take;
+        if n > 56 {
+            // A byte-granular refill only guarantees 57 available bits.
+            let hi = self.read_bits(n - 32)?;
+            let lo = self.read_bits(32)?;
+            return Ok((hi << 32) | lo);
         }
-        Ok(out)
+        if self.bit_count < n {
+            self.refill();
+            if self.bit_count < n {
+                return Err(Self::eof_err());
+            }
+        }
+        let val = self.bit_buf >> (64 - u32::from(n));
+        self.consume(n);
+        Ok(val)
     }
 
     fn read_signed_bits(&mut self, n: u8) -> RsResult<i64> {
@@ -154,33 +189,33 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Count zero bits up to (and consume) the terminating one bit.
     fn read_unary(&mut self) -> RsResult<u64> {
         let mut count: u64 = 0;
         loop {
-            if self.byte_pos >= self.data.len() {
-                return Err(RsError::InvalidData(
-                    "FLAC: unexpected end of bitstream in unary code".into(),
-                ));
+            if self.bit_count == 0 {
+                self.refill();
+                if self.bit_count == 0 {
+                    return Err(RsError::InvalidData(
+                        "FLAC: unexpected end of bitstream in unary code".into(),
+                    ));
+                }
             }
-            let shifted = self.data[self.byte_pos] << self.bit_offset;
-            let avail = 8 - self.bit_offset;
-            if shifted != 0 {
-                let lz = shifted.leading_zeros() as u8;
+            if self.bit_buf != 0 {
+                // Bits below the valid window are zero, so the first set bit
+                // is always inside it.
+                let lz = self.bit_buf.leading_zeros() as u8;
                 count = count
                     .checked_add(u64::from(lz))
                     .ok_or_else(|| RsError::InvalidData("FLAC: unary quotient overflow".into()))?;
-                self.bit_offset += lz + 1;
-                if self.bit_offset >= 8 {
-                    self.bit_offset -= 8;
-                    self.byte_pos += 1;
-                }
+                self.consume(lz + 1);
                 return Ok(count);
             }
             count = count
-                .checked_add(u64::from(avail))
+                .checked_add(u64::from(self.bit_count))
                 .ok_or_else(|| RsError::InvalidData("FLAC: unary quotient overflow".into()))?;
-            self.bit_offset = 0;
-            self.byte_pos += 1;
+            self.bit_buf = 0;
+            self.bit_count = 0;
         }
     }
 
@@ -323,6 +358,9 @@ pub struct FlacDecoder {
     streaminfo: Option<StreamInfo>,
     pending: VecDeque<Frame>,
     eof: bool,
+    /// Per-channel subframe sample buffers, reused across frames so steady
+    /// state decoding does not allocate per subframe.
+    channel_buffers: Vec<Vec<i64>>,
 }
 
 impl FlacDecoder {
@@ -332,6 +370,7 @@ impl FlacDecoder {
             streaminfo: None,
             pending: VecDeque::new(),
             eof: false,
+            channel_buffers: Vec::new(),
         }
     }
 
@@ -503,32 +542,20 @@ impl FlacDecoder {
             ));
         }
 
-        let mut channel_samples: Vec<Vec<i64>> = Vec::with_capacity(usize::from(channels));
-        for ch_idx in 0..channels {
-            let sub_bps: u8 = match (ch_code, ch_idx) {
-                (8, 1) | (9, 0) | (10, 1) => (bps + 1) as u8,
-                _ => bps as u8,
-            };
-            channel_samples.push(decode_subframe(&mut reader, blocksize, sub_bps)?);
-        }
-
-        decorrelate_channels(ch_code, blocksize, &mut channel_samples);
-
-        reader.align_to_byte();
-        let crc16_pos = reader.byte_position();
-        let expected_crc16 = reader.read_bits(16)? as u16;
-        let actual_crc16 = crc16(&data[..crc16_pos]);
-        if actual_crc16 != expected_crc16 {
-            return Err(RsError::InvalidData(
-                format!(
-                    "FLAC: frame CRC-16 mismatch (expected {expected_crc16:#06x}, got {actual_crc16:#06x})"
-                )
-                .into(),
-            ));
-        }
-        let consumed = reader.byte_position();
-
-        let (sample_format, pcm_bytes) = pack_interleaved_pcm(bps, blocksize, &channel_samples);
+        // Borrow the reusable channel buffers for the duration of the frame and
+        // always hand them back, even when decoding fails.
+        let mut buffers = std::mem::take(&mut self.channel_buffers);
+        let body = decode_frame_body(
+            &mut reader,
+            data,
+            ch_code,
+            usize::from(channels),
+            bps,
+            blocksize,
+            &mut buffers,
+        );
+        self.channel_buffers = buffers;
+        let (sample_format, pcm_bytes, consumed) = body?;
 
         self.params.sample_rate = Some(sample_rate);
         self.params.channels = Some(channels);
@@ -634,6 +661,7 @@ impl Decoder for FlacDecoder {
     fn reset(&mut self) -> RsResult<()> {
         self.pending.clear();
         self.eof = false;
+        self.channel_buffers.clear();
         Ok(())
     }
 
@@ -642,11 +670,60 @@ impl Decoder for FlacDecoder {
     }
 }
 
+/// Decode all subframes of one frame into `buffers`, undo inter-channel
+/// decorrelation, verify the CRC-16 footer and pack interleaved PCM.
+///
+/// Returns `(sample_format, pcm_bytes, consumed_bytes)`.
+fn decode_frame_body(
+    reader: &mut BitReader<'_>,
+    data: &[u8],
+    ch_code: u8,
+    channels: usize,
+    bps: u16,
+    blocksize: usize,
+    buffers: &mut Vec<Vec<i64>>,
+) -> RsResult<(SampleFormat, Vec<u8>, usize)> {
+    if buffers.len() < channels {
+        buffers.resize_with(channels, Vec::new);
+    }
+    let chans = &mut buffers[..channels];
+    for (ch_idx, buf) in chans.iter_mut().enumerate() {
+        let sub_bps: u8 = match (ch_code, ch_idx) {
+            (8, 1) | (9, 0) | (10, 1) => (bps + 1) as u8,
+            _ => bps as u8,
+        };
+        decode_subframe(reader, blocksize, sub_bps, buf)?;
+    }
+
+    decorrelate_channels(ch_code, blocksize, chans);
+
+    reader.align_to_byte();
+    let crc16_pos = reader.byte_position();
+    let expected_crc16 = reader.read_bits(16)? as u16;
+    let actual_crc16 = crc16(&data[..crc16_pos]);
+    if actual_crc16 != expected_crc16 {
+        return Err(RsError::InvalidData(
+            format!(
+                "FLAC: frame CRC-16 mismatch (expected {expected_crc16:#06x}, got {actual_crc16:#06x})"
+            )
+            .into(),
+        ));
+    }
+    let consumed = reader.byte_position();
+
+    let (sample_format, pcm_bytes) = pack_interleaved_pcm(bps, blocksize, chans);
+    Ok((sample_format, pcm_bytes, consumed))
+}
+
+/// Decode one subframe into `out` (cleared first and reused across frames, so
+/// steady-state decoding performs no per-frame heap allocation).
 fn decode_subframe(
     reader: &mut BitReader<'_>,
     blocksize: usize,
     sub_bps: u8,
-) -> RsResult<Vec<i64>> {
+    out: &mut Vec<i64>,
+) -> RsResult<()> {
+    out.clear();
     let zero = reader.read_bit()?;
     if zero != 0 {
         return Err(RsError::InvalidData(
@@ -670,96 +747,114 @@ fn decode_subframe(
     };
 
     let eff_bps = sub_bps - wasted;
-    let mut samples = match sub_type {
+    match sub_type {
         0 => {
             let val = reader.read_signed_bits(eff_bps)?;
-            vec![val; blocksize]
+            out.resize(blocksize, val);
         }
         1 => {
-            let mut out = Vec::with_capacity(blocksize);
+            out.reserve(blocksize);
             for _ in 0..blocksize {
                 out.push(reader.read_signed_bits(eff_bps)?);
             }
-            out
         }
         8..=12 => {
             let order = usize::from(sub_type - 8);
-            decode_fixed_subframe(reader, blocksize, eff_bps, order)?
+            decode_fixed_subframe(reader, blocksize, eff_bps, order, out)?;
         }
         32..=63 => {
             let order = usize::from(sub_type - 31);
-            decode_lpc_subframe(reader, blocksize, eff_bps, order)?
+            decode_lpc_subframe(reader, blocksize, eff_bps, order, out)?;
         }
         other => {
             return Err(RsError::InvalidData(
                 format!("FLAC: reserved subframe type {other}").into(),
             ))
         }
-    };
+    }
 
     if wasted > 0 {
-        for s in &mut samples {
+        for s in out.iter_mut() {
             *s = s.wrapping_shl(u32::from(wasted));
         }
     }
 
-    Ok(samples)
+    Ok(())
 }
 
+/// FIXED predictor: warm-up samples, then residuals decoded straight into
+/// `out` and reconstructed in place.
 fn decode_fixed_subframe(
     reader: &mut BitReader<'_>,
     blocksize: usize,
     eff_bps: u8,
     order: usize,
-) -> RsResult<Vec<i64>> {
+    out: &mut Vec<i64>,
+) -> RsResult<()> {
     if order > blocksize {
         return Err(RsError::InvalidData(
             "FLAC: FIXED predictor order exceeds blocksize".into(),
         ));
     }
-    let mut samples = Vec::with_capacity(blocksize);
+    out.reserve(blocksize);
     for _ in 0..order {
-        samples.push(reader.read_signed_bits(eff_bps)?);
+        out.push(reader.read_signed_bits(eff_bps)?);
     }
-    let residuals = decode_residual(reader, blocksize, order)?;
-    for &r in &residuals {
-        let i = samples.len();
-        let pred = match order {
-            0 => 0,
-            1 => samples[i - 1],
-            2 => 2i64
-                .wrapping_mul(samples[i - 1])
-                .wrapping_sub(samples[i - 2]),
-            3 => 3i64
-                .wrapping_mul(samples[i - 1])
-                .wrapping_sub(3i64.wrapping_mul(samples[i - 2]))
-                .wrapping_add(samples[i - 3]),
-            4 => 4i64
-                .wrapping_mul(samples[i - 1])
-                .wrapping_sub(6i64.wrapping_mul(samples[i - 2]))
-                .wrapping_add(4i64.wrapping_mul(samples[i - 3]))
-                .wrapping_sub(samples[i - 4]),
-            _ => unreachable!(),
-        };
-        samples.push(pred.wrapping_add(r));
+    decode_residual(reader, blocksize, order, out)?;
+    let s = out.as_mut_slice();
+    match order {
+        0 => {}
+        1 => {
+            for i in 1..s.len() {
+                s[i] = s[i].wrapping_add(s[i - 1]);
+            }
+        }
+        2 => {
+            for i in 2..s.len() {
+                let pred = 2i64.wrapping_mul(s[i - 1]).wrapping_sub(s[i - 2]);
+                s[i] = s[i].wrapping_add(pred);
+            }
+        }
+        3 => {
+            for i in 3..s.len() {
+                let pred = 3i64
+                    .wrapping_mul(s[i - 1])
+                    .wrapping_sub(3i64.wrapping_mul(s[i - 2]))
+                    .wrapping_add(s[i - 3]);
+                s[i] = s[i].wrapping_add(pred);
+            }
+        }
+        4 => {
+            for i in 4..s.len() {
+                let pred = 4i64
+                    .wrapping_mul(s[i - 1])
+                    .wrapping_sub(6i64.wrapping_mul(s[i - 2]))
+                    .wrapping_add(4i64.wrapping_mul(s[i - 3]))
+                    .wrapping_sub(s[i - 4]);
+                s[i] = s[i].wrapping_add(pred);
+            }
+        }
+        _ => unreachable!(),
     }
-    Ok(samples)
+    Ok(())
 }
 
+/// LPC predictor (orders 1..=32) reconstructed in place.
 fn decode_lpc_subframe(
     reader: &mut BitReader<'_>,
     blocksize: usize,
     eff_bps: u8,
     order: usize,
-) -> RsResult<Vec<i64>> {
+    out: &mut Vec<i64>,
+) -> RsResult<()> {
     if order > blocksize {
         return Err(RsError::InvalidData(
             "FLAC: LPC predictor order exceeds blocksize".into(),
         ));
     }
-    let mut samples = Vec::with_capacity(blocksize);
+    out.reserve(blocksize);
     for _ in 0..order {
-        samples.push(reader.read_signed_bits(eff_bps)?);
+        out.push(reader.read_signed_bits(eff_bps)?);
     }
     let prec_minus_1 = reader.read_bits(4)? as u8;
     if prec_minus_1 == 15 {
@@ -770,34 +865,38 @@ fn decode_lpc_subframe(
     let precision = prec_minus_1 + 1;
     let shift = reader.read_signed_bits(5)? as i32;
 
-    let mut coeffs = Vec::with_capacity(order);
-    for _ in 0..order {
-        coeffs.push(reader.read_signed_bits(precision)?);
+    let mut coeff_buf = [0i64; 32];
+    let coeffs = &mut coeff_buf[..order];
+    for c in coeffs.iter_mut() {
+        *c = reader.read_signed_bits(precision)?;
     }
 
-    let residuals = decode_residual(reader, blocksize, order)?;
-    for &r in &residuals {
-        let i = samples.len();
+    decode_residual(reader, blocksize, order, out)?;
+    let s = out.as_mut_slice();
+    for i in order..s.len() {
         let mut sum: i64 = 0;
         for (j, &coeff) in coeffs.iter().enumerate() {
-            sum = sum.wrapping_add(coeff.wrapping_mul(samples[i - 1 - j]));
+            sum = sum.wrapping_add(coeff.wrapping_mul(s[i - 1 - j]));
         }
         let pred = if shift >= 0 {
             sum >> shift
         } else {
             sum.wrapping_shl((-shift) as u32)
         };
-        samples.push(pred.wrapping_add(r));
+        s[i] = s[i].wrapping_add(pred);
     }
 
-    Ok(samples)
+    Ok(())
 }
 
+/// Decode `blocksize - predictor_order` Rice-coded residuals, appending them
+/// to `out` (which already holds the warm-up samples).
 fn decode_residual(
     reader: &mut BitReader<'_>,
     blocksize: usize,
     predictor_order: usize,
-) -> RsResult<Vec<i64>> {
+    out: &mut Vec<i64>,
+) -> RsResult<()> {
     let method = reader.read_bits(2)? as u8;
     let (param_bits, escape) = match method {
         0 => (4u8, 15u8),
@@ -823,9 +922,6 @@ fn decode_residual(
         ));
     }
 
-    let total_residuals = blocksize - predictor_order;
-    let mut residuals = Vec::with_capacity(total_residuals);
-
     for p in 0..partitions {
         let n = if p == 0 {
             part_samples - predictor_order
@@ -841,7 +937,7 @@ fn decode_residual(
                 } else {
                     reader.read_signed_bits(esc_bps)?
                 };
-                residuals.push(val);
+                out.push(val);
             }
         } else {
             for _ in 0..n {
@@ -856,12 +952,12 @@ fn decode_residual(
                 } else {
                     -((u >> 1) as i64) - 1
                 };
-                residuals.push(val);
+                out.push(val);
             }
         }
     }
 
-    Ok(residuals)
+    Ok(())
 }
 
 fn decorrelate_channels(ch_code: u8, blocksize: usize, channels: &mut [Vec<i64>]) {
@@ -1454,5 +1550,276 @@ mod tests {
             codec.create_encoder(),
             Err(RsError::Unsupported(_))
         ));
+    }
+
+    /// Bit-at-a-time reference reader used to cross-check the reservoir.
+    struct RefReader<'a> {
+        data: &'a [u8],
+        bit: usize,
+    }
+
+    impl RefReader<'_> {
+        fn bits(&mut self, n: u8) -> Option<u64> {
+            let mut v = 0u64;
+            for _ in 0..n {
+                let byte = *self.data.get(self.bit / 8)?;
+                v = (v << 1) | u64::from((byte >> (7 - (self.bit % 8))) & 1);
+                self.bit += 1;
+            }
+            Some(v)
+        }
+        fn unary(&mut self) -> Option<u64> {
+            let mut n = 0;
+            while self.bits(1)? == 0 {
+                n += 1;
+            }
+            Some(n)
+        }
+    }
+
+    #[test]
+    fn bitreader_reservoir_matches_reference_on_random_streams() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 257] {
+            let data: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
+            let mut r = BitReader::new(&data);
+            let mut reference = RefReader {
+                data: &data,
+                bit: 0,
+            };
+            loop {
+                let op = next() % 5;
+                if op == 0 {
+                    let a = r.read_unary().ok();
+                    let b = reference.unary();
+                    assert_eq!(a, b, "unary mismatch len={len}");
+                    if a.is_none() {
+                        break;
+                    }
+                } else if op == 1 {
+                    r.align_to_byte();
+                    reference.bit = reference.bit.div_ceil(8) * 8;
+                    assert_eq!(r.byte_position(), reference.bit / 8);
+                } else {
+                    let n = (next() % 65) as u8;
+                    let a = r.read_bits(n).ok();
+                    let b = reference.bits(n);
+                    assert_eq!(a, b, "read_bits({n}) mismatch len={len}");
+                    if a.is_none() {
+                        break;
+                    }
+                    assert_eq!(r.byte_position(), reference.bit / 8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bitreader_wide_reads_and_reservoir_boundaries() {
+        let data: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        // 64-bit reads at every bit offset 0..8.
+        for skip in 0..8u8 {
+            let mut r = BitReader::new(&data);
+            let mut reference = RefReader {
+                data: &data,
+                bit: 0,
+            };
+            r.read_bits(skip).unwrap();
+            reference.bits(skip);
+            for n in [64u8, 57, 56, 1, 63, 33, 64] {
+                assert_eq!(r.read_bits(n).ok(), reference.bits(n), "skip={skip} n={n}");
+            }
+        }
+        // Signed 64/57-bit reads.
+        let all_ones = [0xFFu8; 16];
+        let mut r = BitReader::new(&all_ones);
+        assert_eq!(r.read_signed_bits(64).unwrap(), -1);
+        assert_eq!(r.read_signed_bits(57).unwrap(), -1);
+        assert_eq!(r.read_signed_bits(7).unwrap(), -1);
+        assert!(r.read_signed_bits(1).is_err(), "exhausted");
+        assert!(BitReader::new(&[0u8; 1]).read_bits(65).is_err());
+    }
+
+    #[test]
+    fn bitreader_unary_spanning_reservoir_and_eof() {
+        // 150 zero bits then a one: the run crosses several 64-bit refills.
+        let mut w = BitWriter::new();
+        w.write_unary(150);
+        w.write_bits(0b1011, 4);
+        w.write_unary(0);
+        w.write_unary(63);
+        w.align_to_byte();
+        let mut r = BitReader::new(&w.bytes);
+        assert_eq!(r.read_unary().unwrap(), 150);
+        assert_eq!(r.read_bits(4).unwrap(), 0b1011);
+        assert_eq!(r.read_unary().unwrap(), 0);
+        assert_eq!(r.read_unary().unwrap(), 63);
+        r.align_to_byte();
+        assert_eq!(r.byte_position(), w.bytes.len());
+
+        // All-zero input never terminates the unary code: clean EOF error.
+        let zeros = [0u8; 40];
+        assert!(BitReader::new(&zeros).read_unary().is_err());
+        assert!(BitReader::new(&[]).read_unary().is_err());
+        assert!(BitReader::new(&[]).read_bit().is_err());
+
+        // A one in the very last bit of a full 64-bit reservoir.
+        let mut last = [0u8; 8];
+        last[7] = 1;
+        let mut r = BitReader::new(&last);
+        assert_eq!(r.read_unary().unwrap(), 63);
+        assert_eq!(r.byte_position(), 8);
+        assert!(r.read_bit().is_err());
+    }
+
+    #[test]
+    fn bitreader_align_and_byte_position_are_exact() {
+        let data = [0xA5u8, 0x5A, 0xFF, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.byte_position(), 0);
+        r.align_to_byte();
+        assert_eq!(r.byte_position(), 0, "aligning at a boundary is a no-op");
+        r.read_bits(3).unwrap();
+        assert_eq!(r.byte_position(), 0);
+        r.align_to_byte();
+        assert_eq!(r.byte_position(), 1);
+        assert_eq!(r.read_bits(8).unwrap(), 0x5A);
+        assert_eq!(r.byte_position(), 2);
+        r.read_bits(13).unwrap();
+        r.align_to_byte();
+        assert_eq!(r.byte_position(), 4);
+        assert_eq!(r.read_bits(16).unwrap(), 0x1234);
+        assert_eq!(r.read_bits(32).unwrap(), 0x5678_9ABC);
+        assert_eq!(r.byte_position(), data.len());
+    }
+
+    /// Build a VERBATIM mono 16-bit frame of `samples`.
+    fn verbatim_frame(samples: &[i16], frame_no: u64) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        write_frame_header(
+            &mut w,
+            7,
+            9,
+            0,
+            4,
+            frame_no,
+            Some(samples.len() as u16),
+            None,
+        );
+        w.write_bit(0);
+        w.write_bits(1, 6);
+        w.write_bit(0);
+        for &s in samples {
+            w.write_signed_bits(i64::from(s), 16);
+        }
+        w.finish_frame()
+    }
+
+    #[test]
+    fn crc16_checks_stay_byte_exact_for_large_and_odd_frames() {
+        // Frames whose subframe data ends at every bit offset before the
+        // byte-alignment padding: an LPC frame with an odd residual count and
+        // large verbatim frames that cross many reservoir refills.
+        let big: Vec<i16> = (0..4096).map(|i| ((i * 7919) % 65_536 - 32_768) as i16).collect();
+        let odd: Vec<i16> = (0..777).map(|i| (i as i16).wrapping_mul(-3)).collect();
+        let mut packet = verbatim_frame(&big, 0);
+        packet.extend_from_slice(&verbatim_frame(&odd, 1));
+
+        // Frame 3: 5-sample FIXED order-1 with Rice param 0 (unaligned end).
+        let mut w = BitWriter::new();
+        write_frame_header(&mut w, 6, 9, 0, 4, 2, Some(5), None);
+        w.write_bit(0);
+        w.write_bits(8 + 1, 6);
+        w.write_bit(0);
+        w.write_signed_bits(-7, 16);
+        write_rice_residuals(&mut w, &[1, -1, 2, 0], 0, 0);
+        packet.extend_from_slice(&w.finish_frame());
+
+        let mut dec = FlacDecoder::new();
+        let frames = dec.decode(&Packet::new(Bytes::from(packet.clone()), 0)).unwrap();
+        assert_eq!(frames.len(), 3);
+        let as_i16 = |f: &Frame| -> Vec<i16> {
+            f.data[0]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        assert_eq!(as_i16(&frames[0]), big);
+        assert_eq!(as_i16(&frames[1]), odd);
+        assert_eq!(as_i16(&frames[2]), vec![-7, -6, -7, -5, -5]);
+
+        // Flipping any single bit of the last frame's CRC-16 must be caught.
+        for bit in 0..16 {
+            let mut bad = packet.clone();
+            let idx = bad.len() - 1 - bit / 8;
+            bad[idx] ^= 1 << (bit % 8);
+            assert!(dec.decode(&Packet::new(Bytes::from(bad), 0)).is_err());
+        }
+        // Truncating the footer is an error, not a panic.
+        let short = &packet[..packet.len() - 1];
+        assert!(dec
+            .decode(&Packet::new(Bytes::copy_from_slice(short), 0))
+            .is_err());
+    }
+
+    #[test]
+    fn channel_buffers_are_reused_across_frames_and_cleared_on_reset() {
+        let stereo = {
+            let mut w = BitWriter::new();
+            write_frame_header(&mut w, 6, 9, 1, 4, 0, Some(64), None);
+            for ch in 0..2i64 {
+                w.write_bit(0);
+                w.write_bits(1, 6);
+                w.write_bit(0);
+                for i in 0..64i64 {
+                    w.write_signed_bits(i * (ch + 1), 16);
+                }
+            }
+            w.finish_frame()
+        };
+        let mono = verbatim_frame(&[5; 32], 1);
+
+        let mut dec = FlacDecoder::new();
+        dec.decode(&Packet::new(Bytes::from(stereo.clone()), 0))
+            .unwrap();
+        assert_eq!(dec.channel_buffers.len(), 2);
+        let caps: Vec<usize> = dec.channel_buffers.iter().map(Vec::capacity).collect();
+        assert!(caps.iter().all(|&c| c >= 64));
+
+        // A smaller mono frame keeps (and reuses) the existing buffers.
+        let f = dec.decode(&Packet::new(Bytes::from(mono), 0)).unwrap();
+        assert_eq!(f[0].channels, 1);
+        assert_eq!(f[0].samples, 32);
+        assert_eq!(dec.channel_buffers.len(), 2);
+        assert_eq!(dec.channel_buffers[0].capacity(), caps[0]);
+
+        // Decoding the stereo frame again does not grow the buffers.
+        let f = dec
+            .decode(&Packet::new(Bytes::from(stereo.clone()), 0))
+            .unwrap();
+        assert_eq!(f[0].channels, 2);
+        let caps2: Vec<usize> = dec.channel_buffers.iter().map(Vec::capacity).collect();
+        assert_eq!(caps, caps2, "buffers must be reused in place");
+        let pcm: Vec<i16> = f[0].data[0]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(&pcm[..6], &[0, 0, 1, 2, 2, 4]);
+
+        // A corrupt frame must not lose the buffers either.
+        let mut bad = stereo;
+        let last = bad.len() - 1;
+        bad[last] ^= 0x80;
+        assert!(dec.decode(&Packet::new(Bytes::from(bad), 0)).is_err());
+        assert_eq!(dec.channel_buffers.len(), 2);
+
+        dec.reset().unwrap();
+        assert!(dec.channel_buffers.is_empty());
     }
 }

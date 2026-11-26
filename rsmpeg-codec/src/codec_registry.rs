@@ -89,6 +89,7 @@ pub fn register_builtin_codecs() {
         SampleFormat::S16,
         SampleFormat::S32,
         SampleFormat::F32,
+        SampleFormat::F64,
     ] {
         if let Some(codec) = PCMAudioCodec::new(*sample_fmt) {
             registry.register(Box::new(codec));
@@ -186,6 +187,20 @@ mod tests {
             listed == 0,
             "is_empty() must agree with the entry count"
         );
+    }
+
+    #[test]
+    fn builtin_registration_includes_every_packed_pcm_format() {
+        register_builtin_codecs();
+        let guard = global_codec_registry().read().expect("codec registry lock");
+        for name in ["pcm_u8", "pcm_s16le", "pcm_s32le", "pcm_f32le", "pcm_f64le"] {
+            let codec = guard
+                .find_by_name(name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_eq!(codec.id(), CodecId::Pcm);
+            assert!(codec.create_decoder().is_ok());
+            assert!(codec.create_encoder().is_ok());
+        }
     }
 
     #[test]

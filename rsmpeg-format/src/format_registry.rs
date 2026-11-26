@@ -34,7 +34,7 @@ impl FormatRegistry {
     pub fn find_muxer(&self, name: &str) -> Option<&dyn OutputFormat> {
         self.muxers
             .iter()
-            .find(|m| m.name() == name)
+            .find(|m| m.name() == name || m.extensions().contains(&name))
             .map(|m| m.as_ref())
     }
 
@@ -75,6 +75,7 @@ pub fn global_format_registry() -> &'static RwLock<FormatRegistry> {
 
 pub fn register_builtin_formats() {
     use crate::demuxers::*;
+    use crate::muxers::*;
     // Recover from a poisoned lock (another thread panicked while holding it)
     // instead of aborting start-up.
     let mut registry = match global_format_registry().write() {
@@ -85,17 +86,59 @@ pub fn register_builtin_formats() {
         }
     };
 
-    // Make repeated calls harmless instead of stacking duplicate demuxers.
-    if !registry.demuxers().is_empty() {
-        tracing::debug!("built-in formats already registered; skipping");
-        return;
+    // Make repeated calls harmless instead of stacking duplicate formats.
+    if registry.demuxers().is_empty() {
+        registry.register_demuxer(Box::new(MP4Demuxer::default()));
+        registry.register_demuxer(Box::new(MKVDemuxer::default()));
+        registry.register_demuxer(Box::new(AVIDemuxer::default()));
+        registry.register_demuxer(Box::new(FLACDemuxer::default()));
+        registry.register_demuxer(Box::new(WAVDemuxer::default()));
+        registry.register_demuxer(Box::new(RawVideoDemuxer));
+        registry.register_demuxer(Box::new(Y4mDemuxer::default()));
+        tracing::info!("Registered 7 built-in demuxers");
+    } else {
+        tracing::debug!("built-in demuxers already registered; skipping");
     }
 
-    registry.register_demuxer(Box::new(MP4Demuxer::default()));
-    registry.register_demuxer(Box::new(MKVDemuxer::default()));
-    registry.register_demuxer(Box::new(AVIDemuxer::default()));
-    registry.register_demuxer(Box::new(FLACDemuxer::default()));
-    registry.register_demuxer(Box::new(WAVDemuxer::default()));
-    registry.register_demuxer(Box::new(RawVideoDemuxer));
-    tracing::info!("Registered 6 built-in demuxers");
+    if registry.muxers().is_empty() {
+        registry.register_muxer(Box::new(WAVMuxer::default()));
+        registry.register_muxer(Box::new(Y4mMuxer::default()));
+        tracing::info!("Registered 2 built-in muxers");
+    } else {
+        tracing::debug!("built-in muxers already registered; skipping");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::demuxers::Y4mDemuxer;
+    use crate::muxers::{WAVMuxer, Y4mMuxer};
+
+    #[test]
+    fn find_muxer_matches_by_name_and_extension() {
+        let mut reg = FormatRegistry::new();
+        reg.register_muxer(Box::new(WAVMuxer::default()));
+        reg.register_muxer(Box::new(Y4mMuxer::default()));
+        assert_eq!(reg.find_muxer("wav").unwrap().name(), "wav");
+        assert_eq!(reg.find_muxer("y4m").unwrap().name(), "y4m");
+        assert!(reg.find_muxer("mp4").is_none());
+    }
+
+    #[test]
+    fn register_builtin_formats_populates_demuxers_and_muxers_idempotently() {
+        register_builtin_formats();
+        register_builtin_formats();
+        let reg = global_format_registry().read().unwrap();
+        assert_eq!(reg.demuxers().len(), 7);
+        assert_eq!(reg.muxers().len(), 2);
+        assert!(reg.find_demuxer("y4m").is_some());
+        assert!(reg.find_muxer("wav").is_some());
+        assert!(reg.find_muxer("y4m").is_some());
+        assert_eq!(
+            reg.probe_demuxer(b"YUV4MPEG2 W8 H8\n").map(|d| d.name()),
+            Some("y4m")
+        );
+        let _ = Y4mDemuxer::default();
+    }
 }
