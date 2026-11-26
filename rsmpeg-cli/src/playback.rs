@@ -2,6 +2,7 @@
 //!
 //! Video frames are presented in a minifb window; audio is owned by the player worker.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rsmpeg_player::{Player, PlayerEvent};
@@ -27,7 +28,7 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Drain player events
         let mut ended = false;
         let mut fatal = None;
-        let mut latest_frame: Option<(usize, usize, Vec<u8>)> = None;
+        let mut latest_frame: Option<(usize, usize, Arc<Vec<u8>>)> = None;
 
         while let Some(ev) = player.poll_event() {
             match ev {
@@ -43,6 +44,19 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 PlayerEvent::Error { message, .. } => fatal = Some(message),
                 PlayerEvent::Warning { message, .. } => {
                     eprintln!("  Warning: {}", message);
+                }
+                PlayerEvent::DecoderInfo {
+                    demuxer,
+                    video_decoder,
+                    audio_decoder,
+                    ..
+                } => {
+                    println!(
+                        "  Pipeline: demux={}, video={}, audio={}",
+                        demuxer,
+                        video_decoder.as_deref().unwrap_or("none"),
+                        audio_decoder.as_deref().unwrap_or("none")
+                    );
                 }
                 _ => {}
             }
@@ -75,20 +89,24 @@ pub fn play_media(path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some(ref mut win) = window {
-                if w != win_w || h != win_h {
-                    // Keep first window size; letterbox-ish crop
-                }
+                // The window keeps its initial size, so a larger frame is cropped
+                // (top-left anchored) rather than rescaled.
                 let copy_w = w.min(win_w);
                 let copy_h = h.min(win_h);
+                let pixels = rgba.as_slice();
                 for y in 0..copy_h {
+                    let src_row = y * w * 4;
+                    let dst_row = y * win_w;
                     for x in 0..copy_w {
-                        let si = (y * w + x) * 4;
-                        let di = y * win_w + x;
-                        if si + 2 < rgba.len() {
-                            pixel_buffer[di] = ((rgba[si] as u32) << 16)
-                                | ((rgba[si + 1] as u32) << 8)
-                                | (rgba[si + 2] as u32);
+                        let si = src_row + x * 4;
+                        // Bounds-check once per pixel instead of relying on a
+                        // three-byte lookahead probe.
+                        if si + 3 >= pixels.len() {
+                            break;
                         }
+                        pixel_buffer[dst_row + x] = ((pixels[si] as u32) << 16)
+                            | ((pixels[si + 1] as u32) << 8)
+                            | (pixels[si + 2] as u32);
                     }
                 }
                 if !win.is_open() || win.is_key_down(minifb::Key::Escape) {

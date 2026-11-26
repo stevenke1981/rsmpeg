@@ -38,8 +38,15 @@ impl CropFilter {
         if w == 0 || h == 0 {
             return;
         }
-        let src = &frame.data[0];
         let stride = 4usize;
+        // Refuse to read outside the packed RGBA plane: a missing or truncated
+        // plane leaves the frame unchanged instead of panicking.
+        let Some(src) = frame.data.first() else {
+            return;
+        };
+        if src.len() < sw * sh * stride {
+            return;
+        }
         let mut out = vec![0u8; w * h * stride];
         for row in 0..h {
             let s_row = (y + row) * sw * stride + x * stride;
@@ -158,5 +165,57 @@ mod tests {
         assert_eq!(filter.inputs().len(), 1);
         assert_eq!(filter.outputs().len(), 1);
         assert!(filter.as_any().is::<CropFilter>());
+    }
+
+    #[test]
+    fn crop_zero_area_leaves_frame_unchanged() {
+        let pixels = [
+            (1, 0, 0, 255),
+            (2, 0, 0, 255),
+            (3, 0, 0, 255),
+            (4, 0, 0, 255),
+        ];
+        let mut frame = rgba_frame(2, 2, &pixels);
+        // w = 0 → no-op.
+        CropFilter::new(0, 0, 0, 2).apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (2, 2));
+        // h = 0 → no-op.
+        CropFilter::new(0, 0, 2, 0).apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (2, 2));
+        // Origin past the frame → clamped region is empty → no-op.
+        CropFilter::new(9, 9, 1, 1).apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (2, 2));
+        assert_eq!(frame.data[0].len(), 2 * 2 * 4);
+    }
+
+    #[test]
+    fn crop_missing_plane_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data.clear();
+        CropFilter::new(0, 0, 1, 1).apply(&mut frame);
+        assert!(frame.data.is_empty());
+    }
+
+    #[test]
+    fn crop_truncated_plane_is_noop() {
+        // Declared 2x2 but only one pixel present: must not read out of bounds.
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data[0] = vec![7u8; 4];
+        CropFilter::new(0, 0, 2, 2).apply(&mut frame);
+        assert_eq!(frame.data[0], vec![7u8; 4]);
+        assert_eq!((frame.width, frame.height), (2, 2));
+    }
+
+    #[test]
+    fn crop_updates_linesize_and_keeps_metadata() {
+        let mut frame = rgba_frame(3, 1, &[(1, 0, 0, 255), (2, 0, 0, 255), (3, 0, 0, 255)]);
+        frame.pts = Some(42);
+        CropFilter::new(1, 0, 2, 1).apply(&mut frame);
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.linesize[0], 2 * 4);
+        assert_eq!(frame.data[0].len(), 2 * 4);
+        // Metadata is untouched by the geometry change.
+        assert_eq!(frame.pts, Some(42));
+        assert_eq!(frame.pixel_format, PixelFormat::Rgba);
     }
 }

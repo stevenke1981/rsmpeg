@@ -10,6 +10,7 @@ members = [
     "rsmpeg-player",
     "rsmpeg",
     "rsmpeg-cli",
+    "rsmpeg-gui",
 ]
 
 [workspace.package]

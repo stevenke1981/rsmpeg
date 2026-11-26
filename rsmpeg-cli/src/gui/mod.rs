@@ -235,7 +235,10 @@ impl MediaApp {
                     clear_player = true;
                 }
                 PlayerEvent::Warning { message, .. } => self.status = message,
-                PlayerEvent::VideoFrame { .. } => {}
+                PlayerEvent::AudioLevel { .. }
+                | PlayerEvent::Tracks { .. }
+                | PlayerEvent::DecoderInfo { .. }
+                | PlayerEvent::VideoFrame { .. } => {}
             }
         }
 
@@ -248,7 +251,7 @@ impl MediaApp {
         }) = latest_frame
         {
             let current_revision = self.preview.as_ref().map_or(0, |preview| preview.revision);
-            match video_preview(width, height, rgba, current_revision) {
+            match video_preview(width, height, Arc::unwrap_or_clone(rgba), current_revision) {
                 Ok(preview) => {
                     self.preview = Some(preview);
                     self.status = if self.playing {

@@ -29,8 +29,16 @@ impl BoxBlurFilter {
         if w == 0 || h == 0 {
             return;
         }
-        let src = &frame.data[0];
         let stride = 4usize;
+        // A frame without a packed RGBA plane (or with a plane shorter than the
+        // declared geometry) cannot be blurred; leave it untouched instead of
+        // panicking on the index.
+        let Some(src) = frame.data.first() else {
+            return;
+        };
+        if src.len() < w * h * stride {
+            return;
+        }
         let mut out = vec![0u8; w * h * stride];
         for y in 0..h {
             for x in 0..w {
@@ -170,5 +178,53 @@ mod tests {
         assert_eq!(filter.inputs().len(), 1);
         assert_eq!(filter.outputs().len(), 1);
         assert!(filter.as_any().is::<BoxBlurFilter>());
+    }
+
+    #[test]
+    fn blur_empty_frame_is_noop() {
+        // Zero-size and plane-less frames must be left untouched, not panic.
+        let mut zero = Frame::new_video(0, 0, PixelFormat::Rgba);
+        BoxBlurFilter::new().apply(&mut zero);
+        assert_eq!(zero.width, 0);
+
+        let mut no_plane = Frame::new_video(2, 2, PixelFormat::Rgba);
+        no_plane.data.clear();
+        BoxBlurFilter::new().apply(&mut no_plane);
+        assert!(no_plane.data.is_empty());
+    }
+
+    #[test]
+    fn blur_truncated_plane_is_noop() {
+        // Declared 4x4 but only one pixel of data: must not index out of bounds.
+        let mut frame = Frame::new_video(4, 4, PixelFormat::Rgba);
+        frame.data[0] = vec![9u8; 4];
+        BoxBlurFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], vec![9u8; 4]);
+    }
+
+    #[test]
+    fn blur_of_single_pixel_frame_is_identity() {
+        // The window is clamped at the borders, so a 1x1 frame averages to itself.
+        let mut frame = rgba_frame(1, 1, &[(12, 34, 56, 78)]);
+        BoxBlurFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], vec![12, 34, 56, 78]);
+    }
+
+    #[test]
+    fn blur_preserves_alpha_and_averages_neighbourhood() {
+        // 3x1 frame: 0, 90, 0 → interior average is (0+90+0)/3 = 30.
+        let mut frame = rgba_frame(3, 1, &[(0, 0, 0, 255), (90, 90, 90, 7), (0, 0, 0, 255)]);
+        BoxBlurFilter::new().apply(&mut frame);
+        let p = &frame.data[0];
+        // Edge pixel 0 averages the two available in-bounds samples: (0+90)/2 = 45.
+        assert_eq!(p[0], 45);
+        // Interior pixel 1 averages all three: 30.
+        assert_eq!(p[4], 30);
+        assert_eq!(p[5], 30);
+        assert_eq!(p[6], 30);
+        // Alpha is copied verbatim from the source centre pixel.
+        assert_eq!(p[3], 255);
+        assert_eq!(p[7], 7);
+        assert_eq!(p[11], 255);
     }
 }

@@ -30,7 +30,9 @@ impl FormatContext {
         let path = path.as_ref();
         let mut io = IOContext::open_file(path)?;
 
-        let probe_buf = io.peek(2048)?;
+        // Probe with as many bytes as the file actually has: a short file (or
+        // an empty one) is a valid input, not an I/O error.
+        let probe_buf = io.peek_prefix(2048)?;
         let mut ctx = FormatContext {
             input: None,
             output: None,
@@ -107,13 +109,13 @@ impl FormatContext {
                 demuxer = Some(Box::new(crate::demuxers::MP4Demuxer::default()));
             }
             "matroska" | "mkv" | "webm" | "mka" | "mks" => {
-                demuxer = Some(Box::new(crate::demuxers::MKVDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::MKVDemuxer::default()));
             }
             "avi" => {
-                demuxer = Some(Box::new(crate::demuxers::AVIDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::AVIDemuxer::default()));
             }
             "flac" => {
-                demuxer = Some(Box::new(crate::demuxers::FLACDemuxer));
+                demuxer = Some(Box::new(crate::demuxers::FLACDemuxer::default()));
             }
             "wav" => {
                 demuxer = Some(Box::new(crate::demuxers::WAVDemuxer::default()));
@@ -140,6 +142,10 @@ impl FormatContext {
     }
 
     /// Read one frame from the input.
+    ///
+    /// The demuxer is moved out of the context for the duration of the call so
+    /// it can borrow the rest of the context mutably; it is always put back —
+    /// including on error — so a failed read never silently loses the demuxer.
     pub fn read_frame(&mut self) -> RsResult<Option<Packet>> {
         if let Some(mut input) = self.input.take() {
             let result = input.read_frame(self);
@@ -176,6 +182,16 @@ impl FormatContext {
         }
     }
 
+    /// Whether a demuxer has been installed by [`read_header`](Self::read_header).
+    pub fn has_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Whether a muxer has been installed on this context.
+    pub fn has_output(&self) -> bool {
+        self.output.is_some()
+    }
+
     /// Add a stream to the context.
     pub fn add_stream(&mut self, stream: Stream) {
         self.streams.push(stream);
@@ -189,5 +205,117 @@ impl FormatContext {
     /// Find the index of the best stream of a given media type.
     pub fn find_best_stream(&self, media_type: rsmpeg_util::MediaType) -> Option<usize> {
         self.streams.iter().position(|s| s.media_type == media_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::ProbeScore;
+    use rsmpeg_util::{MediaType, RsResult};
+
+    /// Minimal demuxer that always fails, used to prove the context keeps its
+    /// demuxer (and therefore its open file handle) across a failed read.
+    struct FailingDemuxer;
+
+    impl InputFormat for FailingDemuxer {
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+        fn description(&self) -> &'static str {
+            "always fails"
+        }
+        fn extensions(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn probe(&self, _buf: &[u8]) -> ProbeScore {
+            ProbeScore::NoMatch
+        }
+        fn read_header(&mut self, _ctx: &mut FormatContext) -> RsResult<()> {
+            Ok(())
+        }
+        fn read_frame(&mut self, _ctx: &mut FormatContext) -> RsResult<Option<Packet>> {
+            Err(RsError::InvalidData("synthetic read failure".into()))
+        }
+        fn seek(&mut self, _ctx: &mut FormatContext, _ts: i64) -> RsResult<()> {
+            Err(RsError::InvalidData("synthetic seek failure".into()))
+        }
+    }
+
+    fn ctx_without_input() -> FormatContext {
+        FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: None,
+            metadata: Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: None,
+        }
+    }
+
+    #[test]
+    fn read_frame_without_input_is_none_not_an_error() {
+        let mut ctx = ctx_without_input();
+        assert!(!ctx.has_input());
+        assert!(matches!(ctx.read_frame(), Ok(None)));
+    }
+
+    #[test]
+    fn failed_read_frame_keeps_the_demuxer_installed() {
+        // Regression guard: `read_frame` moves the demuxer out of the context
+        // (`Box<dyn InputFormat>` cannot be borrowed while `&mut ctx` is passed)
+        // and must put it back even when the read fails, otherwise the demuxer
+        // — and its buffered state / file handle — is leaked on every error.
+        let mut ctx = ctx_without_input();
+        ctx.input = Some(Box::new(FailingDemuxer));
+        assert!(ctx.has_input());
+
+        for _ in 0..3 {
+            let err = ctx.read_frame().unwrap_err();
+            assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+            assert!(
+                ctx.has_input(),
+                "the demuxer must survive a failed read_frame"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_seek_keeps_the_demuxer_installed() {
+        let mut ctx = ctx_without_input();
+        ctx.input = Some(Box::new(FailingDemuxer));
+        assert!(ctx.seek(100).is_err());
+        assert!(ctx.has_input(), "the demuxer must survive a failed seek");
+    }
+
+    #[test]
+    fn seek_without_input_reports_invalid_data() {
+        let mut ctx = ctx_without_input();
+        let err = ctx.seek(0).unwrap_err();
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn write_frame_without_output_is_a_noop() {
+        let mut ctx = ctx_without_input();
+        assert!(!ctx.has_output());
+        let packet = Packet::new(bytes::Bytes::new(), 0);
+        assert!(ctx.write_frame(&packet).is_ok());
+    }
+
+    #[test]
+    fn add_stream_and_find_best_stream() {
+        let mut ctx = ctx_without_input();
+        ctx.add_stream(Stream::new(0, rsmpeg_codec::CodecId::H264));
+        ctx.streams[0].media_type = MediaType::Video;
+        ctx.add_stream(Stream::new(1, rsmpeg_codec::CodecId::Aac));
+        ctx.streams[1].media_type = MediaType::Audio;
+        assert_eq!(ctx.nb_streams(), 2);
+        assert_eq!(ctx.find_best_stream(MediaType::Video), Some(0));
+        assert_eq!(ctx.find_best_stream(MediaType::Audio), Some(1));
+        assert_eq!(ctx.find_best_stream(MediaType::Subtitle), None);
     }
 }

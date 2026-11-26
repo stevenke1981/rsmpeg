@@ -564,4 +564,109 @@ mod tests {
         let resampler = Resampler::new(config).unwrap();
         assert!(resampler.resample(&frame).is_err());
     }
+
+    #[test]
+    fn estimate_output_samples_is_exact_at_integer_ratios() {
+        let down = ResamplerConfig::new(48_000, 24_000, SampleFormat::S16, SampleFormat::S16);
+        assert_eq!(down.estimate_output_samples(480), 240);
+        assert_eq!(down.estimate_output_samples(0), 0);
+
+        let up = ResamplerConfig::new(24_000, 48_000, SampleFormat::S16, SampleFormat::S16);
+        assert_eq!(up.estimate_output_samples(240), 480);
+    }
+
+    #[test]
+    fn estimate_output_samples_rounds_up_for_partial_samples() {
+        // 441 * 48000 / 44100 = 480 exactly; 1 * 48000 / 44100 = 1.088 → 2.
+        let cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::S16, SampleFormat::S16);
+        assert_eq!(cfg.estimate_output_samples(441), 480);
+        assert_eq!(cfg.estimate_output_samples(1), 2);
+    }
+
+    #[test]
+    fn estimate_output_samples_with_zero_source_rate_passes_through() {
+        let mut cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::S16, SampleFormat::S16);
+        cfg.src_sample_rate = 0;
+        assert_eq!(cfg.estimate_output_samples(123), 123);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_output_without_error() {
+        let frame = Frame::new_audio(SampleFormat::S16, 44_100, 2, 0);
+        let cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::S16, SampleFormat::S16)
+            .with_channel_layouts(ChannelLayout::STEREO, ChannelLayout::STEREO);
+        let out = Resampler::new(cfg).unwrap().resample(&frame).unwrap();
+        assert_eq!(out.samples, 0);
+        assert_eq!(out.sample_rate, 48_000);
+        assert_eq!(out.channels, 2);
+    }
+
+    #[test]
+    fn zero_channel_count_is_rejected() {
+        let mut frame = Frame::new_audio(SampleFormat::S16, 44_100, 2, 8);
+        frame.channels = 0;
+        let cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::S16, SampleFormat::S16);
+        assert!(Resampler::new(cfg).unwrap().resample(&frame).is_err());
+    }
+
+    #[test]
+    fn unsupported_source_format_is_rejected() {
+        let mut frame = Frame::new_audio(SampleFormat::S16, 44_100, 2, 8);
+        // U8 has no decode branch in the resampler.
+        frame.sample_format = SampleFormat::U8;
+        let cfg = ResamplerConfig::new(44_100, 48_000, SampleFormat::U8, SampleFormat::S16)
+            .with_channel_layouts(ChannelLayout::STEREO, ChannelLayout::STEREO);
+        let err = Resampler::new(cfg).unwrap().resample(&frame).unwrap_err();
+        assert!(
+            matches!(err, RsError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fast_path_preserves_pts_and_time_base() {
+        let frame = s16_stereo_frame(48_000, &[1, 2, 3, 4]);
+        let cfg = ResamplerConfig::new(48_000, 48_000, SampleFormat::S16, SampleFormat::S16)
+            .with_channel_layouts(ChannelLayout::STEREO, ChannelLayout::STEREO);
+        let out = Resampler::new(cfg).unwrap().resample(&frame).unwrap();
+        assert_eq!(out.pts, frame.pts);
+        assert_eq!(out.time_base, frame.time_base);
+        assert_eq!(out.samples, frame.samples);
+        assert_eq!(out.data[0], frame.data[0]);
+    }
+
+    #[test]
+    fn stereo_to_mono_drops_to_one_channel() {
+        let nb = 100usize;
+        let mut interleaved = Vec::with_capacity(nb * 2);
+        for i in 0..nb {
+            interleaved.push(1000i16 + i as i16);
+            interleaved.push(1000i16 + i as i16);
+        }
+        let frame = s16_stereo_frame(48_000, &interleaved);
+        let cfg = ResamplerConfig::new(48_000, 48_000, SampleFormat::S16, SampleFormat::S16)
+            .with_channel_layouts(ChannelLayout::STEREO, ChannelLayout::MONO);
+        let out = Resampler::new(cfg).unwrap().resample(&frame).unwrap();
+        assert_eq!(out.channels, 1);
+        assert_eq!(out.samples, nb);
+        // One plane of nb mono S16 samples.
+        assert_eq!(out.data[0].len(), nb * 2);
+        assert!(out.data[0].chunks_exact(2).any(|c| c[0] != 0));
+    }
+
+    #[test]
+    fn compression_ratio_handles_zero_source_rate() {
+        let mut cfg = ResamplerConfig::new(48_000, 24_000, SampleFormat::S16, SampleFormat::S16);
+        cfg.src_sample_rate = 0;
+        let resampler = Resampler::new(cfg).unwrap();
+        assert_eq!(resampler.compression_ratio(), 1.0);
+    }
+
+    #[test]
+    fn flush_reports_no_delay_by_default() {
+        let cfg = ResamplerConfig::new(48_000, 48_000, SampleFormat::S16, SampleFormat::S16);
+        let mut resampler = Resampler::new(cfg).unwrap();
+        assert_eq!(resampler.delay(), 0);
+        assert!(resampler.flush().unwrap().is_none());
+    }
 }

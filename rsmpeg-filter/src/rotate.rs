@@ -30,8 +30,15 @@ impl RotateFilter {
         }
         let dw = sh;
         let dh = sw;
-        let src = &frame.data[0];
         let stride = 4usize;
+        // Bail out on a missing or truncated packed RGBA plane rather than
+        // indexing past its end.
+        let Some(src) = frame.data.first() else {
+            return;
+        };
+        if src.len() < sw * sh * stride {
+            return;
+        }
         let mut out = vec![0u8; dw * dh * stride];
         for dy in 0..dh {
             for dx in 0..dw {
@@ -173,5 +180,56 @@ mod tests {
         assert_eq!(filter.inputs().len(), 1);
         assert_eq!(filter.outputs().len(), 1);
         assert!(filter.as_any().is::<RotateFilter>());
+    }
+
+    #[test]
+    fn rotate_four_times_restores_original() {
+        // Four 90° clockwise turns must return every pixel to its origin.
+        let pixels = [
+            (1, 0, 0, 255),
+            (2, 0, 0, 255),
+            (3, 0, 0, 255),
+            (4, 0, 0, 255),
+            (5, 0, 0, 255),
+            (6, 0, 0, 255),
+        ];
+        let mut frame = rgba_frame(3, 2, &pixels);
+        let original = frame.data[0].clone();
+        let filter = RotateFilter::new();
+        for _ in 0..4 {
+            filter.apply(&mut frame);
+        }
+        assert_eq!(frame.width, 3);
+        assert_eq!(frame.height, 2);
+        assert_eq!(frame.data[0], original);
+    }
+
+    #[test]
+    fn rotate_swaps_dimensions_each_time() {
+        let mut frame = rgba_frame(3, 2, &[(0, 0, 0, 255); 6]);
+        let filter = RotateFilter::new();
+        filter.apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (2, 3));
+        assert_eq!(frame.linesize[0], 2 * 4);
+        filter.apply(&mut frame);
+        assert_eq!((frame.width, frame.height), (3, 2));
+        assert_eq!(frame.linesize[0], 3 * 4);
+    }
+
+    #[test]
+    fn rotate_missing_plane_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data.clear();
+        RotateFilter::new().apply(&mut frame);
+        assert!(frame.data.is_empty());
+    }
+
+    #[test]
+    fn rotate_truncated_plane_is_noop() {
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data[0] = vec![3u8; 4];
+        RotateFilter::new().apply(&mut frame);
+        assert_eq!(frame.data[0], vec![3u8; 4]);
+        assert_eq!((frame.width, frame.height), (2, 2));
     }
 }

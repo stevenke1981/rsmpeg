@@ -58,12 +58,30 @@ pub fn register_builtin_codecs() {
     use crate::codec_impls::*;
     use rsmpeg_util::SampleFormat;
 
-    let mut registry = global_codec_registry()
-        .write()
-        .expect("codec registry lock poisoned");
+    // Never panic during start-up registration: if the lock is poisoned the
+    // registry is unusable anyway, so recover the guard and log instead of
+    // aborting the process.
+    let mut registry = match global_codec_registry().write() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!("codec registry lock poisoned; recovering to finish registration");
+            poisoned.into_inner()
+        }
+    };
 
-    // Register raw video codec
+    // Registration is idempotent by construction (fresh registry per process),
+    // but guard against a second call adding duplicates.
+    if !registry.is_empty() {
+        tracing::debug!("built-in codecs already registered; skipping");
+        return;
+    }
+
+    // Register pure-Rust video codecs
     registry.register(Box::new(RawVideoCodec));
+    registry.register(Box::new(MjpegCodec));
+
+    // Register pure-Rust lossless audio codec
+    registry.register(Box::new(FlacCodec));
 
     // Register PCM audio codecs for common formats
     for sample_fmt in &[
@@ -76,6 +94,10 @@ pub fn register_builtin_codecs() {
             registry.register(Box::new(codec));
         }
     }
+
+    // Register subtitle codecs
+    registry.register(Box::new(SrtCodec));
+    registry.register(Box::new(WebVttCodec));
 
     tracing::info!("Registered {} built-in codecs", registry.len());
 }
@@ -151,9 +173,19 @@ mod tests {
 
     #[test]
     fn test_global_registry() {
-        let registry = global_codec_registry();
-        let r = registry.read().unwrap();
-        assert!(r.is_empty());
+        // Hold a single read guard: other tests in this binary may call
+        // `register_builtin_codecs()` at any time (the registry is
+        // process-global), so taking two guards and comparing could observe
+        // two different states.
+        let guard = global_codec_registry().read().expect("codec registry lock");
+        // Both views must agree inside one guard snapshot.
+        let listed = guard.list().len();
+        assert_eq!(listed, guard.len(), "list() and len() must agree");
+        assert_eq!(
+            guard.is_empty(),
+            listed == 0,
+            "is_empty() must agree with the entry count"
+        );
     }
 
     #[test]

@@ -41,12 +41,13 @@ impl PlaybackClock {
         if self.paused_at.is_some() {
             return;
         }
-        if let Some(start) = self.started {
+        if let Some(start) = self.started.take() {
             let elapsed = start.elapsed().mul_f64(self.rate);
             self.base += elapsed;
-            self.started = None;
-            self.paused_at = Some(Instant::now());
         }
+        // Record pause even before first `start()` so a subsequent `seek()`
+        // keeps the clock frozen until `resume()` / `start()` is called.
+        self.paused_at = Some(Instant::now());
     }
 
     pub fn resume(&mut self) {
@@ -475,6 +476,108 @@ mod tests {
         // After resume, audio-driven position is reported again.
         m.set_audio_samples_played(96_000);
         assert!((m.now().as_secs_f64() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duration_helpers_handle_zero_rate() {
+        assert_eq!(
+            PlaybackClock::duration_from_audio_samples(1234, 0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            MasterClock::duration_to_audio_samples(Duration::from_secs(3), 0),
+            0
+        );
+    }
+
+    #[test]
+    fn duration_to_audio_samples_matches_rate() {
+        assert_eq!(
+            MasterClock::duration_to_audio_samples(Duration::from_secs(1), 48_000),
+            48_000
+        );
+        // 0.5 s * 44100 Hz = 22050 samples exactly.
+        assert_eq!(
+            MasterClock::duration_to_audio_samples(Duration::from_millis(500), 44_100),
+            22_050
+        );
+    }
+
+    #[test]
+    fn audio_samples_roundtrip_through_sample_rate() {
+        let rate = 48_000u32;
+        for samples in [0u64, 1, 479, 48_000, 96_001] {
+            let d = PlaybackClock::duration_from_audio_samples(samples, rate);
+            let back = MasterClock::duration_to_audio_samples(d, rate);
+            // Truncation may lose sub-sample precision on the way back.
+            assert!(
+                back == samples || back + 1 == samples,
+                "{samples} -> {d:?} -> {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_rate_rejects_non_positive_values() {
+        let mut c = PlaybackClock::new();
+        c.start();
+        c.set_rate(0.0);
+        // Rate is clamped to a small positive floor so time keeps advancing.
+        assert!(c.rate() > 0.0);
+        assert!(c.rate() <= 0.01);
+        c.set_rate(-5.0);
+        assert!(c.rate() > 0.0);
+        assert!(c.rate() <= 0.01);
+    }
+
+    #[test]
+    fn master_clock_position_never_goes_backwards_on_resume() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        thread::sleep(Duration::from_millis(10));
+        m.pause();
+        let paused = m.now();
+        m.resume();
+        assert!(m.now() >= paused);
+    }
+
+    #[test]
+    fn seek_to_resets_while_paused() {
+        let mut m = MasterClock::new();
+        m.clock_mut().start();
+        m.pause();
+        assert!(m.is_paused());
+        m.seek_to(Duration::from_secs(7));
+        // Seeking clears the paused state.
+        assert!(!m.is_paused());
+        assert!(m.now() >= Duration::from_secs(7));
+    }
+
+    #[test]
+    fn pause_before_start_keeps_clock_frozen_across_seek_until_resume() {
+        let mut c = PlaybackClock::new();
+        // Pausing before first start (e.g. `autoplay(false)`) must mark the clock paused.
+        c.pause();
+        assert!(c.is_paused());
+
+        let target = Duration::from_millis(400);
+        c.seek(target);
+        assert!(c.is_paused(), "seek while paused must keep clock frozen");
+
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            c.now(),
+            target,
+            "pause duration before resume must not advance clock"
+        );
+
+        c.resume();
+        assert!(!c.is_paused());
+        let immediately_after = c.now();
+        assert!(
+            immediately_after >= target && immediately_after < target + Duration::from_millis(30),
+            "clock must resume from seek target without jump, got {immediately_after:?}"
+        );
     }
 
     #[test]

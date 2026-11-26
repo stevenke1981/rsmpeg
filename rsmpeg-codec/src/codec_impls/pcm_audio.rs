@@ -93,6 +93,28 @@ impl PCMAudioDecoder {
         }
     }
 
+    /// Construct a [`PCMAudioDecoder`] configured from [`CodecParameters`].
+    pub fn from_params(params: &CodecParameters) -> RsResult<Self> {
+        if params.codec_id != CodecId::Pcm && params.codec_id != CodecId::Unknown {
+            return Err(RsError::Unsupported(
+                format!(
+                    "PCMAudioDecoder does not support codec {:?}",
+                    params.codec_id
+                )
+                .into(),
+            ));
+        }
+        let sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
+        if sample_format == SampleFormat::None || sample_format.is_planar() {
+            return Err(RsError::Unsupported(
+                format!("Unsupported PCM sample format: {:?}", sample_format).into(),
+            ));
+        }
+        let mut dec = Self::new(sample_format);
+        dec.set_parameters(params.clone());
+        Ok(dec)
+    }
+
     #[allow(dead_code)]
     pub fn set_parameters(&mut self, params: CodecParameters) {
         if let Some(ch) = params.channels {
@@ -201,9 +223,22 @@ impl Encoder for PCMAudioEncoder {
     }
 
     fn encode(&mut self, frame: &Frame) -> RsResult<Vec<Packet>> {
-        let data: Vec<u8> = frame.data.concat();
+        // Fast path: a single (interleaved) plane can be moved into `Bytes`
+        // directly, avoiding the `concat()` intermediate allocation + copy that
+        // `data.concat()` performs even for the common one-plane case.
+        let data: Bytes = match frame.data.as_slice() {
+            [only] => Bytes::copy_from_slice(only),
+            planes => {
+                let total: usize = planes.iter().map(Vec::len).sum();
+                let mut buf = Vec::with_capacity(total);
+                for p in planes {
+                    buf.extend_from_slice(p);
+                }
+                Bytes::from(buf)
+            }
+        };
         let packet = Packet {
-            data: Bytes::from(data),
+            data,
             pts: frame.pts,
             dts: None,
             duration: frame.duration,
@@ -412,5 +447,60 @@ mod tests {
             assert_eq!(frames[0].samples, 10, "Wrong sample count for {:?}", fmt);
             assert_eq!(frames[0].sample_format, *fmt);
         }
+    }
+
+    #[test]
+    fn test_pcm_from_params() {
+        let mut params = CodecParameters::for_audio(48000, 1, CodecId::Pcm);
+        params.sample_format = Some(SampleFormat::S32);
+
+        let mut decoder = PCMAudioDecoder::from_params(&params).unwrap();
+        let packet = Packet {
+            data: Bytes::from(vec![0u8; 32]),
+            pts: Some(12),
+            dts: Some(12),
+            duration: 8,
+            stream_index: 0,
+            flags: PacketFlags::KEY,
+            pos: 0,
+            time_base: Rational::new(1, 48000),
+        };
+        let frames = decoder.decode(&packet).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].sample_format, SampleFormat::S32);
+        assert_eq!(frames[0].sample_rate, 48000);
+        assert_eq!(frames[0].channels, 1);
+        assert_eq!(frames[0].samples, 8);
+        assert_eq!(decoder.get_parameters().sample_rate, Some(48000));
+
+        // Unknown codec id defaults sample_format to S16 when omitted.
+        let unknown_params = CodecParameters::new(CodecId::Unknown);
+        let mut default_dec = PCMAudioDecoder::from_params(&unknown_params).unwrap();
+        let s16_pkt = Packet::new(Bytes::from(vec![0u8; 8]), 0);
+        let frames = default_dec.decode(&s16_pkt).unwrap();
+        assert_eq!(frames[0].sample_format, SampleFormat::S16);
+        assert_eq!(frames[0].samples, 2);
+
+        // Non-PCM codec must be rejected.
+        let flac_params = CodecParameters::new(CodecId::Flac);
+        assert!(matches!(
+            PCMAudioDecoder::from_params(&flac_params),
+            Err(RsError::Unsupported(_))
+        ));
+
+        // Planar or None sample formats must be rejected.
+        let mut planar_params = CodecParameters::new(CodecId::Pcm);
+        planar_params.sample_format = Some(SampleFormat::S16P);
+        assert!(matches!(
+            PCMAudioDecoder::from_params(&planar_params),
+            Err(RsError::Unsupported(_))
+        ));
+
+        let mut none_params = CodecParameters::new(CodecId::Pcm);
+        none_params.sample_format = Some(SampleFormat::None);
+        assert!(matches!(
+            PCMAudioDecoder::from_params(&none_params),
+            Err(RsError::Unsupported(_))
+        ));
     }
 }

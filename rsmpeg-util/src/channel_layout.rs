@@ -43,3 +43,51 @@ impl ChannelLayout {
         self.bits().count_ones() as usize
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_counts_match_layout_names() {
+        assert_eq!(ChannelLayout::MONO.channels(), 1);
+        assert_eq!(ChannelLayout::STEREO.channels(), 2);
+        assert_eq!(ChannelLayout::SURROUND.channels(), 3);
+        assert_eq!(ChannelLayout::_5POINT1.channels(), 6);
+        assert_eq!(ChannelLayout::_7POINT1.channels(), 8);
+        assert_eq!(ChannelLayout::empty().channels(), 0);
+    }
+
+    #[test]
+    fn names_are_stable() {
+        assert_eq!(ChannelLayout::MONO.name(), "mono");
+        assert_eq!(ChannelLayout::STEREO.name(), "stereo");
+        assert_eq!(ChannelLayout::SURROUND.name(), "surround");
+        assert_eq!(ChannelLayout::_5POINT1.name(), "5.1");
+        assert_eq!(ChannelLayout::_7POINT1.name(), "7.1");
+        assert_eq!(ChannelLayout::empty().name(), "unknown");
+        // A non-preset combination also falls back to "unknown".
+        assert_eq!(
+            (ChannelLayout::FRONT_LEFT | ChannelLayout::SIDE_RIGHT).name(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn layouts_nest_as_expected() {
+        // 5.1 ⊃ surround ⊃ stereo, which makes down/up-mix decisions predictable.
+        assert!(ChannelLayout::_5POINT1.contains(ChannelLayout::SURROUND));
+        assert!(ChannelLayout::SURROUND.contains(ChannelLayout::STEREO));
+        assert!(!ChannelLayout::STEREO.contains(ChannelLayout::MONO));
+        assert!(ChannelLayout::_7POINT1.contains(ChannelLayout::_5POINT1));
+    }
+
+    #[test]
+    fn equality_distinguishes_layouts_with_same_channel_count() {
+        // Stereo and "front-left + front-center" both have 2 channels but are
+        // different layouts; the resampler relies on this being `false`.
+        let other = ChannelLayout::FRONT_LEFT | ChannelLayout::FRONT_CENTER;
+        assert_eq!(other.channels(), 2);
+        assert_ne!(other, ChannelLayout::STEREO);
+    }
+}

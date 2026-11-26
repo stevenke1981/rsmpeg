@@ -1,6 +1,23 @@
 //! Events emitted by the player toward UI / CLI consumers.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Summary of one selectable audio or video stream reported by the playback worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerTrackInfo {
+    /// Stream index (native pipeline) or track id (fallback) accepted by
+    /// `SelectAudioTrack` / `SelectVideoTrack`.
+    pub index: usize,
+    pub is_video: bool,
+    pub codec: String,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub sample_rate: Option<u32>,
+    pub channels: Option<u16>,
+    pub language: Option<String>,
+    pub supported: bool,
+}
 
 /// Lightweight state snapshot for UI binding (replaces large shared Mutex state).
 #[derive(Debug, Clone)]
@@ -13,7 +30,11 @@ pub struct PlayerSnapshot {
     pub status: String,
 }
 
-/// Player → host events.  Frame payloads stay small / reference-counted later.
+/// Player → host events.
+///
+/// Video frames carry their pixel buffer as an [`Arc`] so repeating a frame
+/// (`SyncAction::Duplicate`) or fanning it out to several consumers costs a
+/// reference-count bump instead of a full-frame `memcpy`.
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Snapshot(PlayerSnapshot),
@@ -25,7 +46,7 @@ pub enum PlayerEvent {
     VideoFrame {
         width: usize,
         height: usize,
-        rgba: Vec<u8>,
+        rgba: Arc<Vec<u8>>,
         pts: Duration,
         generation: u64,
     },
@@ -45,6 +66,46 @@ pub enum PlayerEvent {
         message: String,
         generation: u64,
     },
+    /// Lightweight audio amplitude meter (normalized `0.0..=1.0`) for GUI visualizers.
+    AudioLevel {
+        rms: f32,
+        peak: f32,
+        generation: u64,
+    },
+    /// Available audio/video tracks and currently active selections.
+    Tracks {
+        video_tracks: Vec<PlayerTrackInfo>,
+        audio_tracks: Vec<PlayerTrackInfo>,
+        active_video: Option<usize>,
+        active_audio: Option<usize>,
+        generation: u64,
+    },
+    /// Active demuxer and decoder backend names.
+    DecoderInfo {
+        demuxer: String,
+        video_decoder: Option<String>,
+        audio_decoder: Option<String>,
+        generation: u64,
+    },
+}
+
+/// Compute normalized `(rms, peak)` levels in `0.0..=1.0` from signed 16-bit PCM samples.
+pub fn compute_pcm_level(samples: &[i16]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0f64;
+    let mut peak = 0.0f32;
+    for &sample in samples {
+        let normalized = (f32::from(sample) / 32768.0).abs().min(1.0);
+        if normalized > peak {
+            peak = normalized;
+        }
+        let v = f64::from(normalized);
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / samples.len() as f64).sqrt().clamp(0.0, 1.0) as f32;
+    (rms, peak)
 }
 
 impl PlayerEvent {
@@ -56,7 +117,126 @@ impl PlayerEvent {
             | Self::SeekCompleted { generation, .. }
             | Self::Ended { generation }
             | Self::Error { generation, .. }
-            | Self::Warning { generation, .. } => *generation,
+            | Self::Warning { generation, .. }
+            | Self::AudioLevel { generation, .. }
+            | Self::Tracks { generation, .. }
+            | Self::DecoderInfo { generation, .. } => *generation,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(rgba: Vec<u8>, generation: u64) -> PlayerEvent {
+        PlayerEvent::VideoFrame {
+            width: 2,
+            height: 2,
+            rgba: Arc::new(rgba),
+            pts: Duration::from_millis(40),
+            generation,
+        }
+    }
+
+    #[test]
+    fn generation_is_exposed_for_every_variant() {
+        let snapshot = PlayerEvent::Snapshot(PlayerSnapshot {
+            playing: true,
+            position: Duration::ZERO,
+            duration: Duration::from_secs(1),
+            volume: 0.5,
+            generation: 7,
+            status: "playing".into(),
+        });
+        let variants = [
+            snapshot,
+            PlayerEvent::PositionChanged {
+                position: Duration::ZERO,
+                generation: 7,
+            },
+            frame(vec![0; 16], 7),
+            PlayerEvent::SeekCompleted {
+                position: Duration::ZERO,
+                generation: 7,
+            },
+            PlayerEvent::Ended { generation: 7 },
+            PlayerEvent::Error {
+                message: "boom".into(),
+                generation: 7,
+            },
+            PlayerEvent::Warning {
+                message: "meh".into(),
+                generation: 7,
+            },
+            PlayerEvent::AudioLevel {
+                rms: 0.25,
+                peak: 0.75,
+                generation: 7,
+            },
+            PlayerEvent::Tracks {
+                video_tracks: Vec::new(),
+                audio_tracks: Vec::new(),
+                active_video: None,
+                active_audio: None,
+                generation: 7,
+            },
+            PlayerEvent::DecoderInfo {
+                demuxer: "rsmpeg-format (mp4)".into(),
+                video_decoder: Some("OpenH264 (H.264)".into()),
+                audio_decoder: Some("Symphonia (AAC)".into()),
+                generation: 7,
+            },
+        ];
+        for ev in &variants {
+            assert_eq!(ev.generation(), 7, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn cloning_a_video_event_shares_the_pixel_buffer() {
+        let ev = frame(vec![1u8, 2, 3, 4], 1);
+        let dup = ev.clone();
+        let (a, b) = match (&ev, &dup) {
+            (PlayerEvent::VideoFrame { rgba: a, .. }, PlayerEvent::VideoFrame { rgba: b, .. }) => {
+                (a, b)
+            }
+            _ => unreachable!("constructed as VideoFrame"),
+        };
+        // The clone must share the allocation, not copy it — this is what makes
+        // `SyncAction::Duplicate` in the playback loop cheap.
+        assert!(Arc::ptr_eq(a, b));
+        assert_eq!(a.as_slice(), &[1u8, 2, 3, 4]);
+        // Strong count is 2 while both events are alive.
+        assert_eq!(Arc::strong_count(a), 2);
+    }
+
+    #[test]
+    fn dropping_the_clone_keeps_the_original_buffer_alive() {
+        let ev = frame(vec![9u8; 32], 3);
+        {
+            let _dup = ev.clone();
+        }
+        match &ev {
+            PlayerEvent::VideoFrame { rgba, .. } => {
+                assert_eq!(rgba.len(), 32);
+                assert_eq!(Arc::strong_count(rgba), 1);
+            }
+            _ => panic!("expected VideoFrame"),
+        }
+    }
+
+    #[test]
+    fn compute_pcm_level_handles_silence_and_full_scale() {
+        assert_eq!(compute_pcm_level(&[]), (0.0, 0.0));
+        assert_eq!(compute_pcm_level(&[0, 0, 0, 0]), (0.0, 0.0));
+
+        let (rms, peak) = compute_pcm_level(&[i16::MIN, i16::MAX]);
+        assert!((peak - 1.0).abs() < 1e-3, "peak={peak}");
+        assert!((rms - 1.0).abs() < 1e-3, "rms={rms}");
+
+        let (rms_half, peak_half) = compute_pcm_level(&[16384, -16384]);
+        assert!((peak_half - 0.5).abs() < 1e-3, "peak={peak_half}");
+        assert!((rms_half - 0.5).abs() < 1e-3, "rms={rms_half}");
     }
 }

@@ -19,7 +19,10 @@ impl GrayscaleFilter {
     /// the alpha channel is left untouched. For RGBA, `frame.data[0]` is a single
     /// tightly-packed plane with a 4-byte stride (R, G, B, A).
     pub fn apply(&self, frame: &mut Frame) {
-        let buf = &mut frame.data[0];
+        // A frame with no plane is a no-op (previously panicked).
+        let Some(buf) = frame.data.first_mut() else {
+            return;
+        };
         let mut i = 0usize;
         while i + 3 < buf.len() {
             let r = buf[i] as f32;
@@ -119,5 +122,24 @@ mod tests {
         assert_eq!(filter.inputs().len(), 1);
         assert_eq!(filter.outputs().len(), 1);
         assert!(filter.as_any().is::<GrayscaleFilter>());
+    }
+
+    #[test]
+    fn grayscale_empty_plane_is_noop() {
+        // A frame with no planes must not panic (previously indexed data[0]).
+        let mut frame = Frame::new_video(2, 2, PixelFormat::Rgba);
+        frame.data.clear();
+        GrayscaleFilter::new().apply(&mut frame);
+        assert!(frame.data.is_empty());
+    }
+
+    #[test]
+    fn grayscale_endpoints_are_exact() {
+        // Pure black stays black, pure white stays white (rounding edge cases).
+        let mut frame = rgba_frame(&[(0, 0, 0, 255), (255, 255, 255, 255)]);
+        GrayscaleFilter::new().apply(&mut frame);
+        let p = &frame.data[0];
+        assert_eq!(&p[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&p[4..8], &[255, 255, 255, 255]);
     }
 }

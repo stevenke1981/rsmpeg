@@ -13,7 +13,7 @@ use rsmpeg_util::{MediaType, Rational, RsError, RsResult};
 use std::io::SeekFrom;
 
 /// One indexed sample ready for packet emission.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct SampleEntry {
     offset: u64,
     size: u32,
@@ -32,16 +32,72 @@ struct TrackState {
     next_sample: usize,
 }
 
+/// Why `read_header` refused to publish a `trak`.
+///
+/// Kept per track so the "nothing is playable" error can describe the real
+/// cause: a sample-mapping failure and an unrepresentable `mdhd` timescale are
+/// different bugs and must not be reported as each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackRejection {
+    /// No sample could be placed inside an `mdat` payload (`stsc`/`stco`/`stsz`
+    /// disagree, or the offsets point outside the media data).
+    UnlocatableSamples,
+    /// `mdhd` timescale is 0 or does not fit an `i32` denominator.
+    UnrepresentableTimeBase,
+}
+
+/// Build the "all tracks rejected" error from the per-track reasons.
+///
+/// When every track failed for the same reason the message names it directly;
+/// otherwise the mix is spelled out so neither cause is hidden behind the
+/// other. The error *variant* follows the cause as well: an untrustworthy
+/// sample mapping is a container-structure problem ([`RsError::Format`]),
+/// while a `mdhd` timescale that cannot form a time base is malformed data
+/// ([`RsError::InvalidData`]). Both were previously reported as the latter,
+/// which pointed readers at `mdhd` for a bug that lived in `stsc`/`stco`.
+fn rejection_error(rejections: &[TrackRejection], track_total: usize) -> RsError {
+    let unlocatable = rejections
+        .iter()
+        .filter(|r| **r == TrackRejection::UnlocatableSamples)
+        .count();
+    let bad_time_base = rejections.len() - unlocatable;
+    let detail = match (unlocatable, bad_time_base) {
+        (0, n) => {
+            format!("{n} track(s) have a timescale that cannot be represented as a time base")
+        }
+        (n, 0) => format!(
+            "{n} track(s) have no sample that can be located inside an mdat payload \
+             (sample mapping is invalid or references non-media bytes)"
+        ),
+        (u, t) => format!(
+            "{u} track(s) have no locatable sample and {t} track(s) have a timescale \
+             that cannot be represented as a time base"
+        ),
+    };
+    let message = format!("MP4: all {track_total} track(s) unusable: {detail}");
+    if unlocatable == 0 {
+        RsError::InvalidData(message.into())
+    } else {
+        RsError::Format(message.into())
+    }
+}
+
 /// Intermediate tables collected while parsing one `trak`.
 struct TrackTables {
     timescale: u32,
     duration: u64,
+    /// Payload ranges `[start, end)` of every `mdat` box. Sample data must live
+    /// inside one of them; anything else (the `ftyp`/`moov` header region, or a
+    /// range spanning two boxes) is structural bytes, not media.
+    media_ranges: Vec<(u64, u64)>,
     media_type: MediaType,
     codec_id: CodecId,
     width: u16,
     height: u16,
     sample_rate: u32,
     channels: u16,
+    bit_rate: u64,
+    language: Option<String>,
     extradata: Option<Vec<u8>>,
     h264_format: H264BitstreamFormat,
     stts: Vec<(u32, u32)>,      // (count, delta)
@@ -58,12 +114,15 @@ impl Default for TrackTables {
         Self {
             timescale: 0,
             duration: 0,
+            media_ranges: Vec::new(),
             media_type: MediaType::Data,
             codec_id: CodecId::Unknown,
             width: 0,
             height: 0,
             sample_rate: 0,
             channels: 0,
+            bit_rate: 0,
+            language: None,
             extradata: None,
             h264_format: H264BitstreamFormat::Unknown,
             stts: Vec::new(),
@@ -126,24 +185,28 @@ impl InputFormat for MP4Demuxer {
 
         let mut track_builds: Vec<TrackTables> = Vec::new();
         let mut found_moov = false;
+        let mut media_ranges: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0u64;
 
-        while cursor + 8 <= file_end {
+        while file_end.saturating_sub(cursor) >= 8 {
             io.seek(SeekFrom::Start(cursor))?;
             let (box_size, box_type, header_len) = read_box_header_at(io, file_end)?;
-            if box_size < header_len {
+            let Some((payload_start, payload_end)) =
+                checked_child_box_bounds(cursor, box_size, header_len, file_end)
+            else {
                 break;
-            }
-            let payload_start = cursor + header_len;
-            let payload_end = cursor.saturating_add(box_size);
-            if payload_end > file_end || payload_end < payload_start {
-                break;
-            }
+            };
 
             match &box_type {
                 b"moov" => {
                     found_moov = true;
                     parse_moov(io, payload_start, payload_end, &mut track_builds)?;
+                }
+                b"mdat" => {
+                    // Only the payload is media; the 8/16-byte box header is not.
+                    if payload_end > payload_start {
+                        media_ranges.push((payload_start, payload_end));
+                    }
                 }
                 b"moof" => {
                     tracing::warn!(
@@ -165,8 +228,21 @@ impl InputFormat for MP4Demuxer {
             return Ok(());
         }
 
+        // Sample ranges must fall inside an `mdat` payload; the file length alone
+        // is not enough (byte 4 of a tiny file is `ftyp`, not media).
+        if media_ranges.is_empty() {
+            tracing::warn!("MP4: no mdat payload found; no sample can be located");
+        }
+        for tables in &mut track_builds {
+            tables.media_ranges = media_ranges.clone();
+        }
+
         let mut max_duration_ms: i64 = 0;
-        for (idx, tables) in track_builds.into_iter().enumerate() {
+        let track_total = track_builds.len();
+        // Why each `trak` was dropped, so the end-of-`moov` report can name the
+        // real cause instead of assuming the time base was at fault.
+        let mut rejections: Vec<TrackRejection> = Vec::new();
+        for (trak_idx, tables) in track_builds.into_iter().enumerate() {
             let samples = build_sample_index(&tables);
             if samples.is_empty()
                 && tables.media_type != MediaType::Data
@@ -174,11 +250,39 @@ impl InputFormat for MP4Demuxer {
             {
                 tracing::warn!(
                     "MP4: track {} has no samples (fragmented or incomplete stbl)",
-                    idx
+                    trak_idx
                 );
             }
 
-            let timescale = tables.timescale.max(1);
+            // A track with no locatable sample cannot be played: publishing it
+            // would put a dead entry in `ctx.streams`, and `find_best_stream`
+            // could select it while every packet belongs to a different track.
+            // Data/subtitle tracks are metadata-only and stay publishable.
+            let playable_kind = !matches!(tables.media_type, MediaType::Data | MediaType::Subtitle);
+            if samples.is_empty() && playable_kind {
+                tracing::error!(
+                    "MP4: track {} has no sample inside any mdat payload; not publishing it",
+                    trak_idx
+                );
+                rejections.push(TrackRejection::UnlocatableSamples);
+                continue;
+            }
+
+            // `tb = 1/timescale` must be representable as an `i32` pair, and a
+            // missing (`mdhd` timescale 0) or out-of-range value is not. The
+            // previous `max(1)` turned 0 into 1/1, re-interpreting every
+            // DTS/PTS in seconds: refuse the track instead.
+            let Some(time_base) = timescale_den(tables.timescale) else {
+                tracing::error!(
+                    "MP4: track {} has timescale {} which cannot be represented as a \
+                     time base; skipping the track",
+                    trak_idx,
+                    tables.timescale
+                );
+                rejections.push(TrackRejection::UnrepresentableTimeBase);
+                continue;
+            };
+            let timescale = time_base as u32;
             let duration_tb = if tables.duration > 0 {
                 tables.duration as i64
             } else {
@@ -190,7 +294,14 @@ impl InputFormat for MP4Demuxer {
             let duration_ms = (duration_tb as i128 * 1000 / timescale as i128) as i64;
             max_duration_ms = max_duration_ms.max(duration_ms);
 
-            let mut stream = Stream::new(idx, tables.codec_id);
+            // The stream index must match the position in `ctx.streams`: the
+            // player picks a stream by index (`find_best_stream`) and routes
+            // packets by `packet.stream_index`. Keeping the original `trak`
+            // ordinal after dropping a track left both readers pointing at the
+            // wrong slot (and at a stream that no longer exists).
+            let index = ctx.streams.len();
+
+            let mut stream = Stream::new(index, tables.codec_id);
             stream.media_type = tables.media_type;
             stream.codec_params.codec_id = tables.codec_id;
             stream.codec_params.media_type = tables.media_type;
@@ -208,16 +319,34 @@ impl InputFormat for MP4Demuxer {
             if tables.channels > 0 {
                 stream.codec_params.channels = Some(tables.channels);
             }
-            stream.time_base = Rational::new(1, timescale as i32);
+            if tables.bit_rate > 0 {
+                stream.codec_params.bit_rate = Some(tables.bit_rate);
+            }
+            if let Some(lang) = tables.language {
+                stream.metadata.insert("language", lang);
+            }
+            stream.time_base = Rational::new(1, time_base);
             stream.duration = duration_tb;
             ctx.streams.push(stream);
 
             self.tracks.push(TrackState {
-                stream_index: idx,
+                stream_index: index,
                 timescale,
                 samples,
                 next_sample: 0,
             });
+        }
+
+        // Every track was rejected: report the failure instead of returning
+        // success with an empty stream list, which reads like an intentionally
+        // empty file. The message has to name the *actual* reason — a track
+        // dropped because its samples are not inside any `mdat` payload has a
+        // perfectly valid time base, and claiming otherwise sent readers
+        // chasing `mdhd` when the bug was in `stsc`/`stco`.
+        if ctx.streams.is_empty() && rejections.len() == track_total && track_total > 0 {
+            let err = rejection_error(&rejections, track_total);
+            tracing::error!("{err}");
+            return Err(err);
         }
 
         ctx.duration = max_duration_ms;
@@ -242,6 +371,22 @@ impl InputFormat for MP4Demuxer {
             return Ok(None);
         }
 
+        // Secondary guard: never translate an unaddressable index entry into a
+        // packet. `build_sample_index` already drops such samples, but a track
+        // built by any other path must not fall through to reading byte 0.
+        for track in &mut self.tracks {
+            while track.next_sample < track.samples.len()
+                && !sample_is_readable(&track.samples[track.next_sample])
+            {
+                tracing::warn!(
+                    "MP4: skipping sample {} of stream {} (offset/size unavailable)",
+                    track.next_sample,
+                    track.stream_index
+                );
+                track.next_sample += 1;
+            }
+        }
+
         // Pick the track whose next sample has the earliest DTS in seconds.
         let mut best: Option<(usize, f64)> = None;
         for (ti, track) in self.tracks.iter().enumerate() {
@@ -262,11 +407,22 @@ impl InputFormat for MP4Demuxer {
         };
 
         let track = &mut self.tracks[ti];
-        let sample = track.samples[track.next_sample].clone();
+        // `SampleEntry` is `Copy`, so this is a plain byte copy (no `Vec` clone).
+        let sample = track.samples[track.next_sample];
         track.next_sample += 1;
         let stream_index = track.stream_index;
         let timescale = track.timescale;
-        let time_base = Rational::new(1, timescale.max(1) as i32);
+        // `read_header` skips tracks with an unrepresentable timescale, so this
+        // is unreachable in practice; fail loudly rather than emit 1/1 ticks.
+        let time_base = Rational::new(
+            1,
+            timescale_den(timescale).ok_or_else(|| {
+                RsError::InvalidData(
+                    format!("MP4: timescale {timescale} cannot be represented as a time base")
+                        .into(),
+                )
+            })?,
+        );
 
         let io = ctx
             .io
@@ -313,6 +469,152 @@ impl InputFormat for MP4Demuxer {
 }
 
 // ── Sample index builder ─────────────────────────────────────────────
+
+/// Expand the run-length `stsc` table into one samples-per-chunk value per
+/// chunk, or `None` when the entries cannot prove a complete, contiguous
+/// mapping of chunks `0..chunk_count`.
+///
+/// Two shapes are legitimate:
+///
+/// * `stsc` starts at `first_chunk == 1` and its ranges cover every chunk.
+/// * `stsc` starts at `first_chunk == 1` and its last range runs past the last
+///   chunk (the tail is simply larger than the table, which is how most muxers
+///   write it) — covered by clamping the last range to `chunk_count`.
+///
+/// Anything else leaves a *leading* chunk (the reviewer's reproduction: 2
+/// chunks, `first_chunk == 2`) or an interior chunk without a mapping. Those
+/// chunks would silently receive `0` samples, so the samples they should have
+/// carried would be looked for in the *next* chunk — with this sample's
+/// `stsz` size and this sample's `stts` DTS. That is exactly the truncated
+/// `BBB`／DTS 0 packet the review caught, so refuse the track instead of
+/// returning a shifted index.
+fn expand_stsc(t: &TrackTables, chunk_count: usize, sample_count: usize) -> Option<Vec<u32>> {
+    if chunk_count == 0 {
+        return Some(Vec::new());
+    }
+    if t.stsc.is_empty() {
+        // No `stsc` at all: `stco` names chunks but says nothing about how many
+        // samples each holds, so only the single-chunk case is unambiguous.
+        if chunk_count == 1 {
+            return Some(vec![u32::try_from(sample_count).ok()?]);
+        }
+        tracing::warn!(
+            "MP4: no stsc table for {chunk_count} chunk(s); the chunk→sample \
+             mapping is unknown"
+        );
+        return None;
+    }
+
+    // The first entry must start at chunk 1. A later start means the chunks
+    // before it have no declared contents — the case this guard exists for.
+    if t.stsc[0].0 != 1 {
+        tracing::warn!(
+            "MP4: stsc starts at first_chunk {} instead of 1; the earlier chunk(s) \
+             have no sample mapping",
+            t.stsc[0].0
+        );
+        return None;
+    }
+
+    let mut samples_per_chunk = vec![0u32; chunk_count];
+    let mut filled_through = 0usize; // exclusive end of the covered chunk run
+    for (ei, entry) in t.stsc.iter().enumerate() {
+        let first_chunk = entry.0;
+        let next_first = t.stsc.get(ei + 1).map(|e| e.0);
+
+        // `first_chunk` is attacker-controlled and 1-based. A zero is invalid
+        // (the spec allows 1..), and the table must be strictly increasing;
+        // either error would otherwise be "repaired" into a wrong ordinal.
+        if first_chunk == 0 || next_first.is_some_and(|next| next <= first_chunk) {
+            tracing::warn!(
+                "MP4: stsc entry {ei} has first_chunk {first_chunk} (next {:?}); the \
+                 table must be strictly increasing from 1",
+                next_first
+            );
+            return None;
+        }
+
+        let start = first_chunk as usize - 1;
+        // A gap (start > filled_through) leaves chunks without a mapping.
+        if start > filled_through {
+            tracing::warn!(
+                "MP4: stsc leaves chunk(s) {}..{} of {chunk_count} unmapped",
+                filled_through + 1,
+                start
+            );
+            return None;
+        }
+        // Starts past the chunk table: the real chunks above are all mapped by
+        // earlier entries, so this only strands its own samples (a tail). Keep
+        // the provable prefix rather than discarding the track.
+        if start >= chunk_count {
+            tracing::warn!(
+                "MP4: stsc entry {ei} starts at chunk {first_chunk}, beyond the \
+                 {chunk_count} chunk(s) in stco; its samples have no chunk"
+            );
+            continue;
+        }
+
+        let end = next_first
+            .map(|next| next as usize - 1)
+            .unwrap_or(chunk_count)
+            .min(chunk_count);
+        if end < start {
+            tracing::warn!("MP4: stsc entry {ei} has an inverted chunk range");
+            return None;
+        }
+        for slot in &mut samples_per_chunk[start..end] {
+            *slot = entry.1;
+        }
+        filled_through = end;
+    }
+
+    // Every chunk must now have a declared sample count. A tail left at 0 means
+    // the table stopped early, which is only acceptable when the sample tables
+    // are exhausted too (a genuinely short tail); otherwise those chunks are
+    // unmapped and would shift ordinals.
+    //
+    // A *run* declaring 0 samples per chunk is the same defect one level down
+    // and was the fifth review's reproduction: `stsc` = [(1, 0), (2, 1)] starts
+    // at chunk 1 (so the guard above passed) but leaves chunk 1 empty. The walk
+    // then handed chunk 2's bytes to sample 0 — emitting the truncated `BBB`
+    // with DTS 0 instead of `AAA`/0 and `BBBB`/1000. While samples remain to be
+    // placed, a zero-sample chunk cannot be distinguished from a missing
+    // mapping, so refuse the track. A zero *trailing* run (all samples already
+    // placed) strands nothing and stays acceptable.
+    let mut placed: u64 = 0;
+    for (ci, &spc) in samples_per_chunk.iter().enumerate() {
+        if placed >= sample_count as u64 {
+            break;
+        }
+        if spc == 0 {
+            tracing::warn!(
+                "MP4: stsc declares 0 samples for chunk {} while {} of {sample_count} \
+                 samples are still unplaced; the mapping cannot be trusted",
+                ci + 1,
+                sample_count as u64 - placed
+            );
+            return None;
+        }
+        placed += u64::from(spc);
+    }
+
+    let declared: u64 = samples_per_chunk.iter().map(|&c| u64::from(c)).sum();
+    if declared == 0 {
+        tracing::warn!("MP4: stsc declares no sample for any of {chunk_count} chunk(s)");
+        return None;
+    }
+    if declared < sample_count as u64 {
+        // The remaining samples have no chunk of their own. That is a missing
+        // *tail*, and the caller keeps the locatable prefix — but only because
+        // the mapping above is contiguous from chunk 1, which was just checked.
+        tracing::warn!(
+            "MP4: stsc addresses {declared} of {sample_count} samples; the rest have \
+             no chunk mapping"
+        );
+    }
+    Some(samples_per_chunk)
+}
 
 fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
     if t.stco.is_empty() {
@@ -379,32 +681,30 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
     // Chunk → samples via stsc
     // stsc entries: first_chunk (1-based), samples_per_chunk, sample_description_index
     let chunk_count = t.stco.len();
-    let mut samples_per_chunk = vec![0u32; chunk_count];
-    if t.stsc.is_empty() {
-        // Fallback: put all samples in first chunk
-        if chunk_count > 0 {
-            samples_per_chunk[0] = sample_count as u32;
-        }
-    } else {
-        for (ei, entry) in t.stsc.iter().enumerate() {
-            let first = entry.0.max(1) as usize - 1;
-            let next_first = t
-                .stsc
-                .get(ei + 1)
-                .map(|e| e.0.max(1) as usize - 1)
-                .unwrap_or(chunk_count);
-            let end = next_first.min(chunk_count);
-            for slot in &mut samples_per_chunk[first..end] {
-                *slot = entry.1;
-            }
-        }
-    }
+    let Some(samples_per_chunk) = expand_stsc(t, chunk_count, sample_count) else {
+        // The sample tables are indexed by ordinal, so a chunk that `stsc`
+        // cannot map is not "one missing packet" — every sample after it would
+        // inherit another chunk's bytes with the wrong size and DTS. Refuse the
+        // whole track instead of emitting a shifted index.
+        tracing::warn!(
+            "MP4: stsc cannot prove the sample→chunk mapping (chunks={chunk_count}, \
+             entries={}); dropping all samples of this track",
+            t.stsc.len()
+        );
+        return Vec::new();
+    };
 
     // Assign file offsets
     let mut offsets = Vec::with_capacity(sample_count);
     let mut sample_i = 0usize;
     for (ci, &spc) in samples_per_chunk.iter().enumerate() {
-        let mut off = t.stco.get(ci).copied().unwrap_or(0);
+        let Some(&chunk_off) = t.stco.get(ci) else {
+            // Chunk table shorter than the sample-per-chunk table: nothing to
+            // read from, so these samples stay unaddressed (see the truncation
+            // below — they must never reach the packet reader).
+            break;
+        };
+        let mut off = chunk_off;
         for _ in 0..spc {
             if sample_i >= sample_count {
                 break;
@@ -414,9 +714,56 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
             sample_i += 1;
         }
     }
-    while offsets.len() < sample_count {
-        offsets.push(0);
+
+    // Every sample must lie completely inside one `mdat` payload. Checking only
+    // "offset != 0 and inside the file" was not enough: offset 4 of a small file
+    // is the `ftyp` box, so a structurally valid packet was built out of
+    // container header bytes. Running past the end of the file, or spanning two
+    // boxes, is rejected the same way.
+    //
+    // Dropping just the offending entries is not enough either — the
+    // sample/duration tables are indexed by ordinal, so removing the middle of a
+    // chunk shifts every later sample's DTS/size onto the wrong bytes. Treat the
+    // whole track as unaddressable instead.
+    let valid_chunks = offsets
+        .iter()
+        .zip(&sizes)
+        .take(offsets.len())
+        .all(|(&off, &size)| {
+            let end = off as u128 + size as u128;
+            size != 0
+                && t.media_ranges
+                    .iter()
+                    .any(|&(start, stop)| off >= start && end <= stop as u128)
+        });
+    if !valid_chunks {
+        tracing::warn!(
+            "MP4: sample/chunk table is inconsistent (chunk offset 0 or payload past \
+             end of file); dropping {} locatable samples of this track",
+            offsets.len()
+        );
+        offsets.clear();
     }
+
+    // Any sample without a chunk of its own cannot be located. Padding it with
+    // offset 0 would make `read_frame` return file-header bytes dressed up as
+    // a media packet (the review caught exactly this), so drop such samples
+    // instead: a shorter DTS-ordered index is safe, bogus packets are not.
+    //
+    // The truncation is only sound because `expand_stsc` proved that chunks are
+    // mapped contiguously from the first one, so the addressed samples are
+    // exactly ordinals `0..offsets.len()` and the shortfall is a *tail*. A
+    // leading or middle gap makes `expand_stsc` refuse the whole track, since
+    // then the surviving samples would keep the DTS of a different ordinal.
+    if offsets.len() < sample_count {
+        tracing::warn!(
+            "MP4: {} of {} samples have no chunk mapping (stsc/stco/stsz disagree); \
+             dropping the unaddressable tail",
+            sample_count - offsets.len(),
+            sample_count
+        );
+    }
+    let sample_count = offsets.len();
 
     // Keyframes
     let mut is_key = vec![false; sample_count];
@@ -438,32 +785,79 @@ fn build_sample_index(t: &TrackTables) -> Vec<SampleEntry> {
         let dts_i = *dts_list.get(i).unwrap_or(&0);
         let pts_i = dts_i.saturating_add(*ctts_offsets.get(i).unwrap_or(&0) as i64);
         samples.push(SampleEntry {
-            offset: offsets[i],
+            // Every table above is padded to `sample_count`, but stay defensive:
+            // a mismatch must not panic on index.
+            offset: offsets.get(i).copied().unwrap_or(0),
             size: sizes.get(i).copied().unwrap_or(0),
             dts: dts_i,
             pts: pts_i,
             duration: d,
-            is_key: is_key[i],
+            is_key: is_key.get(i).copied().unwrap_or(false),
         });
     }
     samples
 }
 
+/// Whether a sample index entry can be read as media data.
+///
+/// `offset == 0` means the sample was never assigned a chunk (a file header
+/// starts at byte 0, so reading there would hand back garbage); `size == 0`
+/// yields an empty packet. Both are skipped instead of being emitted.
+fn sample_is_readable(sample: &SampleEntry) -> bool {
+    sample.offset != 0 && sample.size != 0
+}
+
+/// Clamp a container `timescale` (raw `u32` from `mdhd`) into the `i32`
+/// denominator a [`Rational`] time base can hold.
+///
+/// `as i32` would wrap values above `i32::MAX` into a negative (or zero)
+/// denominator, which silently corrupts every timestamp derived from the
+/// stream's time base, so an unrepresentable value returns `None` and the
+/// caller reports an error instead of substituting `1/1`.
+fn timescale_den(timescale: u32) -> Option<i32> {
+    match i32::try_from(timescale) {
+        Ok(v) if v > 0 => Some(v),
+        _ => None,
+    }
+}
+
 // ── Box parsing ──────────────────────────────────────────────────────
+
+/// Validate a child box's `(payload_start, payload_end)` inside `cursor..=parent_end`.
+///
+/// Uses checked 64-bit arithmetic so a malformed 64-bit extended `box_size`
+/// cannot overflow/panic in debug builds, wrap `cursor` backwards in release
+/// builds, or read beyond `parent_end`.
+fn checked_child_box_bounds(
+    cursor: u64,
+    box_size: u64,
+    header_len: u64,
+    parent_end: u64,
+) -> Option<(u64, u64)> {
+    if box_size < header_len {
+        return None;
+    }
+    let payload_start = cursor.checked_add(header_len)?;
+    let payload_end = cursor.checked_add(box_size)?;
+    if payload_start > parent_end || payload_end > parent_end || payload_end < payload_start {
+        return None;
+    }
+    Some((payload_start, payload_end))
+}
 
 fn read_box_header_at(
     io: &mut crate::io_context::IOContext,
     parent_end: u64,
 ) -> RsResult<(u64, [u8; 4], u64)> {
     let start = io.tell()?;
-    if start + 8 > parent_end {
+    if parent_end.saturating_sub(start) < 8 {
         return Err(RsError::InvalidData("box header past parent end".into()));
     }
     let size32 = io.read_u32_be()?;
     let mut btype = [0u8; 4];
     io.read_exact(&mut btype)?;
     let (size, header_len) = if size32 == 1 {
-        if start + 16 > parent_end {
+        if parent_end.saturating_sub(start) < 16 {
             return Err(RsError::InvalidData("extended size past parent".into()));
         }
         let size64 = io.read_u64_be()?;
@@ -484,14 +878,14 @@ fn parse_moov(
     tracks: &mut Vec<TrackTables>,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"trak" {
             let mut tables = TrackTables::default();
             parse_trak(io, payload_start, payload_end, &mut tables)?;
@@ -512,14 +906,14 @@ fn parse_trak(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"mdia" {
             parse_mdia(io, payload_start, payload_end, tables)?
         }
@@ -538,14 +932,14 @@ fn parse_mdia(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         match &box_type {
             b"mdhd" => parse_mdhd(io, payload_start, payload_end, tables)?,
             b"hdlr" => parse_hdlr(io, payload_start, payload_end, tables)?,
@@ -589,6 +983,19 @@ fn parse_mdhd(
         tables.timescale = io.read_u32_be()?;
         tables.duration = io.read_u32_be()? as u64;
     }
+    // Optional 16-bit packed ISO-639-2/T language code (3 x 5-bit letters + 0x60).
+    if end.saturating_sub(io.tell()?) >= 2 {
+        let packed = io.read_u16_be()?;
+        let c1 = ((packed >> 10) & 0x1F) as u8;
+        let c2 = ((packed >> 5) & 0x1F) as u8;
+        let c3 = (packed & 0x1F) as u8;
+        if (1..=26).contains(&c1) && (1..=26).contains(&c2) && (1..=26).contains(&c3) {
+            let lang = String::from_utf8(vec![c1 + 0x60, c2 + 0x60, c3 + 0x60]).ok();
+            if lang.as_deref() != Some("und") {
+                tables.language = lang;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -621,14 +1028,14 @@ fn parse_minf(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"stbl" {
             parse_stbl(io, payload_start, payload_end, tables)?;
         }
@@ -647,14 +1054,14 @@ fn parse_stbl(
     tables: &mut TrackTables,
 ) -> RsResult<()> {
     let mut cursor = start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         match &box_type {
             b"stsd" => parse_stsd(io, payload_start, payload_end, tables)?,
             b"stts" => parse_stts(io, payload_start, payload_end, tables)?,
@@ -676,7 +1083,7 @@ fn parse_stbl(
 }
 
 fn parse_full_box_header(io: &mut crate::io_context::IOContext, end: u64) -> RsResult<(u8, u32)> {
-    if io.tell()? + 4 > end {
+    if end.saturating_sub(io.tell()?) < 4 {
         return Err(RsError::InvalidData("truncated fullbox".into()));
     }
     let version = io.read_u8()?;
@@ -854,22 +1261,22 @@ fn parse_stsd(
 ) -> RsResult<()> {
     io.seek(SeekFrom::Start(start))?;
     let (_v, _f) = parse_full_box_header(io, end)?;
-    if io.tell()? + 4 > end {
+    if end.saturating_sub(io.tell()?) < 4 {
         return Ok(());
     }
     let entry_count = io.read_u32_be()?;
     let mut cursor = io.tell()?;
     for _ in 0..entry_count {
-        if cursor + 8 > end {
+        if end.saturating_sub(cursor) < 8 {
             break;
         }
         io.seek(SeekFrom::Start(cursor))?;
         let (entry_size, entry_type, header_len) = read_box_header_at(io, end)?;
-        if entry_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, entry_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + entry_size).min(end);
+        };
         match &entry_type {
             b"avc1" | b"avc3" => {
                 tables.codec_id = CodecId::H264;
@@ -904,6 +1311,21 @@ fn parse_stsd(
                 tables.codec_id = CodecId::Av1;
                 tables.media_type = MediaType::Video;
             }
+            b"jpeg" | b"mjpa" | b"mjpb" | b"mjpg" => {
+                tables.codec_id = CodecId::Mjpeg;
+                tables.media_type = MediaType::Video;
+                parse_visual_sample_entry(io, payload_start, payload_end, tables)?;
+            }
+            b"mp4v" => {
+                tables.codec_id = CodecId::Mpeg4;
+                tables.media_type = MediaType::Video;
+                parse_visual_sample_entry(io, payload_start, payload_end, tables)?;
+            }
+            b"fLaC" => {
+                tables.codec_id = CodecId::Flac;
+                tables.media_type = MediaType::Audio;
+                parse_audio_sample_entry(io, payload_start, payload_end, tables)?;
+            }
             _ => {}
         }
         if entry_size == 0 {
@@ -934,16 +1356,16 @@ fn parse_visual_sample_entry(
     tables.height = io.read_u16_be()?;
 
     // Child boxes start after 78-byte header
-    let child_start = start + HDR;
+    let child_start = start.saturating_add(HDR);
     let mut cursor = child_start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"avcC" {
             let len = payload_end.saturating_sub(payload_start) as usize;
             if len > 0 && len < 1024 * 1024 {
@@ -956,6 +1378,30 @@ fn parse_visual_sample_entry(
                     nal_length_size: nls,
                 };
                 tables.codec_id = CodecId::H264;
+            }
+        } else if &box_type == b"esds" {
+            let len_u64 = payload_end.saturating_sub(payload_start);
+            if let Ok(len) = usize::try_from(len_u64) {
+                if len > 0 && len < 64 * 1024 {
+                    io.seek(SeekFrom::Start(payload_start))?;
+                    let data = io.read_bytes(len)?;
+                    if let Some(esds) = parse_esds(&data) {
+                        if esds.object_type_indication == 0x6C {
+                            tables.codec_id = CodecId::Mjpeg;
+                        }
+                        if let Some(dsi) = esds.audio_specific_config {
+                            tables.extradata = Some(dsi);
+                        }
+                        let br = if esds.avg_bitrate > 0 {
+                            esds.avg_bitrate
+                        } else {
+                            esds.max_bitrate
+                        };
+                        if br > 0 {
+                            tables.bit_rate = u64::from(br);
+                        }
+                    }
+                }
             }
         }
         if box_size == 0 {
@@ -972,11 +1418,14 @@ fn parse_audio_sample_entry(
     end: u64,
     tables: &mut TrackTables,
 ) -> RsResult<()> {
-    // AudioSampleEntry: 6+2 reserved/data_ref + 8 version fields + channels + size_size + ...
-    // channels at offset 16, sample_rate at offset 24 (u16.u16 fixed)
+    // AudioSampleEntry: 6 reserved + 2 data_ref + 2 version + 6 reserved +
+    // channels (offset 16) + sample_size (18) + pre_defined (20) + reserved (22) +
+    // sample_rate u16.u16 fixed (offset 24).
     if end.saturating_sub(start) < 28 {
         return Ok(());
     }
+    io.seek(SeekFrom::Start(start + 8))?;
+    let entry_version = io.read_u16_be()?;
     io.seek(SeekFrom::Start(start + 16))?;
     tables.channels = io.read_u16_be()?;
     let _sample_size = io.read_u16_be()?;
@@ -986,24 +1435,63 @@ fn parse_audio_sample_entry(
     let _sr_lo = io.read_u16_be()?;
     tables.sample_rate = sr_hi;
 
-    // Optional esds etc. after 28-byte AudioSampleEntry header (version 0)
-    let child_start = start + 28;
+    // QuickTime AudioSampleEntry v1 adds 16 bytes; v2 adds 36 bytes.
+    let header_size: u64 = match entry_version {
+        1 => 44,
+        2 => 64,
+        _ => 28,
+    };
+    let child_start = start.saturating_add(header_size);
     let mut cursor = child_start;
-    while cursor + 8 <= end {
+    while end.saturating_sub(cursor) >= 8 {
         io.seek(SeekFrom::Start(cursor))?;
         let (box_size, box_type, header_len) = read_box_header_at(io, end)?;
-        if box_size < header_len {
+        let Some((payload_start, payload_end)) =
+            checked_child_box_bounds(cursor, box_size, header_len, end)
+        else {
             break;
-        }
-        let payload_start = cursor + header_len;
-        let payload_end = (cursor + box_size).min(end);
+        };
         if &box_type == b"esds" {
             let len = payload_end.saturating_sub(payload_start) as usize;
             if len > 0 && len < 64 * 1024 {
                 io.seek(SeekFrom::Start(payload_start))?;
                 let data = io.read_bytes(len)?;
-                tables.extradata = Some(data);
-                tables.codec_id = CodecId::Aac;
+                if let Some(esds) = parse_esds(&data) {
+                    tables.codec_id = match esds.object_type_indication {
+                        0x69 | 0x6B => CodecId::Mp3,
+                        _ => CodecId::Aac,
+                    };
+                    if let Some(asc) = esds.audio_specific_config {
+                        tables.extradata = Some(asc);
+                    }
+                    let br = if esds.avg_bitrate > 0 {
+                        esds.avg_bitrate
+                    } else {
+                        esds.max_bitrate
+                    };
+                    if br > 0 {
+                        tables.bit_rate = u64::from(br);
+                    }
+                }
+            }
+        } else if &box_type == b"dfLa" {
+            let len_u64 = payload_end.saturating_sub(payload_start);
+            if let Ok(len) = usize::try_from(len_u64) {
+                if (8..64 * 1024).contains(&len) {
+                    io.seek(SeekFrom::Start(payload_start))?;
+                    let data = io.read_bytes(len)?;
+                    if data.len() >= 8 {
+                        let hdr = &data[4..8];
+                        let block_type = hdr[0] & 0x7F;
+                        let block_len = (usize::from(hdr[1]) << 16)
+                            | (usize::from(hdr[2]) << 8)
+                            | usize::from(hdr[3]);
+                        if block_type == 0 && block_len >= 34 && data.len() >= 8 + 34 {
+                            tables.extradata = Some(data[8..8 + 34].to_vec());
+                            tables.codec_id = CodecId::Flac;
+                        }
+                    }
+                }
             }
         }
         if box_size == 0 {
@@ -1014,6 +1502,130 @@ fn parse_audio_sample_entry(
     Ok(())
 }
 
+/// Parsed fields extracted from an ISO/IEC 14496-1 `esds` FullBox payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedEsds {
+    object_type_indication: u8,
+    max_bitrate: u32,
+    avg_bitrate: u32,
+    audio_specific_config: Option<Vec<u8>>,
+}
+
+/// Read one ISO/IEC 14496-1 BaseDescriptor (`tag` + 1..=4 byte expandable length + payload).
+fn read_mp4_descriptor(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, mut rest) = buf.split_first()?;
+    let mut len = 0usize;
+    let mut terminated = false;
+    for _ in 0..4 {
+        let (&b, next) = rest.split_first()?;
+        rest = next;
+        len = (len << 7) | usize::from(b & 0x7F);
+        if b & 0x80 == 0 {
+            terminated = true;
+            break;
+        }
+    }
+    if !terminated || len > rest.len() {
+        return None;
+    }
+    let (payload, tail) = rest.split_at(len);
+    Some((tag, payload, tail))
+}
+
+/// Parse `DecoderConfigDescriptor` (tag `0x04`) and extract its nested
+/// `DecoderSpecificInfo` (tag `0x05`) payload as raw `AudioSpecificConfig`.
+fn parse_decoder_config_descriptor(payload: &[u8]) -> Option<ParsedEsds> {
+    // Fixed header: objectTypeIndication(1) + streamType(1) + bufferSizeDB(3)
+    // + maxBitrate(4) + avgBitrate(4) = 13 bytes.
+    if payload.len() < 13 {
+        return None;
+    }
+    let object_type_indication = payload[0];
+    let max_bitrate = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]);
+    let avg_bitrate = u32::from_be_bytes([payload[9], payload[10], payload[11], payload[12]]);
+
+    let mut audio_specific_config = None;
+    let mut rest = &payload[13..];
+    while !rest.is_empty() {
+        let (tag, sub_payload, next) = read_mp4_descriptor(rest)?;
+        if tag == 0x05 {
+            if !sub_payload.is_empty() {
+                audio_specific_config = Some(sub_payload.to_vec());
+            }
+            break;
+        }
+        rest = next;
+    }
+
+    Some(ParsedEsds {
+        object_type_indication,
+        max_bitrate,
+        avg_bitrate,
+        audio_specific_config,
+    })
+}
+
+/// Parse an `esds` FullBox payload (`version(1) + flags(3) + descriptors...`) and
+/// strip all MPEG-4 descriptor wrappers down to raw `AudioSpecificConfig`.
+fn parse_esds(esds_payload: &[u8]) -> Option<ParsedEsds> {
+    // Skip FullBox version (1 byte) + flags (3 bytes).
+    if esds_payload.len() < 4 {
+        return None;
+    }
+    let mut rest = &esds_payload[4..];
+    while !rest.is_empty() {
+        let (tag, payload, next) = read_mp4_descriptor(rest)?;
+        match tag {
+            0x03 => {
+                // ES_Descriptor: ES_ID(2) + flags(1) + optional fields + child descriptors.
+                if payload.len() < 3 {
+                    return None;
+                }
+                let flags = payload[2];
+                let mut inner = &payload[3..];
+                if flags & 0x80 != 0 {
+                    // streamDependenceFlag -> dependsOn_ES_ID (2 bytes)
+                    if inner.len() < 2 {
+                        return None;
+                    }
+                    inner = &inner[2..];
+                }
+                if flags & 0x40 != 0 {
+                    // URL_Flag -> URLlength(1) + URLstring(URLlength)
+                    let (&url_len, after_len) = inner.split_first()?;
+                    let url_len = usize::from(url_len);
+                    if after_len.len() < url_len {
+                        return None;
+                    }
+                    inner = &after_len[url_len..];
+                }
+                if flags & 0x20 != 0 {
+                    // OCRstreamFlag -> OCR_ES_Id (2 bytes)
+                    if inner.len() < 2 {
+                        return None;
+                    }
+                    inner = &inner[2..];
+                }
+                while !inner.is_empty() {
+                    let (child_tag, child_payload, child_next) = read_mp4_descriptor(inner)?;
+                    if child_tag == 0x04 {
+                        return parse_decoder_config_descriptor(child_payload);
+                    }
+                    inner = child_next;
+                }
+                return None;
+            }
+            0x04 => {
+                return parse_decoder_config_descriptor(payload);
+            }
+            _ => {
+                rest = next;
+            }
+        }
+    }
+    None
+}
+
 // ── Unit tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1021,6 +1633,14 @@ mod tests {
     use super::*;
     use crate::format_context::FormatContext;
     use crate::io_context::IOContext;
+
+    /// Media range covering a synthetic test file's payload.
+    ///
+    /// Sample data is only accepted inside an `mdat` payload, so unit tests that
+    /// hand-build `TrackTables` must declare the region their offsets point into.
+    fn media_range(start: u64, end: u64) -> Vec<(u64, u64)> {
+        vec![(start, end)]
+    }
 
     fn be32(v: u32) -> [u8; 4] {
         v.to_be_bytes()
@@ -1165,6 +1785,7 @@ mod tests {
             stsc: vec![(1, 3, 1)],
             stsz: vec![10, 20, 30],
             stco: vec![100],
+            media_ranges: media_range(1, u64::MAX / 2),
             stss: vec![1, 3],
             ..Default::default()
         };
@@ -1191,7 +1812,8 @@ mod tests {
             ctts: vec![(1, 40), (1, 0)],
             stsc: vec![(1, 2, 1)],
             stsz: vec![1, 1],
-            stco: vec![0],
+            stco: vec![2048],
+            media_ranges: media_range(1, u64::MAX / 2),
             stss: vec![],
             ..Default::default()
         };
@@ -1279,5 +1901,1439 @@ mod tests {
         assert_eq!(&btype, b"free");
         assert_eq!(header_len, 16);
         assert_eq!(size, 24);
+    }
+
+    #[test]
+    fn stsc_first_chunk_past_table_yields_no_bogus_samples() {
+        // Malformed `stsc`: `first_chunk` far beyond the real chunk count.
+        // Regression guard for two bugs in a row: the slice used to panic, and
+        // the fix then padded the missing offsets with 0 — which made
+        // `read_frame` hand back file-header bytes as a media packet.
+        let tables = TrackTables {
+            timescale: 1000,
+            stts: vec![(2, 40)],
+            stsc: vec![(999, 1, 1)],
+            stsz: vec![1, 1],
+            stco: vec![100],
+            media_ranges: media_range(1, u64::MAX / 2),
+            ..Default::default()
+        };
+        let samples = build_sample_index(&tables);
+        // No sample can be located, so the index must be empty — not two
+        // samples pointing at offset 0.
+        assert!(
+            samples.is_empty(),
+            "unaddressable samples must be dropped, got {samples:?}"
+        );
+    }
+
+    #[test]
+    fn stsc_non_monotonic_table_drops_the_whole_track() {
+        // Second entry claims an *earlier* chunk than the first. The old code
+        // patched the slice bounds and silently dropped chunk 0's samples, so
+        // the two survivors carried ordinals 0/1 while sitting at chunk 1 —
+        // i.e. the wrong size and DTS. A table that cannot be walked in
+        // increasing order proves nothing, so the track must be refused.
+        let tables = TrackTables {
+            timescale: 1000,
+            stts: vec![(3, 10)],
+            stsc: vec![(3, 1, 1), (1, 1, 1)],
+            stsz: vec![1, 1, 1],
+            stco: vec![100, 200],
+            media_ranges: media_range(1, u64::MAX / 2),
+            ..Default::default()
+        };
+        let samples = build_sample_index(&tables);
+        assert!(
+            samples.is_empty(),
+            "a non-monotonic stsc must not shift sample ordinals: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn sample_is_readable_rejects_zero_offset_and_zero_size() {
+        // A file header lives at offset 0; such an entry must never be emitted.
+        let unaddressed = SampleEntry {
+            offset: 0,
+            size: 16,
+            dts: 0,
+            pts: 0,
+            duration: 1,
+            is_key: true,
+        };
+        let empty = SampleEntry {
+            offset: 32,
+            size: 0,
+            ..unaddressed
+        };
+        let good = SampleEntry {
+            offset: 32,
+            size: 16,
+            ..unaddressed
+        };
+        assert!(!sample_is_readable(&unaddressed));
+        assert!(!sample_is_readable(&empty));
+        assert!(sample_is_readable(&good));
+    }
+
+    #[test]
+    fn demuxing_a_broken_stsc_never_returns_header_bytes() {
+        // End-to-end: a file whose stsc cannot address any sample must yield no
+        // packets at all, instead of packets built from the `ftyp` bytes.
+        let mut data = build_minimal_mp4();
+        // Locate "stsc" and set its first_chunk to an impossible value.
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stsc")
+            .expect("minimal mp4 contains an stsc box");
+        // stsc payload: version/flags (4) + entry_count (4) + first_chunk (4)
+        let first_chunk_at = pos + 4 + 4 + 4;
+        data[first_chunk_at..first_chunk_at + 4].copy_from_slice(&be32(9_999));
+
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+        let mut demuxer = MP4Demuxer::default();
+        // The only track has no locatable sample, so it is not published and the
+        // file reports that nothing is playable (rather than exposing a stream
+        // that can never yield a packet).
+        assert!(demuxer.read_header(&mut ctx).is_err());
+        assert!(ctx.streams.is_empty());
+        assert!(demuxer.read_frame(&mut ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_sample_index_pads_mismatched_tables() {
+        // stsz is authoritative for the sample count (2) while stts claims 4:
+        // the index must follow stsz, ignore the out-of-range stss entry, and
+        // never panic on a table mismatch.
+        let tables = TrackTables {
+            timescale: 1000,
+            stts: vec![(4, 10)],
+            stsc: vec![(1, 4, 1)],
+            stsz: vec![3, 3],
+            stco: vec![2048],
+            media_ranges: media_range(1, u64::MAX / 2),
+            stss: vec![99],
+            ..Default::default()
+        };
+        let samples = build_sample_index(&tables);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[1].size, 3);
+        // Out-of-range stss index is ignored rather than panicking.
+        assert!(samples.iter().all(|s| !s.is_key));
+    }
+
+    #[test]
+    fn truncated_mp4_header_returns_error_not_panic() {
+        // Truncate a valid file inside the moov box.
+        let mut data = build_minimal_mp4();
+        let keep = data.len() / 2;
+        data.truncate(keep);
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+        let mut demuxer = MP4Demuxer::default();
+        // Either a clean error or an empty track list is fine — never a panic.
+        let _ = demuxer.read_header(&mut ctx);
+    }
+
+    #[test]
+    fn timescale_den_reports_unrepresentable_values() {
+        assert_eq!(timescale_den(1000), Some(1000));
+        assert_eq!(timescale_den(90_000), Some(90_000));
+        // Raw u32 values above i32::MAX used to become negative denominators,
+        // and the first fix substituted 1/1 — both corrupt timestamps. They
+        // must now be reported as unrepresentable.
+        assert_eq!(timescale_den(u32::MAX), None);
+        assert_eq!(timescale_den(i32::MAX as u32 + 1), None);
+        assert_eq!(timescale_den(0), None);
+    }
+
+    #[test]
+    fn track_with_unrepresentable_timescale_is_rejected_not_coerced() {
+        // End-to-end: patch mdhd's timescale to 2^31 and confirm the track is
+        // dropped (no stream promising 1/1 ticks over real tick timestamps).
+        let mut data = build_minimal_mp4();
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"mdhd")
+            .expect("minimal mp4 contains an mdhd box");
+        // mdhd v0 payload: version/flags(4) creation(4) modification(4) timescale(4)
+        let timescale_at = pos + 4 + 4 + 4 + 4;
+        data[timescale_at..timescale_at + 4].copy_from_slice(&be32(0x8000_0000));
+
+        let mut ctx = FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        };
+        let mut demuxer = MP4Demuxer::default();
+        // All tracks rejected ⇒ report an error instead of a successful empty
+        // stream list (which reads like a legitimately empty file).
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("every track has an unusable timescale");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert!(
+            ctx.streams.is_empty(),
+            "a track whose timescale cannot form a time base must not be published: {:?}",
+            ctx.streams.iter().map(|s| s.time_base).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Regression tests mirroring the independent boundary probe ─────────
+
+    /// Build a one- or two-track MP4 with the given `mdhd` timescale and chunk
+    /// offset, mirroring the reviewer's fixture generator.
+    fn build_probe_mp4(tracks: &[(u32, usize, usize, u64)]) -> Vec<u8> {
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\0\0isom");
+        let media: [&[u8]; 2] = [b"AAA", b"BBBB"];
+        let mdat = box_bytes(b"mdat", b"AAABBBB");
+        let first_payload = (ftyp.len() + 8) as u64;
+
+        let mut moov_payload = Vec::new();
+        for &(timescale, sample_count, per_chunk, offset) in tracks {
+            let sizes: Vec<u32> = media[..sample_count]
+                .iter()
+                .map(|m| m.len() as u32)
+                .collect();
+
+            let mut audio_entry = vec![0u8; 28];
+            audio_entry[16..18].copy_from_slice(&be16(2)); // channel count
+            audio_entry[18..20].copy_from_slice(&be16(16)); // sample size
+            audio_entry[24..28].copy_from_slice(&be32(48_000 << 16));
+            let mut stsd_rest = be32(1).to_vec();
+            stsd_rest.extend_from_slice(&box_bytes(b"mp4a", &audio_entry));
+            let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+            let mut stts_rest = be32(1).to_vec();
+            stts_rest.extend_from_slice(&be32(sample_count as u32));
+            stts_rest.extend_from_slice(&be32(1000));
+            let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+            let mut stsc_rest = be32(1).to_vec();
+            stsc_rest.extend_from_slice(&be32(1));
+            stsc_rest.extend_from_slice(&be32(per_chunk as u32));
+            stsc_rest.extend_from_slice(&be32(1));
+            let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+            let mut stsz_rest = be32(0).to_vec();
+            stsz_rest.extend_from_slice(&be32(sample_count as u32));
+            for size in &sizes {
+                stsz_rest.extend_from_slice(&be32(*size));
+            }
+            let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+            let actual_offset = offset.max(first_payload);
+            let actual_offset = if offset == u64::MAX {
+                offset
+            } else {
+                actual_offset
+            };
+            let mut stco_rest = be32(1).to_vec();
+            stco_rest.extend_from_slice(&be32(actual_offset as u32));
+            let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+            let mut mdhd_rest = be32(0).to_vec();
+            mdhd_rest.extend_from_slice(&be32(0));
+            mdhd_rest.extend_from_slice(&be32(timescale));
+            mdhd_rest.extend_from_slice(&be32(1000 * sample_count as u32));
+            mdhd_rest.extend_from_slice(&be16(0x55c4));
+            mdhd_rest.extend_from_slice(&be16(0));
+            let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_rest));
+
+            let mut hdlr_rest = be32(0).to_vec();
+            hdlr_rest.extend_from_slice(b"soun");
+            hdlr_rest.extend_from_slice(&[0u8; 13]);
+            let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_rest));
+
+            let stbl = box_bytes(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+            let minf = box_bytes(b"minf", &stbl);
+            let mdia = box_bytes(b"mdia", &[mdhd, hdlr, minf].concat());
+            moov_payload.extend_from_slice(&box_bytes(b"trak", &mdia));
+        }
+
+        let moov = box_bytes(b"moov", &moov_payload);
+        [ftyp, mdat, moov].concat()
+    }
+
+    fn ctx_from(data: Vec<u8>) -> FormatContext {
+        FormatContext {
+            input: None,
+            output: None,
+            streams: Vec::new(),
+            io: Some(IOContext::from_buffer(data)),
+            metadata: rsmpeg_util::Dict::new(),
+            duration: 0,
+            bit_rate: 0,
+            filename: None,
+            format_name: Some("mp4".into()),
+        }
+    }
+
+    fn read_all(demuxer: &mut MP4Demuxer, ctx: &mut FormatContext) -> Vec<Packet> {
+        let mut out = Vec::new();
+        while let Some(p) = demuxer.read_frame(ctx).unwrap() {
+            out.push(p);
+            assert!(out.len() < 10, "unexpected packet count");
+        }
+        out
+    }
+
+    #[test]
+    fn probe_control_two_samples_read_back_verbatim() {
+        let mut ctx = ctx_from(build_probe_mp4(&[(1000, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].data.as_ref(), b"AAA");
+        assert_eq!(packets[0].stream_index, 0);
+        assert_eq!(packets[1].data.as_ref(), b"BBBB");
+        assert_eq!(packets[1].dts, Some(1000));
+    }
+
+    #[test]
+    fn probe_locatable_prefix_kept_without_fake_tail() {
+        // stsc maps only one sample per chunk while stsz/stts describe two: the
+        // locatable prefix is kept, and no invented tail packet appears.
+        let mut ctx = ctx_from(build_probe_mp4(&[(1000, 2, 1, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert_eq!(packets.len(), 1, "got {:?}", packets.len());
+        assert_eq!(packets[0].data.as_ref(), b"AAA");
+        assert_eq!(packets[0].dts, Some(0));
+    }
+
+    /// Build the reviewer's two-chunk fixture: `mdat` holds `AAA` then `BBBB`,
+    /// `stts` ticks by 1000 per sample, and `stsc` is supplied verbatim as
+    /// `(first_chunk, samples_per_chunk)` runs.
+    ///
+    /// Mirrors `focused-probe/make_fixtures.py`, where
+    /// `first_chunk = 2` produced the failing case: chunk 1 has no declared
+    /// samples, so the old expansion put "BBBB" at ordinal 0 and emitted the
+    /// truncated packet `BBB` with DTS 0.
+    fn build_two_chunk_mp4(stsc_runs: &[(u32, u32)]) -> Vec<u8> {
+        build_mp4_with_chunks(&[b"AAA", b"BBBB"], stsc_runs)
+    }
+
+    /// Same fixture, but with an arbitrary chunk layout, so chunk runs can be
+    /// made to skip a chunk in the middle.
+    fn build_mp4_with_chunks(chunks: &[&[u8]], stsc_runs: &[(u32, u32)]) -> Vec<u8> {
+        build_mp4_with_chunks_and_samples(chunks, stsc_runs, chunks.len())
+    }
+
+    /// Same fixture with a chosen `stsz`/`stts` sample count, so the sample
+    /// tables can be exhausted before the last chunk (the trailing-empty-chunk
+    /// shape that real muxers produce).
+    fn build_mp4_with_chunks_and_samples(
+        chunks: &[&[u8]],
+        stsc_runs: &[(u32, u32)],
+        sample_count: usize,
+    ) -> Vec<u8> {
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\0\0isom");
+        let payload: Vec<u8> = chunks.concat();
+        let mdat = box_bytes(b"mdat", &payload);
+        let media = (ftyp.len() + 8) as u32;
+
+        let mut audio_entry = vec![0u8; 28];
+        audio_entry[16..18].copy_from_slice(&be16(2));
+        audio_entry[18..20].copy_from_slice(&be16(16));
+        audio_entry[24..28].copy_from_slice(&be32(48_000 << 16));
+        let mut stsd_rest = be32(1).to_vec();
+        stsd_rest.extend_from_slice(&box_bytes(b"mp4a", &audio_entry));
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = be32(1).to_vec();
+        stts_rest.extend_from_slice(&be32(sample_count as u32));
+        stts_rest.extend_from_slice(&be32(1000));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = be32(stsc_runs.len() as u32).to_vec();
+        for &(first_chunk, per_chunk) in stsc_runs {
+            stsc_rest.extend_from_slice(&be32(first_chunk));
+            stsc_rest.extend_from_slice(&be32(per_chunk));
+            stsc_rest.extend_from_slice(&be32(1));
+        }
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = be32(0).to_vec();
+        stsz_rest.extend_from_slice(&be32(sample_count as u32));
+        for chunk in chunks.iter().take(sample_count) {
+            stsz_rest.extend_from_slice(&be32(chunk.len() as u32));
+        }
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let mut stco_rest = be32(chunks.len() as u32).to_vec();
+        let mut next = media;
+        for chunk in chunks {
+            stco_rest.extend_from_slice(&be32(next));
+            next += chunk.len() as u32;
+        }
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut mdhd_rest = be32(0).to_vec();
+        mdhd_rest.extend_from_slice(&be32(0));
+        mdhd_rest.extend_from_slice(&be32(1000));
+        mdhd_rest.extend_from_slice(&be32(1000 * chunks.len() as u32));
+        mdhd_rest.extend_from_slice(&be16(0x55c4));
+        mdhd_rest.extend_from_slice(&be16(0));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_rest));
+
+        let mut hdlr_rest = be32(0).to_vec();
+        hdlr_rest.extend_from_slice(b"soun");
+        hdlr_rest.extend_from_slice(&[0u8; 13]);
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_rest));
+
+        let stbl = box_bytes(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+        let minf = box_bytes(b"minf", &stbl);
+        let mdia = box_bytes(b"mdia", &[mdhd, hdlr, minf].concat());
+        let moov = box_bytes(b"moov", &box_bytes(b"trak", &mdia));
+        [ftyp, mdat, moov].concat()
+    }
+
+    #[test]
+    fn review_control_two_chunks_keep_verbatim_payloads_and_dts() {
+        // Baseline for the two cases below: a complete mapping must still be
+        // decoded verbatim, with the DTS coming from the sample table.
+        let mut ctx = ctx_from(build_two_chunk_mp4(&[(1, 1)]));
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        let got: Vec<(Option<i64>, &[u8])> =
+            packets.iter().map(|p| (p.dts, p.data.as_ref())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(0), b"AAA".as_slice()),
+                (Some(1000), b"BBBB".as_slice())
+            ],
+            "a complete stsc mapping must be decoded as-is"
+        );
+    }
+
+    #[test]
+    fn review_missing_first_chunk_mapping_emits_nothing() {
+        // Review P1 reproduction: `stsc.first_chunk == 2` with two chunks, so
+        // chunk 1 has no declared sample count. Previously the surviving
+        // samples slid down one ordinal each and the demuxer returned `BBB`
+        // (a truncation of "BBBB" sized by sample 0) stamped with DTS 0.
+        //
+        // A chunk with no mapping cannot be proven to hold *these* samples, so
+        // neither the shifted packet nor a "guess" may be emitted. Dropping
+        // every sample leaves the only track unplayable, and `read_header`
+        // reports the file instead of publishing an empty stream.
+        let mut ctx = ctx_from(build_two_chunk_mp4(&[(2, 1)]));
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        let rendered: Vec<(Option<i64>, Vec<u8>)> =
+            packets.iter().map(|p| (p.dts, p.data.to_vec())).collect();
+        assert!(
+            rendered.is_empty(),
+            "no packet may be emitted from an unprovable chunk mapping: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn review_chunk_run_starting_at_zero_emits_nothing() {
+        // Same class of bug through a different door: `stsc.first_chunk` is
+        // 1-based, so an entry claiming chunk 0 cannot be honoured (subtracting
+        // one wraps, and clamping to zero silently mis-assigns the run). The
+        // mapping is unprovable, so no packet may be emitted.
+        let data = build_two_chunk_mp4(&[(0, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "a zero-based chunk run must not shift ordinals: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn review_zero_sample_prefix_run_must_not_shift_the_valid_chunk() {
+        // Fifth review P1 reproduction, and the neighbour of the
+        // `first_chunk > 1` case: `stsc` has two runs, starts at chunk 1
+        // (satisfying the leading-gap guard) but declares **0** samples per
+        // chunk for the first run. Chunk 1 is therefore empty, so the walk
+        // handed chunk 2's bytes to sample 0 and emitted the truncated `BBB`
+        // stamped with DTS 0.
+        //
+        // Mirrors `extra-probe/make_fixtures.py`: `stsc = (1, 0, 1, 2, 1, 1)`.
+        // Samples 0 and 1 are still unplaced when chunk 1 is visited, so the
+        // mapping is unprovable and nothing may be emitted.
+        let data = build_two_chunk_mp4(&[(1, 0), (2, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        let rendered: Vec<(Option<i64>, Vec<u8>)> =
+            packets.iter().map(|p| (p.dts, p.data.to_vec())).collect();
+        assert!(
+            rendered.is_empty(),
+            "a zero-sample first run must not shift the valid chunk into sample 0's \
+             size and DTS: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn review_trailing_zero_sample_run_keeps_the_full_prefix() {
+        // The guard must not over-reject: a zero-sample run that starts *after*
+        // every sample has been placed strands nothing (chunk 3+ simply holds
+        // no samples), and the two real samples must still come back verbatim.
+        let data = build_mp4_with_chunks_and_samples(
+            &[b"AAA", b"BBBB", b"CC"],
+            &[(1, 1), (2, 1), (3, 0)],
+            2,
+        );
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer
+            .read_header(&mut ctx)
+            .expect("a trailing empty run is harmless");
+        let packets = read_all(&mut demuxer, &mut ctx);
+        let got: Vec<(Option<i64>, &[u8])> =
+            packets.iter().map(|p| (p.dts, p.data.as_ref())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(0), b"AAA".as_slice()),
+                (Some(1000), b"BBBB".as_slice()),
+            ],
+            "samples before a trailing empty run must be decoded verbatim"
+        );
+    }
+
+    #[test]
+    fn review_multi_run_mapping_still_decodes_in_order() {
+        // The complement of the rejections above: a two-run `stsc`
+        // (`first_chunk` 1 → 1 sample each, then 2 → 1 sample each) must keep
+        // working, so the guards do not over-reject legitimate files.
+        let data = build_mp4_with_chunks(&[b"AAA", b"BBBB", b"CC", b"DDDD"], &[(1, 1), (3, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+        let packets = read_all(&mut demuxer, &mut ctx);
+        let got: Vec<(Option<i64>, &[u8])> =
+            packets.iter().map(|p| (p.dts, p.data.as_ref())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(0), b"AAA".as_slice()),
+                (Some(1000), b"BBBB".as_slice()),
+                (Some(2000), b"CC".as_slice()),
+                (Some(3000), b"DDDD".as_slice()),
+            ],
+            "a contiguous multi-run mapping must decode verbatim, in order"
+        );
+    }
+
+    #[test]
+    fn review_zero_sample_middle_run_rejects_entire_track() {
+        // Sixth review neighbour of `review_zero_sample_prefix_run_must_not_shift_the_valid_chunk`:
+        // the zero-sample run sits in the *middle* of a three-chunk table
+        // (`stsc` = (1,1), (2,0), (3,1)), so chunk 1 is mapped, chunk 2 is empty
+        // while samples are still unplaced, and chunk 3 holds the rest. This is
+        // the reviewer's `zero_middle.mp4` shape. Mirroring `extra-probe`, the
+        // demuxer must refuse the whole track: the surviving samples would
+        // otherwise slide down one ordinal and land on the wrong `stsz` size
+        // and `stts` DTS.
+        let data = build_mp4_with_chunks(&[b"AAA", b"BBBB", b"CC"], &[(1, 1), (2, 0), (3, 1)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "a zero-sample middle run must not shift the remaining chunks: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+        // The track is unplayable, so it must not be published either.
+        assert!(
+            ctx.streams.is_empty() || header.is_err(),
+            "an unprovable track must not be offered to the player"
+        );
+    }
+
+    #[test]
+    fn probe_surviving_track_packets_match_the_selected_stream() {
+        // Review P1: dropping track 0 left the surviving track's Stream and
+        // Packet indices at 1, while the player selects position 0.
+        // Track 1 starts at the second payload ("BBBB").
+        let second_payload = (box_bytes(b"ftyp", b"isom\0\0\0\0isom").len() + 8 + 3) as u64;
+        let data = build_probe_mp4(&[(0x8000_0000, 1, 1, 0), (1000, 2, 1, second_payload)]);
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        assert_eq!(ctx.streams.len(), 1);
+        assert_eq!(
+            ctx.streams[0].index, 0,
+            "the surviving stream must be renumbered to its position"
+        );
+        let selected = ctx
+            .find_best_stream(MediaType::Audio)
+            .expect("one audio stream survives");
+        assert_eq!(selected, 0);
+
+        let packets = read_all(&mut demuxer, &mut ctx);
+        // Only one chunk is declared, so one sample is locatable; what matters
+        // is that it is routed to the stream the player actually selected.
+        assert_eq!(packets.len(), 1, "got {packets:?}");
+        assert_eq!(
+            packets[0].stream_index, selected,
+            "packet.stream_index must match the selected stream"
+        );
+        assert_eq!(&packets[0].data[..], b"BBB");
+        assert!(packets.iter().all(|p| p.stream_index == selected));
+    }
+
+    #[test]
+    fn review_track_without_locatable_samples_is_not_published() {
+        // Third review round: dropping a track's samples still left it in
+        // `ctx.streams`, so `find_best_stream` selected index 0 (the broken
+        // track) while every packet belonged to index 1. Selection must only
+        // ever see playable tracks.
+        let broken = (1000u32, 1usize, 1usize, u64::MAX); // chunk offset 0
+        let second_payload = (box_bytes(b"ftyp", b"isom    isom").len() + 8 + 3) as u64;
+        let healthy = (1000u32, 2usize, 1usize, second_payload);
+        let mut data = build_probe_mp4(&[broken, healthy]);
+        // Force the first track's chunk offset to 0.
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(0));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).unwrap();
+
+        // Only the healthy track is published, renumbered to position 0.
+        let indices: Vec<usize> = ctx.streams.iter().map(|s| s.index).collect();
+        assert_eq!(
+            indices,
+            vec![0],
+            "streams must contain playable tracks only"
+        );
+        let selected = ctx.find_best_stream(MediaType::Audio);
+        assert_eq!(selected, Some(0));
+
+        let packets = read_all(&mut demuxer, &mut ctx);
+        assert_eq!(packets.len(), 1, "got {packets:?}");
+        assert_eq!(
+            packets[0].stream_index, 0,
+            "packets must be routed to the selected stream"
+        );
+        assert_eq!(&packets[0].data[..], b"BBB");
+    }
+
+    #[test]
+    fn review_sample_offsets_must_point_inside_mdat() {
+        // Offset 4 is inside the file but inside the `ftyp` box, not the media
+        // payload; the old check (non-zero, before EOF) let it through and
+        // returned the bytes "ftyp" as a packet.
+        let mut data = build_probe_mp4(&[(1000, 2, 1, 0)]);
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(4));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "container header bytes must never become a packet: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn review_sample_spanning_two_boxes_is_rejected() {
+        // A sample that starts inside `mdat` but runs past its end (into `moov`)
+        // must be rejected: the range check is on the whole sample, not the start.
+        let mut data = build_probe_mp4(&[(1000, 2, 2, 0)]);
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        // mdat payload starts after ftyp (24 bytes) + 8-byte mdat header.
+        let mdat_payload_start = 24u32 + 8;
+        // Point two bytes before the last media byte so aAAA straddles the end.
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(mdat_payload_start + 5));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "a sample crossing the mdat boundary must be dropped: {packets:?}"
+        );
+    }
+
+    #[test]
+    fn probe_zero_timescale_is_an_error_not_seconds() {
+        // mdhd timescale 0 must not be coerced to 1/1 (which read ticks as seconds).
+        let mut ctx = ctx_from(build_probe_mp4(&[(0, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("timescale 0 cannot form a time base");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert!(ctx.streams.is_empty());
+    }
+
+    #[test]
+    fn probe_all_tracks_invalid_reports_error() {
+        let mut ctx = ctx_from(build_probe_mp4(&[(0x8000_0000, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("no usable track remains");
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+        assert_eq!(ctx.streams.len(), 0);
+    }
+
+    #[test]
+    fn review_unlocatable_samples_are_not_reported_as_a_time_base_error() {
+        // Review P2: this fixture's `mdhd` timescale (1000) is perfectly valid;
+        // only the chunk offset points at `ftyp` instead of the `mdat` payload.
+        // The old diagnostic blamed the timescale, sending readers after a bug
+        // that lives in `stco`/`stsc`.
+        let mut data = build_probe_mp4(&[(1000, 2, 1, 0)]);
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(4));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("the only track has no locatable sample");
+        let text = err.to_string();
+        assert!(
+            !text.contains("timescale"),
+            "a sample-location failure must not be reported as a time base error: {text}"
+        );
+        assert!(
+            text.contains("no sample that can be located"),
+            "the error must name the real cause: {text}"
+        );
+        // A broken sample mapping is a container-structure problem, not
+        // malformed numeric data.
+        assert!(matches!(err, RsError::Format(_)), "got {err:?}");
+        assert!(ctx.streams.is_empty());
+    }
+
+    #[test]
+    fn review_time_base_rejection_still_names_the_timescale() {
+        // The counterpart: a genuinely unrepresentable `mdhd` timescale must
+        // keep reporting the time base, so the fix above does not just move the
+        // wrong message onto the other case.
+        let mut ctx = ctx_from(build_probe_mp4(&[(0, 2, 2, 0)]));
+        let mut demuxer = MP4Demuxer::default();
+        let err = demuxer
+            .read_header(&mut ctx)
+            .expect_err("timescale 0 cannot form a time base");
+        let text = err.to_string();
+        assert!(
+            text.contains("timescale"),
+            "the time base failure must still be reported as such: {text}"
+        );
+        assert!(matches!(err, RsError::InvalidData(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn probe_zero_chunk_offset_never_reads_the_header() {
+        // A chunk starting at byte 0 would hand back `\x14 f t y p`. Without a
+        // file-size bound the accumulated sizes gave later samples a nonzero
+        // offset, so a single-sample check is not enough — the whole track must
+        // be dropped.
+        let data = build_probe_mp4(&[(1000, 2, 2, u64::MAX)]); // u64::MAX ⇒ patched to 0 below
+        let mut data = data;
+        // Locate the first `stco` entry and force it to 0.
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box");
+        // stco payload: version/flags(4) + entry_count(4) + first offset(4)
+        let offset_at = pos + 4 + 4 + 4;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(0));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(
+            packets.is_empty(),
+            "no packet may be produced from a chunk at offset 0: {:?}",
+            packets.iter().map(|p| p.data.to_vec()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn probe_track_payload_past_eof_is_dropped() {
+        // A chunk offset inside the file but whose payload runs past EOF must
+        // not be read either.
+        let mut data = build_probe_mp4(&[(1000, 2, 2, 0)]);
+        let pos = data
+            .windows(4)
+            .position(|w| w == b"stco")
+            .expect("stco box");
+        let offset_at = pos + 4 + 4 + 4;
+        // Point the chunk at the last byte of the file: 7 bytes cannot fit.
+        let last = (data.len() - 1) as u32;
+        data[offset_at..offset_at + 4].copy_from_slice(&be32(last));
+
+        let mut ctx = ctx_from(data);
+        let mut demuxer = MP4Demuxer::default();
+        // The payload is outside every `mdat`, so the track is unplayable.
+        let header = demuxer.read_header(&mut ctx);
+        let packets = if header.is_ok() {
+            read_all(&mut demuxer, &mut ctx)
+        } else {
+            Vec::new()
+        };
+        assert!(packets.is_empty(), "samples past EOF must be dropped");
+    }
+
+    fn encode_mp4_len(len: usize, width: usize) -> Vec<u8> {
+        match width {
+            1 => vec![(len & 0x7F) as u8],
+            2 => vec![0x80 | (((len >> 7) & 0x7F) as u8), (len & 0x7F) as u8],
+            3 => vec![
+                0x80 | (((len >> 14) & 0x7F) as u8),
+                0x80 | (((len >> 7) & 0x7F) as u8),
+                (len & 0x7F) as u8,
+            ],
+            4 => vec![
+                0x80 | (((len >> 21) & 0x7F) as u8),
+                0x80 | (((len >> 14) & 0x7F) as u8),
+                0x80 | (((len >> 7) & 0x7F) as u8),
+                (len & 0x7F) as u8,
+            ],
+            _ => unreachable!("ISO/IEC 14496-1 descriptor length is 1..=4 bytes"),
+        }
+    }
+
+    fn build_esds_payload(len_width: usize, es_flags: u8, object_type: u8, asc: &[u8]) -> Vec<u8> {
+        // DecoderSpecificInfo (0x05)
+        let mut dsi = vec![0x05];
+        dsi.extend_from_slice(&encode_mp4_len(asc.len(), len_width));
+        dsi.extend_from_slice(asc);
+
+        // DecoderConfigDescriptor (0x04)
+        let mut dcd_body = Vec::new();
+        dcd_body.push(object_type);
+        dcd_body.push(0x15); // streamType: audio
+        dcd_body.extend_from_slice(&[0x00, 0x00, 0x00]); // bufferSizeDB
+        dcd_body.extend_from_slice(&128_000u32.to_be_bytes()); // maxBitrate
+        dcd_body.extend_from_slice(&126_595u32.to_be_bytes()); // avgBitrate
+        dcd_body.extend_from_slice(&dsi);
+
+        let mut dcd = vec![0x04];
+        dcd.extend_from_slice(&encode_mp4_len(dcd_body.len(), len_width));
+        dcd.extend_from_slice(&dcd_body);
+
+        // SLConfigDescriptor (0x06) trailing sibling
+        let mut sl = vec![0x06];
+        sl.extend_from_slice(&encode_mp4_len(1, len_width));
+        sl.push(0x02);
+
+        // ES_Descriptor (0x03)
+        let mut es_body = vec![0x00, 0x02, es_flags];
+        if es_flags & 0x80 != 0 {
+            es_body.extend_from_slice(&[0x00, 0x01]); // dependsOn_ES_ID
+        }
+        if es_flags & 0x40 != 0 {
+            es_body.push(3);
+            es_body.extend_from_slice(b"abc"); // URLstring
+        }
+        if es_flags & 0x20 != 0 {
+            es_body.extend_from_slice(&[0x00, 0x03]); // OCR_ES_Id
+        }
+        es_body.extend_from_slice(&dcd);
+        es_body.extend_from_slice(&sl);
+
+        // FullBox header: version(1) + flags(3)
+        let mut out = vec![0u8; 4];
+        out.push(0x03);
+        out.extend_from_slice(&encode_mp4_len(es_body.len(), len_width));
+        out.extend_from_slice(&es_body);
+        out
+    }
+
+    #[test]
+    fn esds_extracts_audio_specific_config_across_all_length_encodings() {
+        let asc = [0x11u8, 0x90, 0x56, 0xE5, 0x00];
+        for width in 1..=4 {
+            let payload = build_esds_payload(width, 0x00, 0x40, &asc);
+            let parsed =
+                parse_esds(&payload).unwrap_or_else(|| panic!("width={width} esds should parse"));
+            assert_eq!(parsed.object_type_indication, 0x40);
+            assert_eq!(parsed.max_bitrate, 128_000);
+            assert_eq!(parsed.avg_bitrate, 126_595);
+            assert_eq!(
+                parsed.audio_specific_config.as_deref(),
+                Some(asc.as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn esds_parses_real_ffmpeg_four_byte_padded_box() {
+        // Verbatim `esds` FullBox payload generated by FFmpeg for 48 kHz stereo AAC-LC.
+        let ffmpeg_esds: [u8; 46] = [
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x25, 0x00, 0x02, 0x00, 0x04, 0x80,
+            0x80, 0x80, 0x17, 0x40, 0x15, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF4, 0x00, 0x00, 0x01,
+            0xEE, 0x83, 0x05, 0x80, 0x80, 0x80, 0x05, 0x11, 0x90, 0x56, 0xE5, 0x00, 0x06, 0x80,
+            0x80, 0x80, 0x01, 0x02,
+        ];
+        let parsed = parse_esds(&ffmpeg_esds).expect("FFmpeg esds must parse");
+        assert_eq!(parsed.object_type_indication, 0x40);
+        assert_eq!(parsed.max_bitrate, 128_000);
+        assert_eq!(parsed.avg_bitrate, 126_595);
+        assert_eq!(
+            parsed.audio_specific_config.as_deref(),
+            Some([0x11, 0x90, 0x56, 0xE5, 0x00].as_slice())
+        );
+    }
+
+    #[test]
+    fn esds_handles_optional_es_descriptor_flags_and_mp3_object_type() {
+        // streamDependenceFlag | URL_Flag | OCRstreamFlag all set (0xE0)
+        let asc = [0x12u8, 0x10];
+        let payload = build_esds_payload(2, 0xE0, 0x40, &asc);
+        let parsed = parse_esds(&payload).expect("esds with optional flags must parse");
+        assert_eq!(
+            parsed.audio_specific_config.as_deref(),
+            Some(asc.as_slice())
+        );
+
+        // MP3 inside mp4a (objectTypeIndication = 0x6B, empty DecoderSpecificInfo)
+        let mp3_payload = build_esds_payload(1, 0x00, 0x6B, &[]);
+        let mp3_parsed = parse_esds(&mp3_payload).expect("MP3 esds must parse");
+        assert_eq!(mp3_parsed.object_type_indication, 0x6B);
+        assert_eq!(mp3_parsed.audio_specific_config, None);
+    }
+
+    #[test]
+    fn esds_rejects_truncated_or_overlong_length_encoding_without_panic() {
+        assert!(parse_esds(&[]).is_none());
+        assert!(parse_esds(&[0, 0, 0]).is_none());
+        // Truncated descriptor length
+        assert!(parse_esds(&[0, 0, 0, 0, 0x03, 0x80]).is_none());
+        // 5-byte unterminated expandable length (>4 bytes is invalid)
+        assert!(parse_esds(&[0, 0, 0, 0, 0x03, 0x80, 0x80, 0x80, 0x80, 0x01]).is_none());
+        // Declared length exceeds remaining buffer
+        assert!(parse_esds(&[0, 0, 0, 0, 0x03, 0x40, 0x00, 0x01, 0x00]).is_none());
+    }
+
+    #[test]
+    fn mp4_demuxer_populates_raw_asc_extradata_from_mp4a_esds() {
+        // Build a valid minimal MP4 whose `mp4a` entry contains a 4-byte-padded FFmpeg `esds`.
+        let asc = [0x11u8, 0x90, 0x56, 0xE5, 0x00];
+        let esds_box = box_bytes(b"esds", &build_esds_payload(4, 0x00, 0x40, &asc));
+
+        let mut mp4a_payload = vec![0u8; 28];
+        mp4a_payload[17] = 2; // 2 channels
+        mp4a_payload[19] = 16; // 16-bit
+        mp4a_payload[24] = 0xBB;
+        mp4a_payload[25] = 0x80; // 48000 Hz
+        mp4a_payload.extend_from_slice(&esds_box);
+        let mp4a = box_bytes(b"mp4a", &mp4a_payload);
+
+        let mut stsd_rest = Vec::new();
+        stsd_rest.extend_from_slice(&be32(1));
+        stsd_rest.extend_from_slice(&mp4a);
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1024));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = Vec::new();
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = Vec::new();
+        stsz_rest.extend_from_slice(&be32(0));
+        stsz_rest.extend_from_slice(&be32(1));
+        stsz_rest.extend_from_slice(&be32(4));
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mdat = box_bytes(b"mdat", b"ABCD");
+        let data_offset = (ftyp.len() + 8) as u32;
+
+        let mut stco_rest = Vec::new();
+        stco_rest.extend_from_slice(&be32(1));
+        stco_rest.extend_from_slice(&be32(data_offset));
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut stbl_body = Vec::new();
+        for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+            stbl_body.extend_from_slice(b);
+        }
+        let minf = box_bytes(b"minf", &box_bytes(b"stbl", &stbl_body));
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&be32(48_000));
+        mdhd_body[12..16].copy_from_slice(&be32(1024));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"soun");
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body)),
+        );
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+
+        let mut ctx = ctx_from(file);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+        assert_eq!(ctx.streams.len(), 1);
+        let st = &ctx.streams[0];
+        assert_eq!(st.codec_id, CodecId::Aac);
+        assert_eq!(st.codec_params.sample_rate, Some(48_000));
+        assert_eq!(st.codec_params.channels, Some(2));
+        assert_eq!(st.codec_params.bit_rate, Some(126_595));
+        assert_eq!(
+            st.codec_params.extradata.as_deref(),
+            Some(asc.as_slice()),
+            "extradata must contain raw AudioSpecificConfig without esds wrapper"
+        );
+    }
+
+    fn build_mp4_with_audio_child_box(child_box: &[u8]) -> Vec<u8> {
+        let mut mp4a_payload = vec![0u8; 28];
+        mp4a_payload[17] = 2;
+        mp4a_payload[19] = 16;
+        mp4a_payload[24] = 0xBB;
+        mp4a_payload[25] = 0x80; // 48000 Hz
+        mp4a_payload.extend_from_slice(child_box);
+        let mp4a = box_bytes(b"mp4a", &mp4a_payload);
+
+        let mut stsd_rest = Vec::new();
+        stsd_rest.extend_from_slice(&be32(1));
+        stsd_rest.extend_from_slice(&mp4a);
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1024));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = Vec::new();
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = Vec::new();
+        stsz_rest.extend_from_slice(&be32(0));
+        stsz_rest.extend_from_slice(&be32(1));
+        stsz_rest.extend_from_slice(&be32(4));
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mdat = box_bytes(b"mdat", b"ABCD");
+        let data_offset = (ftyp.len() + 8) as u32;
+
+        let mut stco_rest = Vec::new();
+        stco_rest.extend_from_slice(&be32(1));
+        stco_rest.extend_from_slice(&be32(data_offset));
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut stbl_body = Vec::new();
+        for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+            stbl_body.extend_from_slice(b);
+        }
+        let minf = box_bytes(b"minf", &box_bytes(b"stbl", &stbl_body));
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&be32(48_000));
+        mdhd_body[12..16].copy_from_slice(&be32(1024));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"soun");
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body)),
+        );
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    #[test]
+    fn checked_child_box_bounds_rejects_overflow_wrap_and_past_parent() {
+        // u64::MAX overflows cursor + box_size.
+        assert_eq!(checked_child_box_bounds(128, u64::MAX, 16, 256), None);
+        // Exact wrap-around past u64::MAX back to an offset < parent_end.
+        let wrap_back = u64::MAX - 128 + 1 + 10;
+        assert_eq!(checked_child_box_bounds(128, wrap_back, 16, 256), None);
+        // Box smaller than its own header.
+        assert_eq!(checked_child_box_bounds(128, 12, 16, 256), None);
+        // Declared extent exceeds parent_end.
+        assert_eq!(checked_child_box_bounds(128, 200, 16, 256), None);
+        // Valid 64-bit extended box inside parent.
+        assert_eq!(checked_child_box_bounds(128, 64, 16, 256), Some((144, 192)));
+    }
+
+    #[test]
+    fn public_demux_handles_overflowing_64bit_esds_and_container_box_sizes_without_panic() {
+        let asc = [0x11u8, 0x90];
+        let valid_esds_payload = build_esds_payload(1, 0x00, 0x40, &asc);
+
+        // Case 1: `mp4a` child `esds` declares 64-bit size = u64::MAX.
+        let mut overflow_esds = Vec::new();
+        overflow_esds.extend_from_slice(&be32(1));
+        overflow_esds.extend_from_slice(b"esds");
+        overflow_esds.extend_from_slice(&u64::MAX.to_be_bytes());
+        overflow_esds.extend_from_slice(&valid_esds_payload);
+
+        let file_max = build_mp4_with_audio_child_box(&overflow_esds);
+        let mut ctx_max = ctx_from(file_max);
+        let mut demuxer_max = MP4Demuxer::default();
+        demuxer_max
+            .read_header(&mut ctx_max)
+            .expect("overflowing esds must not panic");
+        assert_eq!(ctx_max.streams.len(), 1);
+        assert_eq!(
+            ctx_max.streams[0].codec_params.extradata, None,
+            "malformed overflowing esds payload must not be read"
+        );
+
+        // Case 2: 64-bit size engineered to wrap `cursor + box_size` backward into the parent.
+        let mut wrap_box = Vec::new();
+        wrap_box.extend_from_slice(&be32(1));
+        wrap_box.extend_from_slice(b"free");
+        wrap_box.extend_from_slice(&(u64::MAX - 20).to_be_bytes());
+        wrap_box.extend_from_slice(&[0u8; 8]);
+        let file_wrap = build_mp4_with_audio_child_box(&wrap_box);
+        let mut ctx_wrap = ctx_from(file_wrap);
+        let mut demuxer_wrap = MP4Demuxer::default();
+        demuxer_wrap
+            .read_header(&mut ctx_wrap)
+            .expect("wrap-around child box must not panic or loop forever");
+        assert_eq!(ctx_wrap.streams.len(), 1);
+
+        // Case 3: 64-bit `esds` size does not overflow u64, but exceeds parent `mp4a` end.
+        let mut past_parent_esds = Vec::new();
+        past_parent_esds.extend_from_slice(&be32(1));
+        past_parent_esds.extend_from_slice(b"esds");
+        past_parent_esds.extend_from_slice(&10_000u64.to_be_bytes());
+        past_parent_esds.extend_from_slice(&valid_esds_payload);
+        let file_past = build_mp4_with_audio_child_box(&past_parent_esds);
+        let mut ctx_past = ctx_from(file_past);
+        let mut demuxer_past = MP4Demuxer::default();
+        demuxer_past
+            .read_header(&mut ctx_past)
+            .expect("past-parent esds must not panic");
+        assert_eq!(ctx_past.streams.len(), 1);
+        assert_eq!(
+            ctx_past.streams[0].codec_params.extradata, None,
+            "esds extending past parent mp4a must be rejected"
+        );
+
+        // Case 4: `moov` child box with 64-bit size = u64::MAX via FormatContext::open_input.
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mut bad_moov_child = Vec::new();
+        bad_moov_child.extend_from_slice(&be32(1));
+        bad_moov_child.extend_from_slice(b"trak");
+        bad_moov_child.extend_from_slice(&u64::MAX.to_be_bytes());
+        let moov = box_bytes(b"moov", &bad_moov_child);
+        let mut file_moov = Vec::new();
+        file_moov.extend_from_slice(&ftyp);
+        file_moov.extend_from_slice(&moov);
+
+        let tmp = std::env::temp_dir().join("rsmpeg_p1_01_overflow_moov.mp4");
+        std::fs::write(&tmp, &file_moov).expect("write temp mp4");
+        let open_res = FormatContext::open_input(&tmp).and_then(|mut c| {
+            c.read_header()?;
+            Ok(c.streams.len())
+        });
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(
+            open_res.expect("public FormatContext::open_input + read_header must not panic"),
+            0
+        );
+    }
+
+    fn build_mp4_with_sample_entry(
+        handler_type: &[u8; 4],
+        timescale: u32,
+        sample_entry_box: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut stsd_rest = Vec::new();
+        stsd_rest.extend_from_slice(&be32(1));
+        stsd_rest.extend_from_slice(&sample_entry_box);
+        let stsd = box_bytes(b"stsd", &fullbox(0, 0, &stsd_rest));
+
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1));
+        stts_rest.extend_from_slice(&be32(1024));
+        let stts = box_bytes(b"stts", &fullbox(0, 0, &stts_rest));
+
+        let mut stsc_rest = Vec::new();
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        stsc_rest.extend_from_slice(&be32(1));
+        let stsc = box_bytes(b"stsc", &fullbox(0, 0, &stsc_rest));
+
+        let mut stsz_rest = Vec::new();
+        stsz_rest.extend_from_slice(&be32(0));
+        stsz_rest.extend_from_slice(&be32(1));
+        stsz_rest.extend_from_slice(&be32(4));
+        let stsz = box_bytes(b"stsz", &fullbox(0, 0, &stsz_rest));
+
+        let ftyp = box_bytes(b"ftyp", b"isom\0\0\x02\0isom");
+        let mdat = box_bytes(b"mdat", b"DATA");
+        let data_offset = (ftyp.len() + 8) as u32;
+
+        let mut stco_rest = Vec::new();
+        stco_rest.extend_from_slice(&be32(1));
+        stco_rest.extend_from_slice(&be32(data_offset));
+        let stco = box_bytes(b"stco", &fullbox(0, 0, &stco_rest));
+
+        let mut stbl_body = Vec::new();
+        for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+            stbl_body.extend_from_slice(b);
+        }
+        let minf = box_bytes(b"minf", &box_bytes(b"stbl", &stbl_body));
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&be32(timescale));
+        mdhd_body[12..16].copy_from_slice(&be32(1024));
+        let mdhd = box_bytes(b"mdhd", &fullbox(0, 0, &mdhd_body));
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(handler_type);
+        let hdlr = box_bytes(b"hdlr", &fullbox(0, 0, &hdlr_body));
+
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"trak", &box_bytes(b"mdia", &mdia_body)),
+        );
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&ftyp);
+        file.extend_from_slice(&mdat);
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    #[test]
+    fn mp4_demuxer_parses_mjpeg_visual_sample_entries() {
+        for fourcc in [b"jpeg", b"mjpa", b"mjpb", b"mjpg"] {
+            let mut visual_payload = vec![0u8; 78];
+            visual_payload[24..26].copy_from_slice(&be16(640));
+            visual_payload[26..28].copy_from_slice(&be16(480));
+            let entry = box_bytes(fourcc, &visual_payload);
+            let file = build_mp4_with_sample_entry(b"vide", 90_000, entry);
+
+            let mut ctx = ctx_from(file);
+            let mut demuxer = MP4Demuxer::default();
+            demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+            assert_eq!(ctx.streams.len(), 1);
+            let st = &ctx.streams[0];
+            assert_eq!(st.codec_id, CodecId::Mjpeg);
+            assert_eq!(st.media_type, MediaType::Video);
+            assert_eq!(st.codec_params.width, Some(640));
+            assert_eq!(st.codec_params.height, Some(480));
+        }
+    }
+
+    #[test]
+    fn mp4_demuxer_upgrades_mp4v_with_esds_0x6c_to_mjpeg() {
+        let esds_mjpeg = box_bytes(b"esds", &build_esds_payload(1, 0x00, 0x6C, &[]));
+        let mut visual_payload = vec![0u8; 78];
+        visual_payload[24..26].copy_from_slice(&be16(320));
+        visual_payload[26..28].copy_from_slice(&be16(240));
+        visual_payload.extend_from_slice(&esds_mjpeg);
+        let mp4v_mjpeg = box_bytes(b"mp4v", &visual_payload);
+
+        let file = build_mp4_with_sample_entry(b"vide", 30_000, mp4v_mjpeg);
+        let mut ctx = ctx_from(file);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+        assert_eq!(ctx.streams.len(), 1);
+        let st = &ctx.streams[0];
+        assert_eq!(st.codec_id, CodecId::Mjpeg);
+        assert_eq!(st.media_type, MediaType::Video);
+        assert_eq!(st.codec_params.width, Some(320));
+        assert_eq!(st.codec_params.height, Some(240));
+
+        // Plain MPEG-4 Visual (objectTypeIndication = 0x20) remains CodecId::Mpeg4.
+        let esds_mpeg4 = box_bytes(b"esds", &build_esds_payload(1, 0x00, 0x20, &[0x00, 0x00]));
+        let mut visual_mpeg4 = vec![0u8; 78];
+        visual_mpeg4[24..26].copy_from_slice(&be16(1280));
+        visual_mpeg4[26..28].copy_from_slice(&be16(720));
+        visual_mpeg4.extend_from_slice(&esds_mpeg4);
+        let mp4v_mpeg4 = box_bytes(b"mp4v", &visual_mpeg4);
+
+        let file2 = build_mp4_with_sample_entry(b"vide", 30_000, mp4v_mpeg4);
+        let mut ctx2 = ctx_from(file2);
+        let mut demuxer2 = MP4Demuxer::default();
+        demuxer2
+            .read_header(&mut ctx2)
+            .expect("read_header succeeds");
+        assert_eq!(ctx2.streams[0].codec_id, CodecId::Mpeg4);
+        assert_eq!(ctx2.streams[0].codec_params.width, Some(1280));
+        assert_eq!(ctx2.streams[0].codec_params.height, Some(720));
+    }
+
+    #[test]
+    fn mp4_demuxer_parses_flac_dfla_streaminfo_extradata() {
+        let mut streaminfo = [0u8; 34];
+        for (i, b) in streaminfo.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(1);
+        }
+        let mut dfla_rest = vec![0x80, 0x00, 0x00, 34]; // last-block=1, type=0 (STREAMINFO), len=34
+        dfla_rest.extend_from_slice(&streaminfo);
+        let dfla_box = box_bytes(b"dfLa", &fullbox(0, 0, &dfla_rest));
+
+        let mut flac_payload = vec![0u8; 28];
+        flac_payload[16..18].copy_from_slice(&be16(2)); // 2 channels
+        flac_payload[18..20].copy_from_slice(&be16(16)); // 16-bit
+        flac_payload[24..26].copy_from_slice(&be16(44_100)); // 44100 Hz
+        flac_payload.extend_from_slice(&dfla_box);
+        let flac_entry = box_bytes(b"fLaC", &flac_payload);
+
+        let file = build_mp4_with_sample_entry(b"soun", 44_100, flac_entry);
+        let mut ctx = ctx_from(file);
+        let mut demuxer = MP4Demuxer::default();
+        demuxer.read_header(&mut ctx).expect("read_header succeeds");
+
+        assert_eq!(ctx.streams.len(), 1);
+        let st = &ctx.streams[0];
+        assert_eq!(st.codec_id, CodecId::Flac);
+        assert_eq!(st.media_type, MediaType::Audio);
+        assert_eq!(st.codec_params.sample_rate, Some(44_100));
+        assert_eq!(st.codec_params.channels, Some(2));
+        assert_eq!(
+            st.codec_params.extradata.as_deref(),
+            Some(streaminfo.as_slice())
+        );
+
+        // Truncated dfLa must not panic and leaves extradata empty.
+        let bad_dfla = box_bytes(b"dfLa", &fullbox(0, 0, &[0x80, 0x00, 0x00, 34, 0x01, 0x02]));
+        let mut bad_payload = vec![0u8; 28];
+        bad_payload[16..18].copy_from_slice(&be16(2));
+        bad_payload[24..26].copy_from_slice(&be16(44_100));
+        bad_payload.extend_from_slice(&bad_dfla);
+        let bad_entry = box_bytes(b"fLaC", &bad_payload);
+
+        let bad_file = build_mp4_with_sample_entry(b"soun", 44_100, bad_entry);
+        let mut bad_ctx = ctx_from(bad_file);
+        let mut bad_demuxer = MP4Demuxer::default();
+        bad_demuxer
+            .read_header(&mut bad_ctx)
+            .expect("truncated dfLa must not panic");
+        assert_eq!(bad_ctx.streams[0].codec_id, CodecId::Flac);
+        assert_eq!(bad_ctx.streams[0].codec_params.extradata, None);
     }
 }

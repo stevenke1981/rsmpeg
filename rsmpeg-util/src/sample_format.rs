@@ -60,3 +60,65 @@ impl SampleFormat {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_per_sample_table() {
+        assert_eq!(SampleFormat::U8.bytes(), 1);
+        assert_eq!(SampleFormat::S16.bytes(), 2);
+        assert_eq!(SampleFormat::S16P.bytes(), 2);
+        assert_eq!(SampleFormat::S32.bytes(), 4);
+        assert_eq!(SampleFormat::F32.bytes(), 4);
+        assert_eq!(SampleFormat::F32P.bytes(), 4);
+        assert_eq!(SampleFormat::F64.bytes(), 8);
+        assert_eq!(SampleFormat::F64P.bytes(), 8);
+        // Unknown format must report zero so size computations degrade to empty.
+        assert_eq!(SampleFormat::None.bytes(), 0);
+    }
+
+    #[test]
+    fn planar_formats_report_planar_only() {
+        for f in [
+            SampleFormat::S16P,
+            SampleFormat::S32P,
+            SampleFormat::F32P,
+            SampleFormat::F64P,
+        ] {
+            assert!(f.is_planar(), "{f:?} should be planar");
+        }
+        for f in [
+            SampleFormat::U8,
+            SampleFormat::S16,
+            SampleFormat::S32,
+            SampleFormat::F32,
+            SampleFormat::F64,
+            SampleFormat::None,
+        ] {
+            assert!(!f.is_planar(), "{f:?} should be interleaved");
+        }
+    }
+
+    #[test]
+    fn names_are_unique() {
+        let all = [
+            SampleFormat::U8,
+            SampleFormat::S16,
+            SampleFormat::S32,
+            SampleFormat::F32,
+            SampleFormat::F64,
+            SampleFormat::S16P,
+            SampleFormat::S32P,
+            SampleFormat::F32P,
+            SampleFormat::F64P,
+            SampleFormat::None,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|f| f.name()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "sample format names must be unique");
+    }
+}

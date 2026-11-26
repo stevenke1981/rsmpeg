@@ -196,4 +196,94 @@ mod tests {
         assert!(!s.drop_before_seek(Duration::from_millis(500), Duration::from_millis(500)));
         assert!(!s.drop_before_seek(Duration::from_millis(900), Duration::from_millis(500)));
     }
+
+    #[test]
+    fn wait_never_returns_zero_duration_early_action() {
+        // A frame one microsecond early is below `early_epsilon` (1 ms), so it
+        // still waits but is not counted as early.
+        let mut s = VideoScheduler::new();
+        let action = s.schedule(
+            Duration::from_micros(1_000_001),
+            Duration::from_micros(1_000_000),
+        );
+        assert_eq!(
+            action,
+            ScheduleAction::Wait {
+                duration: Duration::from_micros(1)
+            }
+        );
+        assert_eq!(
+            s.stats().early,
+            0,
+            "sub-epsilon wait must not count as early"
+        );
+    }
+
+    #[test]
+    fn wait_duration_equals_lateness_of_pts_gap() {
+        let mut s = VideoScheduler::new();
+        let action = s.schedule(Duration::from_secs(2), Duration::from_millis(500));
+        assert_eq!(
+            action,
+            ScheduleAction::Wait {
+                duration: Duration::from_millis(1_500)
+            }
+        );
+        assert_eq!(s.stats().early, 1);
+    }
+
+    #[test]
+    fn mark_displayed_increments_only_displayed() {
+        let mut s = VideoScheduler::new();
+        assert_eq!(s.stats().displayed, 0);
+        s.mark_displayed();
+        s.mark_displayed();
+        assert_eq!(s.stats().displayed, 2);
+        assert_eq!(s.stats().dropped, 0);
+        assert_eq!(s.stats().late, 0);
+    }
+
+    #[test]
+    fn stats_accumulate_across_mixed_decisions() {
+        let mut s = VideoScheduler::new().with_late_threshold(Duration::from_millis(50));
+        // early → wait
+        let _ = s.schedule(Duration::from_millis(200), Duration::from_millis(100));
+        // on time → display
+        let _ = s.schedule(Duration::from_millis(200), Duration::from_millis(200));
+        // slightly late → display + late
+        let _ = s.schedule(Duration::from_millis(200), Duration::from_millis(220));
+        // too late → drop + late
+        let _ = s.schedule(Duration::from_millis(200), Duration::from_millis(400));
+
+        let stats = s.stats();
+        assert_eq!(stats.early, 1);
+        assert_eq!(stats.displayed, 2);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.late, 2);
+    }
+
+    #[test]
+    fn zero_late_threshold_drops_any_lateness() {
+        let mut s = VideoScheduler::new().with_late_threshold(Duration::ZERO);
+        // Exactly on time still displays.
+        assert_eq!(
+            s.schedule(Duration::from_millis(10), Duration::from_millis(10)),
+            ScheduleAction::Display
+        );
+        // One millisecond late is past a zero threshold → drop.
+        assert_eq!(
+            s.schedule(Duration::from_millis(10), Duration::from_millis(11)),
+            ScheduleAction::DropLate
+        );
+    }
+
+    #[test]
+    fn late_threshold_is_readable() {
+        let s = VideoScheduler::new().with_late_threshold(Duration::from_millis(123));
+        assert_eq!(s.late_threshold(), Duration::from_millis(123));
+        assert_eq!(
+            VideoScheduler::default().late_threshold(),
+            Duration::from_millis(50)
+        );
+    }
 }

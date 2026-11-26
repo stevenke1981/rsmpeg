@@ -10,8 +10,8 @@ use rsmpeg_codec::{CodecId, CodecParameters, DecodeStatus, Decoder, Frame, Packe
 use rsmpeg_util::{PixelFormat, Rational, RsError, RsResult, SampleFormat};
 use symphonia::core::audio::{AudioBufferRef, Channels, SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{
-    DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_MP3, CODEC_TYPE_PCM_F32LE, CODEC_TYPE_PCM_S16LE,
-    CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8,
+    DecoderOptions, CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_MP3, CODEC_TYPE_PCM_F32LE,
+    CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8, CODEC_TYPE_VORBIS,
 };
 use symphonia::core::formats::Packet as SymPacket;
 use symphonia::core::sample::SampleFormat as SymphoniaSampleFormat;
@@ -31,10 +31,15 @@ pub struct SymphoniaAudioDecoder {
 impl SymphoniaAudioDecoder {
     /// Construct from rsmpeg [`CodecParameters`].
     ///
-    /// Supported: [`CodecId::Aac`], [`CodecId::Pcm`], [`CodecId::Mp3`].
+    /// Supported: [`CodecId::Aac`], [`CodecId::Pcm`], [`CodecId::Mp3`],
+    /// [`CodecId::Vorbis`], [`CodecId::Alac`].
     ///
     /// For AAC, `params.extradata` may be a raw AudioSpecificConfig or an MPEG-4
     /// `esds` payload — ASC is extracted automatically when present.
+    ///
+    /// Vorbis and ALAC require `params.extradata`, which is passed to Symphonia
+    /// unchanged: the identification header followed by the setup header for
+    /// Vorbis, and the 24- or 48-byte magic cookie for ALAC.
     pub fn try_new(params: &CodecParameters) -> RsResult<Self> {
         if !Self::supported(params.codec_id) {
             return Err(RsError::Unsupported(std::borrow::Cow::Owned(format!(
@@ -57,6 +62,16 @@ impl SymphoniaAudioDecoder {
             }
             CodecId::Mp3 => {
                 sym_params.for_codec(CODEC_TYPE_MP3);
+            }
+            CodecId::Vorbis | CodecId::Alac => {
+                sym_params.for_codec(if params.codec_id == CodecId::Vorbis {
+                    CODEC_TYPE_VORBIS
+                } else {
+                    CODEC_TYPE_ALAC
+                });
+                if let Some(ref extra) = params.extradata {
+                    sym_params.with_extra_data(extra.clone().into_boxed_slice());
+                }
             }
             CodecId::Pcm => {
                 let fmt = params.sample_format.unwrap_or(SampleFormat::S16);
@@ -118,7 +133,10 @@ impl SymphoniaAudioDecoder {
 
     /// Whether this backend can decode the given codec id.
     pub fn supported(codec_id: CodecId) -> bool {
-        matches!(codec_id, CodecId::Aac | CodecId::Pcm | CodecId::Mp3)
+        matches!(
+            codec_id,
+            CodecId::Aac | CodecId::Pcm | CodecId::Mp3 | CodecId::Vorbis | CodecId::Alac
+        )
     }
 
     fn packet_to_frame(&mut self, packet: &Packet) -> RsResult<Option<Frame>> {
@@ -305,9 +323,12 @@ fn audio_buffer_to_frame(
         Rational::new(1, sample_rate.max(1) as i32)
     };
 
+    // `data` is moved into the frame — cloning it here doubled the per-packet
+    // audio copy on the hot decode path.
+    let linesize = data.len();
     Frame {
-        data: vec![data.clone()],
-        linesize: vec![data.len()],
+        data: vec![data],
+        linesize: vec![linesize],
         width: 0,
         height: 0,
         pixel_format: PixelFormat::None,
@@ -328,37 +349,64 @@ fn audio_buffer_to_frame(
 /// Mirrors the helper used by the native pipeline so AAC packet-in works with
 /// either raw ASC or full esds extradata.
 fn extract_aac_asc(esds: &[u8]) -> Option<Vec<u8>> {
-    let mut i = 0usize;
-    while i < esds.len() {
-        let tag = esds[i];
-        i += 1;
-        if i >= esds.len() {
-            return None;
-        }
-        // Expandable MPEG-4 length
+    // Support full `esds` FullBox payload (4-byte version/flags + ES_Descriptor 0x03)
+    // as well as bare descriptor streams starting with 0x03/0x04/0x05.
+    let slice = if esds.len() >= 6 && esds[0..4] == [0, 0, 0, 0] && esds[4] == 0x03 {
+        &esds[4..]
+    } else if matches!(esds.first(), Some(0x03..=0x05)) {
+        esds
+    } else {
+        return None;
+    };
+
+    fn read_desc(buf: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, mut rest) = buf.split_first()?;
         let mut len = 0usize;
+        let mut done = false;
         for _ in 0..4 {
-            if i >= esds.len() {
-                return None;
-            }
-            let b = esds[i];
-            i += 1;
-            len = (len << 7) | (b & 0x7f) as usize;
+            let (&b, next) = rest.split_first()?;
+            rest = next;
+            len = (len << 7) | usize::from(b & 0x7F);
             if b & 0x80 == 0 {
+                done = true;
                 break;
             }
         }
-        if tag == 0x05 {
-            if i + len <= esds.len() && len > 0 {
-                return Some(esds[i..i + len].to_vec());
-            }
+        if !done || len > rest.len() {
             return None;
         }
-        // Nested descriptors (ES / DecoderConfig) — continue scanning inside.
-        if tag == 0x03 || tag == 0x04 {
-            continue;
+        let (payload, tail) = rest.split_at(len);
+        Some((tag, payload, tail))
+    }
+
+    let mut rest = slice;
+    while !rest.is_empty() {
+        let (tag, payload, next) = read_desc(rest)?;
+        match tag {
+            0x05 => return (!payload.is_empty()).then(|| payload.to_vec()),
+            0x03 => {
+                if payload.len() < 3 {
+                    return None;
+                }
+                let flags = payload[2];
+                let mut inner = &payload[3..];
+                if flags & 0x80 != 0 {
+                    inner = inner.get(2..)?;
+                }
+                if flags & 0x40 != 0 {
+                    let (&url_len, after) = inner.split_first()?;
+                    inner = after.get(usize::from(url_len)..)?;
+                }
+                if flags & 0x20 != 0 {
+                    inner = inner.get(2..)?;
+                }
+                rest = inner;
+            }
+            0x04 => {
+                rest = payload.get(13..)?;
+            }
+            _ => rest = next,
         }
-        i = i.saturating_add(len);
     }
     None
 }
@@ -513,6 +561,50 @@ mod tests {
     }
 
     #[test]
+    fn send_after_eof_is_a_lifecycle_error() {
+        // The decoder moves to a terminal state on flush; sending again must
+        // be a clean error rather than silently dropping the packet (which
+        // would lose audio after a seek that forgot to reset()).
+        let mut dec = SymphoniaAudioDecoder::try_new(&pcm_params()).expect("pcm");
+        dec.send_packet(None).unwrap();
+        assert!(matches!(
+            dec.receive_frame().unwrap(),
+            DecodeStatus::EndOfStream
+        ));
+
+        let raw: Vec<u8> = (0i16..8).flat_map(|v| v.to_le_bytes()).collect();
+        let pkt = Packet::new(raw.into(), 0);
+        let err = dec.send_packet(Some(&pkt)).unwrap_err();
+        assert!(matches!(err, RsError::Codec(_)), "got {err:?}");
+
+        // reset() must lift the error state again.
+        dec.reset().unwrap();
+        dec.send_packet(Some(&pkt)).unwrap();
+    }
+
+    #[test]
+    fn decoded_frame_plane_is_owned_not_shared() {
+        // Regression guard for the removed `data.clone()`: the frame's single
+        // plane must be exactly the interleaved S16 bytes of `samples *
+        // channels`, and `linesize` must describe it.
+        let mut dec = SymphoniaAudioDecoder::try_new(&pcm_params()).expect("pcm");
+        let raw: Vec<u8> = (0i16..8).flat_map(|v| v.to_le_bytes()).collect();
+        let mut pkt = Packet::new(raw.into(), 0);
+        pkt.duration = 4;
+        dec.send_packet(Some(&pkt)).unwrap();
+
+        let DecodeStatus::Frame(f) = dec.receive_frame().unwrap() else {
+            panic!("expected a decoded frame");
+        };
+        assert_eq!(f.data.len(), 1);
+        assert_eq!(f.data[0].len(), 4 * 2 * 2);
+        assert_eq!(f.linesize[0], f.data[0].len());
+        // 4 stereo samples → the last value must be preserved verbatim.
+        let tail = &f.data[0][f.data[0].len() - 2..];
+        assert_eq!(i16::from_le_bytes([tail[0], tail[1]]), 7);
+    }
+
+    #[test]
     fn extract_asc_from_minimal_esds_like() {
         let data = [0x05u8, 0x02, 0x11, 0x90];
         let asc = extract_aac_asc(&data).expect("asc");
@@ -521,13 +613,89 @@ mod tests {
 
     #[test]
     fn construct_aac_with_raw_asc() {
-        // AAC-LC, 48 kHz, stereo ASC: 0x11 0x90
-        let mut p = CodecParameters::new(CodecId::Aac);
-        p.sample_rate = Some(48_000);
+        // AAC-LC, 48 kHz, stereo ASC (2-byte and 5-byte FFmpeg form)
+        for asc in [vec![0x11, 0x90], vec![0x11, 0x90, 0x56, 0xE5, 0x00]] {
+            let mut p = CodecParameters::new(CodecId::Aac);
+            p.sample_rate = Some(48_000);
+            p.channels = Some(2);
+            p.extradata = Some(asc);
+            let dec = SymphoniaAudioDecoder::try_new(&p).expect("aac decoder");
+            assert_eq!(dec.codec_id(), CodecId::Aac);
+        }
+    }
+
+    /// 24-byte ALAC magic cookie: 4096-sample frames, 16-bit stereo, 44.1 kHz.
+    fn alac_magic_cookie() -> Vec<u8> {
+        let mut cookie = Vec::with_capacity(24);
+        cookie.extend_from_slice(&4096u32.to_be_bytes()); // frame length
+        cookie.extend_from_slice(&[0, 16, 40, 10, 14, 2]); // version, depth, pb, mb, kb, channels
+        cookie.extend_from_slice(&255u16.to_be_bytes()); // max run
+        cookie.extend_from_slice(&0u32.to_be_bytes()); // max frame bytes
+        cookie.extend_from_slice(&0u32.to_be_bytes()); // average bit rate
+        cookie.extend_from_slice(&44_100u32.to_be_bytes());
+        cookie
+    }
+
+    fn open_error(params: &CodecParameters) -> String {
+        match SymphoniaAudioDecoder::try_new(params) {
+            Err(RsError::Codec(message)) => message.into_owned(),
+            Err(other) => panic!("expected a codec error, got {other:?}"),
+            Ok(_) => panic!("expected {:?} to fail to open", params.codec_id),
+        }
+    }
+
+    #[test]
+    fn vorbis_and_alac_are_supported() {
+        assert!(SymphoniaAudioDecoder::supported(CodecId::Vorbis));
+        assert!(SymphoniaAudioDecoder::supported(CodecId::Alac));
+    }
+
+    #[test]
+    fn construct_alac_from_magic_cookie() {
+        let mut p = CodecParameters::new(CodecId::Alac);
+        p.sample_rate = Some(44_100);
         p.channels = Some(2);
-        p.extradata = Some(vec![0x11, 0x90]);
-        let dec = SymphoniaAudioDecoder::try_new(&p).expect("aac decoder");
-        assert_eq!(dec.codec_id(), CodecId::Aac);
+        p.extradata = Some(alac_magic_cookie());
+        let dec = SymphoniaAudioDecoder::try_new(&p).expect("alac decoder");
+        assert_eq!(dec.codec_id(), CodecId::Alac);
+    }
+
+    #[test]
+    fn vorbis_and_alac_without_extradata_fail_cleanly() {
+        for codec in [CodecId::Vorbis, CodecId::Alac] {
+            let message = open_error(&CodecParameters::new(codec));
+            assert!(message.contains("missing extra data"), "{message}");
+        }
+    }
+
+    #[test]
+    fn vorbis_extradata_reaches_symphonia() {
+        // An invalid header is rejected on its content, which is only possible
+        // if the bytes were forwarded.
+        let mut p = CodecParameters::new(CodecId::Vorbis);
+        p.extradata = Some(vec![0u8; 32]);
+        let message = open_error(&p);
+        assert!(message.contains("identification header"), "{message}");
+    }
+
+    #[test]
+    fn non_audio_and_unwired_codecs_are_rejected() {
+        for codec in [
+            CodecId::H264,
+            CodecId::Mjpeg,
+            CodecId::RawVideo,
+            CodecId::Opus,
+            CodecId::Flac,
+            CodecId::Srt,
+            CodecId::Unknown,
+        ] {
+            assert!(!SymphoniaAudioDecoder::supported(codec), "{codec:?}");
+            let result = SymphoniaAudioDecoder::try_new(&CodecParameters::new(codec));
+            assert!(
+                matches!(result, Err(RsError::Unsupported(_))),
+                "{codec:?} must be rejected as unsupported"
+            );
+        }
     }
 
     #[test]

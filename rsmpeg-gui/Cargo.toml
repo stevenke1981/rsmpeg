@@ -1,0 +1,30 @@
+[package]
+name = "rsmpeg-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.88"
+description = "GPUI desktop media player for rsmpeg"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rsmpeg-gui"
+path = "src/main.rs"
+
+[dependencies]
+rsmpeg = { path = "../rsmpeg" }
+rsmpeg-player = { path = "../rsmpeg-player" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
+rfd = "0.15"
+clap = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+gpui = "0.2.2"
