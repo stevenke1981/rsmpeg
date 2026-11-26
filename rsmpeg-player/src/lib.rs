@@ -27,10 +27,11 @@ pub mod video_scheduler;
 
 pub use audio_convert::frame_to_s16_device;
 pub use clock::{AudioPlaybackClock, MasterClock, PlaybackClock};
+#[cfg(feature = "backend-symphonia")]
 pub use codec_detect::{
-    classify_track, codec_from_fourcc, find_audio_track, find_h264_video_track,
-    find_unsupported_video, DetectedVideoCodec, TrackKind,
+    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video,
 };
+pub use codec_detect::{codec_from_fourcc, DetectedVideoCodec, TrackKind};
 pub use command::{PlayerCommand, SeekMode};
 pub use event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
 pub use h264_bitstream::{

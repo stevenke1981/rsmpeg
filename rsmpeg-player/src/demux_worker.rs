@@ -1,33 +1,47 @@
 //! Background demux / decode / output worker (UI-thread free).
+//!
+//! The native pipeline ([`crate::native_pipeline`]) is built under every
+//! feature combination. The Symphonia fallback demuxer in this module needs
+//! `backend-symphonia`; inside it, H.264 video needs `backend-openh264` and
+//! sound output needs `audio-rodio`.
 
-use std::fs::File;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread;
-use std::time::{Duration, Instant};
 
-use crate::audio_convert::frame_to_s16_device;
-use crate::audio_ring_buffer::PcmRingBuffer;
-use crate::clock::PlaybackClock;
-use crate::codec_detect::{
-    classify_track, find_audio_track, find_h264_video_track, find_unsupported_video,
-    DetectedVideoCodec, TrackKind,
-};
 use crate::command::PlayerCommand;
-use crate::event::{compute_pcm_level, PlayerEvent, PlayerSnapshot, PlayerTrackInfo};
-use crate::h264_bitstream::extract_avcc_streaming;
-use crate::player::{EventSender, MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE};
-use crate::video_scheduler::{ScheduleAction, VideoScheduler};
+use crate::event::PlayerEvent;
+use crate::player::EventSender;
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
-use crate::sync::{SyncAction, SyncController};
+#[cfg(feature = "backend-symphonia")]
+use std::{
+    fs::File,
+    sync::mpsc::TryRecvError,
+    time::{Duration, Instant},
+};
 
+#[cfg(feature = "backend-symphonia")]
+use crate::{
+    audio_convert::frame_to_s16_device,
+    audio_ring_buffer::PcmRingBuffer,
+    clock::PlaybackClock,
+    codec_detect::{
+        classify_track, find_audio_track, find_h264_video_track, find_unsupported_video,
+        DetectedVideoCodec, TrackKind,
+    },
+    event::{compute_pcm_level, PlayerSnapshot, PlayerTrackInfo},
+    h264_bitstream::extract_avcc_streaming,
+    native_pipeline::AudioSink,
+    player::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE},
+    sync::{SyncAction, SyncController},
+    video_scheduler::{ScheduleAction, VideoScheduler},
+};
+
+#[cfg(feature = "backend-symphonia")]
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(12);
+#[cfg(feature = "backend-symphonia")]
 const MAX_AUDIO_QUEUE_SOURCES: usize = 48;
+#[cfg(feature = "backend-symphonia")]
 const AUDIO_LEVEL_INTERVAL: Duration = Duration::from_millis(40);
 
 /// A/V sync helper wrapper for the demux worker.
@@ -38,21 +52,13 @@ const AUDIO_LEVEL_INTERVAL: Duration = Duration::from_millis(40);
 /// video emit loop: it decides whether each decoded frame should be rendered,
 /// dropped (video ahead of audio), or have the previous frame duplicated
 /// (video behind audio).
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 struct WorkerSync {
     sync: SyncController,
     sync_enabled: bool,
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 impl WorkerSync {
     /// Create a sync wrapper with the default 40 ms tolerance, enabled.
     fn new() -> Self {
@@ -108,14 +114,17 @@ pub(crate) fn spawn_worker_with_sender(
     })
 }
 
+#[cfg(feature = "backend-symphonia")]
 fn emit(tx: &EventSender, ev: PlayerEvent) {
     tx.send(ev);
 }
 
+#[cfg(feature = "backend-symphonia")]
 fn emit_preview(tx: &EventSender, ev: PlayerEvent) {
     tx.send_preview(ev);
 }
 
+#[cfg(feature = "backend-symphonia")]
 fn snap(
     playing: bool,
     position: Duration,
@@ -136,11 +145,7 @@ fn snap(
 
 /// Media time at which an audio buffer starts, used to anchor the audio sync
 /// clock. Falls back to `fallback` without a usable timestamp or time base.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn audio_anchor_position(
     pts: Option<i64>,
     time_base: rsmpeg_util::Rational,
@@ -157,11 +162,7 @@ fn audio_anchor_position(
 
 /// Media time of a frame drained from the video decoder at end of stream,
 /// relative to `base_pts`. Falls back to `fallback` without a usable timestamp.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn flushed_frame_position(
     pts: Option<i64>,
     sec_per_tick: Option<f64>,
@@ -180,11 +181,7 @@ fn flushed_frame_position(
 
 /// Convert a decoded picture into a [`PlayerEvent::VideoFrame`], or `None` when
 /// it is empty or cannot be converted.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn video_frame_event(
     frame: &rsmpeg_codec::Frame,
     pts: Duration,
@@ -201,11 +198,7 @@ fn video_frame_event(
 }
 
 /// Map a Symphonia track + optional avcC blob into rsmpeg H.264 codec parameters.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(all(feature = "backend-symphonia", feature = "backend-openh264"))]
 fn map_h264_params(
     _track: &symphonia::core::formats::Track,
     extra: Option<Vec<u8>>,
@@ -227,15 +220,58 @@ fn map_h264_params(
     params
 }
 
+/// Open the fallback path's H.264 decoder for `track`, or warn and return `None`.
+#[cfg(all(feature = "backend-symphonia", feature = "backend-openh264"))]
+fn open_fallback_video(
+    track: &symphonia::core::formats::Track,
+    extra: Option<Vec<u8>>,
+    generation: u64,
+    event_tx: &EventSender,
+) -> Option<Box<dyn rsmpeg_codec::Decoder>> {
+    let params = map_h264_params(track, extra);
+    match crate::backend::OpenH264Decoder::from_params(&params) {
+        Ok(d) => Some(Box::new(d)),
+        Err(e) => {
+            emit(
+                event_tx,
+                PlayerEvent::Warning {
+                    message: format!("fallback: failed to open OpenH264 decoder: {e}"),
+                    generation,
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Without `backend-openh264` the fallback path decodes no video.
+#[cfg(all(feature = "backend-symphonia", not(feature = "backend-openh264")))]
+fn open_fallback_video(
+    _track: &symphonia::core::formats::Track,
+    _extra: Option<Vec<u8>>,
+    generation: u64,
+    event_tx: &EventSender,
+) -> Option<Box<dyn rsmpeg_codec::Decoder>> {
+    warn_h264_unsupported(generation, event_tx);
+    None
+}
+
+#[cfg(feature = "backend-symphonia")]
+fn warn_h264_unsupported(generation: u64, event_tx: &EventSender) {
+    emit(
+        event_tx,
+        PlayerEvent::Warning {
+            message: "Unsupported video codec 'h264' — audio only".into(),
+            generation,
+        },
+    );
+}
+
 /// Map a Symphonia audio track into rsmpeg [`CodecParameters`] when the codec is known.
 ///
 /// Supported for decode backends: AAC / MP3 / PCM. FLAC is mapped for completeness
 /// but [`SymphoniaAudioDecoder`] may reject it (caller falls back or mutes).
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn map_audio_params(
     track: &symphonia::core::formats::Track,
 ) -> Option<rsmpeg_codec::CodecParameters> {
@@ -295,11 +331,7 @@ fn map_audio_params(
 }
 
 /// Build an rsmpeg [`Packet`] from a Symphonia demux packet.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn sym_packet_to_rsmpeg(
     packet: &symphonia::core::formats::Packet,
     stream_index: usize,
@@ -318,11 +350,7 @@ fn sym_packet_to_rsmpeg(
 }
 
 /// Build selectable video/audio track descriptors for the Symphonia fallback path.
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn collect_fallback_tracks(
     tracks: &[symphonia::core::formats::Track],
     fallback_video_id: Option<u32>,
@@ -358,7 +386,7 @@ fn collect_fallback_tracks(
                     sample_rate: None,
                     channels: None,
                     language,
-                    supported: true,
+                    supported: cfg!(feature = "backend-openh264"),
                 });
             }
             TrackKind::Video(u) => {
@@ -384,7 +412,7 @@ fn collect_fallback_tracks(
                     sample_rate: None,
                     channels: None,
                     language,
-                    supported: true,
+                    supported: cfg!(feature = "backend-openh264"),
                 });
             }
             TrackKind::Ignore => {}
@@ -393,11 +421,7 @@ fn collect_fallback_tracks(
     (video_tracks, audio_tracks)
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 type FallbackAudioBundle = (
     Option<crate::backend::SymphoniaAudioDecoder>,
     Option<Box<dyn symphonia::core::codecs::Decoder>>,
@@ -405,11 +429,7 @@ type FallbackAudioBundle = (
     u32,
 );
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn active_audio_decoder_name(
     audio_dec: Option<&crate::backend::SymphoniaAudioDecoder>,
     audio_decoder_raw: Option<&dyn symphonia::core::codecs::Decoder>,
@@ -430,11 +450,7 @@ fn active_audio_decoder_name(
     }
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn open_fallback_audio(
     at: &symphonia::core::formats::Track,
     generation: u64,
@@ -503,11 +519,7 @@ fn open_fallback_audio(
     (audio_dec, audio_decoder_raw, ch, rate)
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 fn run_worker(
     path: PathBuf,
     mut volume: f32,
@@ -525,7 +537,6 @@ fn run_worker(
     use symphonia::core::probe::Hint;
     use symphonia::core::units::Time;
 
-    use crate::backend::OpenH264Decoder;
     // Cached converter: reuses one `Scaler` per resolution instead of building
     // a fresh one for every decoded frame (byte-identical output).
     use crate::video_convert::yuv420p_frame_to_rgba_cached;
@@ -601,6 +612,10 @@ fn run_worker(
             fallback_video_id = video_track.as_ref().map(|t| t.id);
             stream_avcc = Some(avcc);
         }
+    }
+    // Without a video decoder, play as audio only so audio drives the clock.
+    if !cfg!(feature = "backend-openh264") && video_track.take().is_some() {
+        warn_h264_unsupported(generation, &event_tx);
     }
     let has_video = video_track.is_some();
     let has_audio = audio_track.is_some();
@@ -679,24 +694,9 @@ fn run_worker(
         .as_ref()
         .and_then(|t| t.codec_params.extra_data.as_ref().map(|e| e.to_vec()))
         .or_else(|| stream_avcc.clone());
-    let mut video_dec: Option<OpenH264Decoder> = if let Some(ref vt) = video_track {
-        let params = map_h264_params(vt, avcc_blob);
-        match OpenH264Decoder::from_params(&params) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                emit(
-                    &event_tx,
-                    PlayerEvent::Warning {
-                        message: format!("fallback: failed to open OpenH264 decoder: {e}"),
-                        generation,
-                    },
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let mut video_dec: Option<Box<dyn Decoder>> = video_track
+        .as_ref()
+        .and_then(|vt| open_fallback_video(vt, avcc_blob, generation, &event_tx));
 
     // ── Audio decoder (Symphonia packet-in backend, limited raw fallback) ──
     let mut audio_track_id = audio_track.as_ref().map(|t| t.id);
@@ -714,7 +714,7 @@ fn run_worker(
         active_audio_decoder_name(audio_dec.as_ref(), audio_decoder_raw.as_deref());
 
     let mut sink = if has_audio {
-        crate::audio_output::try_open_sink(volume)
+        AudioSink::try_open_sink(volume)
     } else {
         None
     };
@@ -958,7 +958,7 @@ fn run_worker(
                                 if (audio_dec.is_some() || audio_decoder_raw.is_some())
                                     && sink.is_none()
                                 {
-                                    sink = crate::audio_output::try_open_sink(volume);
+                                    sink = AudioSink::try_open_sink(volume);
                                 }
                                 audio_track_id = Some(at.id);
                                 audio_stream_index = at.id as usize;
@@ -1032,6 +1032,37 @@ fn run_worker(
                                 );
                             }
                         }
+                        // No video decoder is built in: report why and keep
+                        // playing audio.
+                        PlayerCommand::SelectVideoTrack {
+                            index,
+                            generation: g,
+                        } if !cfg!(feature = "backend-openh264") => {
+                            generation = g;
+                            let kind = tracks
+                                .iter()
+                                .find(|t| t.id as usize == index)
+                                .map(classify_track);
+                            let message = match kind {
+                                None | Some(TrackKind::Audio) => {
+                                    format!("invalid video track id {index}")
+                                }
+                                Some(TrackKind::Video(codec)) => format!(
+                                    "Unsupported video codec '{}' — audio only",
+                                    codec.name()
+                                ),
+                                Some(TrackKind::Ignore) => {
+                                    "Unsupported video codec 'h264' — audio only".into()
+                                }
+                            };
+                            emit(
+                                &event_tx,
+                                PlayerEvent::Warning {
+                                    message,
+                                    generation: g,
+                                },
+                            );
+                        }
                         PlayerCommand::SelectVideoTrack {
                             index,
                             generation: g,
@@ -1066,22 +1097,7 @@ fn run_worker(
                                             .as_ref()
                                             .map(|e| e.to_vec())
                                             .or_else(|| stream_avcc.clone());
-                                        let params = map_h264_params(&vt, extra);
-                                        video_dec = match OpenH264Decoder::from_params(&params) {
-                                            Ok(d) => Some(d),
-                                            Err(e) => {
-                                                emit(
-                                                    &event_tx,
-                                                    PlayerEvent::Warning {
-                                                        message: format!(
-                                                            "fallback: failed to open OpenH264 decoder: {e}"
-                                                        ),
-                                                        generation: g,
-                                                    },
-                                                );
-                                                None
-                                            }
-                                        };
+                                        video_dec = open_fallback_video(&vt, extra, g, &event_tx);
                                     }
                                 }
                                 video_stream_index = vt.id as usize;
@@ -1325,11 +1341,11 @@ fn run_worker(
                                 .unwrap_or_default();
                                 if !samples.is_empty() {
                                     if let Some(ref s) = sink {
-                                        s.append(rodio::buffer::SamplesBuffer::new(
+                                        s.append_i16(
                                             f.channels.max(1),
                                             f.sample_rate.max(1),
                                             samples,
-                                        ));
+                                        );
                                     }
                                 }
                             }
@@ -1563,11 +1579,7 @@ fn run_worker(
                                     appended_audio_frames +=
                                         (samples.len() / usize::from(audio_channels.max(1))) as u64;
                                     if let Some(ref s) = sink {
-                                        s.append(rodio::buffer::SamplesBuffer::new(
-                                            audio_channels,
-                                            audio_rate,
-                                            samples,
-                                        ));
+                                        s.append_i16(audio_channels, audio_rate, samples);
                                     }
                                     if playing {
                                         let audio_pts = f.pts.or(Some(packet.ts() as i64));
@@ -1628,11 +1640,7 @@ fn run_worker(
                             appended_audio_frames +=
                                 (samples.len() / usize::from(audio_channels.max(1))) as u64;
                             if let Some(ref s) = sink {
-                                s.append(rodio::buffer::SamplesBuffer::new(
-                                    audio_channels,
-                                    audio_rate,
-                                    samples,
-                                ));
+                                s.append_i16(audio_channels, audio_rate, samples);
                             }
                             if playing {
                                 audio_sync_clock.start_output_at(audio_anchor_position(
@@ -1665,33 +1673,29 @@ fn run_worker(
     Ok(())
 }
 
-#[cfg(not(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-)))]
+/// Without Symphonia there is no fallback demuxer, so the native pipeline is
+/// used whatever `prefer_native` says.
+#[cfg(not(feature = "backend-symphonia"))]
 fn run_worker(
-    _path: PathBuf,
-    _volume: f32,
+    path: PathBuf,
+    volume: f32,
     _prefer_native: bool,
-    _cmd_rx: Receiver<PlayerCommand>,
+    cmd_rx: Receiver<PlayerCommand>,
     event_tx: EventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    emit(
-        &event_tx,
-        PlayerEvent::Error {
-            message: "playback backends disabled".into(),
-            generation: 0,
+    // The caller reports the returned error as a `PlayerEvent::Error`.
+    crate::native_pipeline::try_run_native_with_sender(&path, volume, &cmd_rx, &event_tx).map_err(
+        |reason| {
+            format!(
+                "native pipeline cannot play this file ({reason}), and the Symphonia \
+                 fallback demuxer is not built in (feature `backend-symphonia`)"
+            )
+            .into()
         },
-    );
-    Err("backends disabled".into())
+    )
 }
 
-#[cfg(all(
-    feature = "backend-symphonia",
-    feature = "backend-openh264",
-    feature = "audio-rodio"
-))]
+#[cfg(feature = "backend-symphonia")]
 #[cfg(test)]
 mod tests {
     use super::{audio_anchor_position, flushed_frame_position, video_frame_event, WorkerSync};

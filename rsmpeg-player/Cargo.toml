@@ -14,6 +14,10 @@ default = ["backend-symphonia", "backend-openh264", "audio-rodio"]
 backend-symphonia = ["dep:symphonia"]
 backend-openh264 = ["dep:openh264"]
 audio-rodio = ["dep:rodio"]
+# No C/C++ codec: Symphonia for AAC/MP3/Vorbis/ALAC and the fallback demuxer.
+pure-rust = ["backend-symphonia", "audio-rodio"]
+# rsmpeg's own demuxers and decoders only.
+native-only = ["audio-rodio"]
 
 [dependencies]
 rsmpeg-util = { path = "../rsmpeg-util" }

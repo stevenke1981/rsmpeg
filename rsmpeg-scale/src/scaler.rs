@@ -167,20 +167,21 @@ impl Scaler {
     ///
     /// Currently implements real conversion for:
     /// - `Yuv420P` → `Rgba` / `Rgb24` / `Bgr24`
-    /// - `Nv12` → `Rgba` / `Rgb24`
-    /// - `Yuv422P` → `Rgba`
+    /// - `Nv12` / `Nv21` → `Rgba` / `Rgb24` / `Bgr24`
+    /// - `Yuv422P` → `Rgba` / `Rgb24` / `Bgr24`
     /// - `Yuv444P` → `Rgba` / `Rgb24` / `Bgr24`
-    /// - `Rgb24` → `Rgba`
-    /// - same format → same format (with dimension scaling)
+    /// - `Rgb24` / `Bgr24` / `Bgra` / `Gray8` → `Rgba` (`Bgra` keeps its alpha;
+    ///   the others become opaque)
+    /// - `Yuv420P` → `Yuv420P` (with dimension scaling)
+    /// - any other format → itself, only without a dimension change
     ///
     /// Dimension changes are performed with the kernel named by
     /// [`ScalerConfig::interpolation`] — `nearest`, `bilinear`, `bicubic` or
     /// `lanczos` (see [`InterpolationMethod::is_supported`]). Every resize path
-    /// honours it: `Yuv420P → Yuv420P` resamples all three planes, and each
-    /// packed-output path (`Yuv420P`/`Nv12`/`Yuv422P`/`Yuv444P` →
-    /// `Rgba`/`Rgb24`/`Bgr24`) resamples its planes before the colour
-    /// conversion. A YUV → packed conversion without a size change reads the
-    /// source planes directly.
+    /// honours it: `Yuv420P → Yuv420P` resamples all three planes, each YUV →
+    /// packed path resamples its planes before the colour conversion, and each
+    /// packed → `Rgba` path resamples every source channel. A conversion
+    /// without a size change reads the source planes directly.
     ///
     /// YUV → RGB conversion uses the inverse matrix named by
     /// [`ColorConversion::src_space`]: BT.709 and BT.2020 have their own, every
@@ -209,9 +210,14 @@ impl Scaler {
             (PixelFormat::Yuv420P, PixelFormat::Rgba) => self.scale_yuv420p_to_packed(frame, 4),
             (PixelFormat::Yuv420P, PixelFormat::Rgb24) => self.scale_yuv420p_to_packed(frame, 3),
             (PixelFormat::Yuv420P, PixelFormat::Bgr24) => self.scale_yuv420p_to_packed(frame, 0),
-            (PixelFormat::Nv12, PixelFormat::Rgba) => self.scale_nv12_to_rgba(frame),
-            (PixelFormat::Nv12, PixelFormat::Rgb24) => self.scale_nv12_to_rgb24(frame),
-            (PixelFormat::Yuv422P, PixelFormat::Rgba) => self.scale_yuv422p_to_rgba(frame),
+            (
+                src @ (PixelFormat::Nv12 | PixelFormat::Nv21 | PixelFormat::Yuv422P),
+                dst @ (PixelFormat::Rgba | PixelFormat::Rgb24 | PixelFormat::Bgr24),
+            ) => {
+                let bytes_per_pixel = if dst == PixelFormat::Rgba { 4 } else { 3 };
+                let bgr = dst == PixelFormat::Bgr24;
+                self.scale_subsampled_to_packed(frame, src, bytes_per_pixel, bgr)
+            }
             (PixelFormat::Yuv444P, PixelFormat::Rgba) => {
                 self.scale_yuv444p_to_packed(frame, 4, false)
             }
@@ -221,7 +227,13 @@ impl Scaler {
             (PixelFormat::Yuv444P, PixelFormat::Bgr24) => {
                 self.scale_yuv444p_to_packed(frame, 3, true)
             }
-            (PixelFormat::Rgb24, PixelFormat::Rgba) => self.scale_rgb24_to_rgba(frame),
+            (
+                src @ (PixelFormat::Rgb24
+                | PixelFormat::Bgr24
+                | PixelFormat::Bgra
+                | PixelFormat::Gray8),
+                PixelFormat::Rgba,
+            ) => self.scale_packed_to_rgba(frame, src),
             (src, dst)
                 if src == dst
                     && self.config.src_width == self.config.dst_width
@@ -670,16 +682,40 @@ impl Scaler {
         // 1:1 fast path: every kernel is the identity here, so convert straight
         // from the source rows.
         if src_w == dst_w && src_h == dst_h {
+            let matrix = YuvMatrix::new(space, limited);
             for (row, out_row) in out.chunks_exact_mut(out_stride).enumerate() {
                 let chroma_row = row / chroma_h_step;
                 let y_row = &y_plane[row * y_stride..][..src_w];
                 let u_row = &u_plane[chroma_row * u_stride..][..src_cw];
                 let v_row = &v_plane[chroma_row * v_stride..][..src_cw];
-                let pixels = out_row.chunks_exact_mut(bytes_per_pixel).zip(y_row);
-                for (x, (px, &y)) in pixels.enumerate() {
-                    let cx = x / chroma_w_step;
-                    let rgb = yuv_to_rgb(y, u_row[cx], v_row[cx], space, limited);
-                    write_rgb_pixel(px, rgb, bgr);
+                match chroma_w_step {
+                    // Two luma samples share each chroma sample.
+                    2 => {
+                        let chroma = u_row.iter().copied().zip(v_row.iter().copied());
+                        convert_half_chroma_row(
+                            out_row,
+                            y_row,
+                            chroma,
+                            matrix,
+                            bytes_per_pixel,
+                            bgr,
+                        );
+                    }
+                    // Full-resolution chroma: column `x` reads sample `x`.
+                    1 => {
+                        let samples = y_row.iter().zip(u_row).zip(v_row);
+                        let pixels = out_row.chunks_exact_mut(bytes_per_pixel);
+                        for (px, ((&y, &u), &v)) in pixels.zip(samples) {
+                            write_rgb_pixel(px, matrix.apply(y, matrix.chroma(u, v)), bgr);
+                        }
+                    }
+                    step => {
+                        let pixels = out_row.chunks_exact_mut(bytes_per_pixel).zip(y_row);
+                        for (x, (px, &y)) in pixels.enumerate() {
+                            let terms = matrix.chroma(u_row[x / step], v_row[x / step]);
+                            write_rgb_pixel(px, matrix.apply(y, terms), bgr);
+                        }
+                    }
                 }
             }
             return Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h));
@@ -811,34 +847,21 @@ impl Scaler {
         result
     }
 
-    /// `Nv12` → `Rgba`, rescaling with the configured interpolation kernel.
-    fn scale_nv12_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
-        self.scale_semi_planar_to_packed(frame, PixelFormat::Nv12, 2, true, true)
-    }
-
-    /// `Nv12` → `Rgb24`, rescaling with the configured interpolation kernel.
-    fn scale_nv12_to_rgb24(&self, frame: &Frame) -> RsResult<Frame> {
-        self.scale_semi_planar_to_packed(frame, PixelFormat::Nv12, 2, false, true)
-    }
-
-    /// `Yuv422P` → `Rgba`, rescaling with the configured interpolation kernel.
-    fn scale_yuv422p_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
-        self.scale_semi_planar_to_packed(frame, PixelFormat::Yuv422P, 3, true, false)
-    }
-
-    /// Shared implementation for the `Nv12` / `Yuv422P` → packed RGB(A) paths.
+    /// `Nv12` / `Nv21` / `Yuv422P` → packed `Rgba` / `Rgb24` / `Bgr24`,
+    /// rescaling with the configured interpolation kernel.
     ///
-    /// `alpha` selects 4 bytes/pixel RGBA versus 3 bytes/pixel RGB24; `interleaved_uv`
-    /// selects NV12 semi-planar chroma over planar 4:2:2 chroma.
-    fn scale_semi_planar_to_packed(
+    /// `Nv12` stores each chroma sample as a `U, V` byte pair and `Nv21` as
+    /// `V, U`; `Yuv422P` is planar with full-height chroma.
+    fn scale_subsampled_to_packed(
         &self,
         frame: &Frame,
         expected: PixelFormat,
-        planes: usize,
-        alpha: bool,
-        interleaved_uv: bool,
+        bytes_per_pixel: usize,
+        bgr: bool,
     ) -> RsResult<Frame> {
         Self::require_source_format(frame, expected)?;
+        let interleaved_uv = matches!(expected, PixelFormat::Nv12 | PixelFormat::Nv21);
+        let planes = if interleaved_uv { 2 } else { 3 };
         if frame.data.len() < planes || frame.linesize.len() < planes {
             return Err(RsError::InvalidData(
                 format!("{:?} frame requires {} planes", expected, planes).into(),
@@ -858,6 +881,7 @@ impl Scaler {
         };
         let uv_bytes = if interleaved_uv { 2 } else { 1 };
 
+        // `validate_plane` guarantees that every row sliced below is in bounds.
         let format_name = format!("{expected:?}");
         Self::validate_plane(
             &frame.data[0],
@@ -886,109 +910,117 @@ impl Scaler {
             )?;
         }
 
-        let y_stride = frame.linesize[0];
-        let uv_stride = frame.linesize[1];
-        let y_need = y_stride
-            .checked_mul(use_h.saturating_sub(1))
-            .and_then(|o| o.checked_add(use_w));
-        let uv_need = uv_stride
-            .checked_mul(chroma_h.saturating_sub(1))
-            .and_then(|o| o.checked_add(chroma_w.checked_mul(uv_bytes)?));
-        let v_need = if interleaved_uv {
-            Some(0)
-        } else {
-            let v_stride = frame.linesize[2];
-            v_stride
-                .checked_mul(use_h.saturating_sub(1))
-                .and_then(|o| o.checked_add(chroma_w))
-        };
-
         let y_plane = &frame.data[0];
+        let y_stride = frame.linesize[0];
         let uv_plane = &frame.data[1];
-        match (y_need, uv_need, v_need) {
-            (Some(yn), Some(uvn), Some(vn))
-                if y_plane.len() >= yn
-                    && uv_plane.len() >= uvn
-                    && (interleaved_uv || frame.data[2].len() >= vn) => {}
-            _ => {
-                return Err(RsError::InvalidData(
-                    format!(
-                        "{:?} plane buffers are too small for declared size/linesize",
-                        expected
-                    )
-                    .into(),
-                ));
-            }
-        }
-        let v_plane: &[u8] = if interleaved_uv { &[] } else { &frame.data[2] };
-        let v_stride = if interleaved_uv { 0 } else { frame.linesize[2] };
+        let uv_stride = frame.linesize[1];
 
-        let bpp = if alpha { 4 } else { 3 };
-
-        // NV12 interleaves U and V in one plane, so it cannot go straight to the
-        // planar converter: split it first, then share the kernel-driven path.
-        // (`Yuv422P` is already planar and needs no copy.)
-        if interleaved_uv {
-            let mut u_dense = Vec::with_capacity(chroma_w * chroma_h);
-            let mut v_dense = Vec::with_capacity(chroma_w * chroma_h);
-            for row in 0..chroma_h {
-                let base = row * uv_stride;
-                for col in 0..chroma_w {
-                    u_dense.push(uv_plane[base + col * 2]);
-                    v_dense.push(uv_plane[base + col * 2 + 1]);
-                }
-            }
+        if !interleaved_uv {
             return self.yuv_planes_to_packed(
                 frame,
-                &frame.data[0],
+                y_plane,
                 y_stride,
-                &u_dense,
-                chroma_w,
-                &v_dense,
-                chroma_w,
+                uv_plane,
+                uv_stride,
+                &frame.data[2],
+                frame.linesize[2],
                 use_w,
                 use_h,
                 2,
-                2,
-                bpp,
-                false,
+                1,
+                bytes_per_pixel,
+                bgr,
             );
         }
 
+        // Byte offsets of U and V within one interleaved chroma pair.
+        let (u_at, v_at) = if expected == PixelFormat::Nv21 {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+
+        let dst_w = self.config.dst_width as usize;
+        let dst_h = self.config.dst_height as usize;
+
+        // 1:1 fast path: convert row by row straight from the interleaved plane,
+        // without splitting it into temporary U and V buffers.
+        if use_w == dst_w && use_h == dst_h {
+            Self::validate_output_size(dst_w, dst_h, bytes_per_pixel)?;
+            let matrix = YuvMatrix::new(
+                self.color.src_space,
+                self.color.src_range == ColorRange::Limited,
+            );
+            let out_stride = dst_w * bytes_per_pixel;
+            let mut out = vec![0u8; out_stride * dst_h];
+            for (row, out_row) in out.chunks_exact_mut(out_stride).enumerate() {
+                let y_row = &y_plane[row * y_stride..][..use_w];
+                let uv_row = &uv_plane[(row / 2) * uv_stride..][..chroma_w * 2];
+                let chroma = uv_row.chunks_exact(2).map(|uv| (uv[u_at], uv[v_at]));
+                convert_half_chroma_row(out_row, y_row, chroma, matrix, bytes_per_pixel, bgr);
+            }
+            return Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h));
+        }
+
+        // Resizing: the shared kernel-driven path takes planar chroma, so split
+        // the interleaved plane first.
+        let mut u_dense = Vec::with_capacity(chroma_w * chroma_h);
+        let mut v_dense = Vec::with_capacity(chroma_w * chroma_h);
+        for row in 0..chroma_h {
+            let uv_row = &uv_plane[row * uv_stride..][..chroma_w * 2];
+            for uv in uv_row.chunks_exact(2) {
+                u_dense.push(uv[u_at]);
+                v_dense.push(uv[v_at]);
+            }
+        }
         self.yuv_planes_to_packed(
             frame,
-            &frame.data[0],
+            y_plane,
             y_stride,
-            uv_plane,
-            uv_stride,
-            v_plane,
-            v_stride,
+            &u_dense,
+            chroma_w,
+            &v_dense,
+            chroma_w,
             use_w,
             use_h,
             2,
-            1,
-            bpp,
-            false,
+            2,
+            bytes_per_pixel,
+            bgr,
         )
     }
 
-    /// `Rgb24` → `Rgba`, rescaling with the configured interpolation kernel.
+    /// `Rgb24` / `Bgr24` / `Bgra` / `Gray8` → `Rgba`, rescaling with the
+    /// configured interpolation kernel.
     ///
-    /// The three colour channels are split into 8-bit planes, resampled with the
-    /// same [`resample_plane`] code that drives every other path, and
-    /// interleaved back into RGBA. Previously this path hard-coded the
-    /// nearest-neighbour `floor(d*s/t)` lookup, so a `Bilinear`/`Bicubic`/
-    /// `Lanczos` configuration changed nothing: a 2×2 black/white RGB24 frame
-    /// widened to 4×2 came back as `[0,0,255,255]` for every kernel. Nearest
-    /// still maps `floor(d*s/t)`, so its output remains byte-identical.
-    fn scale_rgb24_to_rgba(&self, frame: &Frame) -> RsResult<Frame> {
+    /// On a size change every source channel is split into its own 8-bit plane,
+    /// resampled with the same [`resample_plane`] code that drives every other
+    /// path, and interleaved back into RGBA, so `Bilinear`/`Bicubic`/`Lanczos`
+    /// really affect the output while nearest keeps the `floor(d*s/t)` mapping.
+    /// `Bgra` alpha is carried through; the other sources become opaque.
+    fn scale_packed_to_rgba(&self, frame: &Frame, expected: PixelFormat) -> RsResult<Frame> {
         // Rejecting the mismatch matters: a `Bgr24` frame fed to an `Rgb24`
         // scaler produced a perfectly plausible RGBA image with red and blue
         // swapped, which no later stage can detect.
-        Self::require_source_format(frame, PixelFormat::Rgb24)?;
+        Self::require_source_format(frame, expected)?;
+        // Bytes per source pixel, then the offsets of R, G, B and alpha in it.
+        let (src_bpp, [r, g, b], alpha): (usize, [usize; 3], Option<usize>) = match expected {
+            PixelFormat::Rgb24 => (3, [0, 1, 2], None),
+            PixelFormat::Bgr24 => (3, [2, 1, 0], None),
+            PixelFormat::Bgra => (4, [2, 1, 0], Some(3)),
+            PixelFormat::Gray8 => (1, [0, 0, 0], None),
+            other => {
+                return Err(unsupported!(
+                    "scale conversion {:?} -> Rgba is not implemented yet",
+                    other
+                ))
+            }
+        };
         let (use_w, use_h) = self.source_geometry(frame);
         if frame.data.is_empty() || frame.linesize.is_empty() {
-            return Err(RsError::InvalidData("RGB24 frame has no plane data".into()));
+            return Err(RsError::InvalidData(
+                format!("{expected:?} frame has no plane data").into(),
+            ));
         }
         let dst_w = self.config.dst_width as usize;
         let dst_h = self.config.dst_height as usize;
@@ -999,57 +1031,50 @@ impl Scaler {
         let src_stride = frame.linesize[0];
         // `linesize` must cover one full pixel row, otherwise consecutive rows
         // overlap (a 3-byte stride for a 2-pixel RGB24 row duplicated pixels).
-        Self::validate_plane(src, src_stride, use_w, use_h, 3, "RGB24")?;
+        Self::validate_plane(
+            src,
+            src_stride,
+            use_w,
+            use_h,
+            src_bpp,
+            &format!("{expected:?}"),
+        )?;
         Self::validate_output_size(dst_w, dst_h, 4)?;
-        let need = src_stride
-            .checked_mul(use_h.saturating_sub(1))
-            .and_then(|o| o.checked_add(use_w.checked_mul(3)?));
-        match need {
-            Some(n) if src.len() >= n => {}
-            _ => {
-                return Err(RsError::InvalidData(
-                    "RGB24 plane buffer is too small for declared size/linesize".into(),
-                ));
-            }
-        }
 
         let out_stride = dst_w * 4;
         let mut out = vec![0u8; out_stride * dst_h];
 
-        // Split the interleaved RGB into three 8-bit planes so the shared kernel
-        // code can resample each channel independently, then interleave RGBA.
-        let method = self.config.interpolation;
-        let mut planes: [Vec<u8>; 3] = [
-            vec![0u8; use_w * use_h],
-            vec![0u8; use_w * use_h],
-            vec![0u8; use_w * use_h],
-        ];
-        for sy in 0..use_h {
-            let row = sy * src_stride;
-            for sx in 0..use_w {
-                let s = row + sx * 3;
-                let i = sy * use_w + sx;
-                planes[0][i] = src[s];
-                planes[1][i] = src[s + 1];
-                planes[2][i] = src[s + 2];
+        if use_w == dst_w && use_h == dst_h {
+            for (row, out_row) in out.chunks_exact_mut(out_stride).enumerate() {
+                let src_row = &src[row * src_stride..][..use_w * src_bpp];
+                let pixels = out_row.chunks_exact_mut(4);
+                for (px, s) in pixels.zip(src_row.chunks_exact(src_bpp)) {
+                    px.copy_from_slice(&[s[r], s[g], s[b], alpha.map_or(255, |a| s[a])]);
+                }
             }
+            return Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h));
         }
-        let mut resampled = Vec::with_capacity(3);
-        for plane in &planes {
+
+        let method = self.config.interpolation;
+        let mut resampled = Vec::with_capacity(src_bpp);
+        for channel in 0..src_bpp {
+            let mut plane = Vec::with_capacity(use_w * use_h);
+            for row in 0..use_h {
+                let src_row = &src[row * src_stride..][..use_w * src_bpp];
+                plane.extend(src_row.iter().skip(channel).step_by(src_bpp));
+            }
             resampled.push(resample_plane(
-                plane, use_w, use_w, use_h, dst_w, dst_h, method,
+                &plane, use_w, use_w, use_h, dst_w, dst_h, method,
             )?);
         }
 
-        for dy in 0..dst_h {
-            for dx in 0..dst_w {
-                let i = dy * dst_w + dx;
-                let d = dy * out_stride + dx * 4;
-                out[d] = resampled[0][i];
-                out[d + 1] = resampled[1][i];
-                out[d + 2] = resampled[2][i];
-                out[d + 3] = 255;
-            }
+        for (i, px) in out.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[
+                resampled[r][i],
+                resampled[g][i],
+                resampled[b][i],
+                alpha.map_or(255, |a| resampled[a][i]),
+            ]);
         }
 
         Ok(self.packed_video_frame(frame, out, out_stride, dst_w, dst_h))
@@ -1207,6 +1232,60 @@ fn chroma_coefficients(space: ColorSpace, limited: bool) -> ChromaCoefficients {
     }
 }
 
+/// The inverse matrix of one colour space and range, selected once per frame so
+/// pixel loops do not repeat the lookup.
+#[derive(Debug, Clone, Copy)]
+struct YuvMatrix {
+    coefficients: ChromaCoefficients,
+    limited: bool,
+}
+
+/// The R, G and B contributions of one `(U, V)` sample, shared by every luma
+/// sample that the chroma sample covers.
+#[derive(Debug, Clone, Copy)]
+struct ChromaTerms {
+    r: i32,
+    g: i32,
+    b: i32,
+}
+
+impl YuvMatrix {
+    #[inline]
+    fn new(space: ColorSpace, limited: bool) -> Self {
+        YuvMatrix {
+            coefficients: chroma_coefficients(space, limited),
+            limited,
+        }
+    }
+
+    #[inline]
+    fn chroma(self, u: u8, v: u8) -> ChromaTerms {
+        let d = u as i32 - 128;
+        let e = v as i32 - 128;
+        let c = self.coefficients;
+        ChromaTerms {
+            r: c.rv * e,
+            g: -c.gu * d - c.gv * e,
+            b: c.bu * d,
+        }
+    }
+
+    /// Combine one luma sample with precomputed chroma terms.
+    #[inline]
+    fn apply(self, y: u8, terms: ChromaTerms) -> (u8, u8, u8) {
+        let y_scaled = if self.limited {
+            (y as i32 - 16).max(0) * COEF_Y_LTD
+        } else {
+            y as i32 * 65536
+        };
+        (
+            clamp_fixed_u8(y_scaled + terms.r),
+            clamp_fixed_u8(y_scaled + terms.g),
+            clamp_fixed_u8(y_scaled + terms.b),
+        )
+    }
+}
+
 /// YUV → RGB conversion (integer fixed point) with the matrix of `space`.
 ///
 /// Limited range uses studio swing (Y 16–235, UV 16–240).
@@ -1217,19 +1296,29 @@ fn chroma_coefficients(space: ColorSpace, limited: bool) -> ChromaCoefficients {
 /// component plus a shift, within ±1 LSB of the exact matrix.
 #[inline]
 fn yuv_to_rgb(y: u8, u: u8, v: u8, space: ColorSpace, limited: bool) -> (u8, u8, u8) {
-    let d = u as i32 - 128;
-    let e = v as i32 - 128;
-    let y_scaled = if limited {
-        (y as i32 - 16).max(0) * COEF_Y_LTD
-    } else {
-        y as i32 * 65536
-    };
-    let c = chroma_coefficients(space, limited);
+    let matrix = YuvMatrix::new(space, limited);
+    matrix.apply(y, matrix.chroma(u, v))
+}
 
-    let r = y_scaled + c.rv * e;
-    let g = y_scaled - c.gu * d - c.gv * e;
-    let b = y_scaled + c.bu * d;
-    (clamp_fixed_u8(r), clamp_fixed_u8(g), clamp_fixed_u8(b))
+/// Convert one row whose chroma is halved horizontally: each `(U, V)` item
+/// covers two luma samples (only one at the right edge of an odd-width row).
+#[inline]
+fn convert_half_chroma_row(
+    out_row: &mut [u8],
+    y_row: &[u8],
+    chroma: impl Iterator<Item = (u8, u8)>,
+    matrix: YuvMatrix,
+    bytes_per_pixel: usize,
+    bgr: bool,
+) {
+    let pairs = out_row.chunks_mut(2 * bytes_per_pixel).zip(y_row.chunks(2));
+    for ((out_pair, luma_pair), (u, v)) in pairs.zip(chroma) {
+        let terms = matrix.chroma(u, v);
+        let pixels = out_pair.chunks_exact_mut(bytes_per_pixel);
+        for (px, &y) in pixels.zip(luma_pair) {
+            write_rgb_pixel(px, matrix.apply(y, terms), bgr);
+        }
+    }
 }
 
 /// BT.601 shorthand for [`yuv_to_rgb`], used by the standalone `*_frame_to_*`
@@ -4154,6 +4243,442 @@ mod color_and_resample_tests {
                 let out = resample_plane(&src, 13, 13, 7, dw, dh, method).unwrap();
                 assert_eq!(out, vec![211u8; dw * dh], "{} {dw}x{dh}", method.name());
             }
+        }
+    }
+}
+
+/// `Nv21`, the 4:2:2 packed outputs, the packed → RGBA sources and the 1:1
+/// semi-planar fast path.
+#[cfg(test)]
+mod semi_planar_and_packed_tests {
+    use super::*;
+
+    const METHODS: [InterpolationMethod; 4] = [
+        InterpolationMethod::NearestNeighbor,
+        InterpolationMethod::Bilinear,
+        InterpolationMethod::Bicubic,
+        InterpolationMethod::Lanczos,
+    ];
+
+    const PACKED: [PixelFormat; 3] = [PixelFormat::Rgba, PixelFormat::Rgb24, PixelFormat::Bgr24];
+
+    // Odd on both axes, so the last chroma sample covers a single column / row.
+    const W: usize = 5;
+    const H: usize = 3;
+    const CW: usize = 3;
+    const CH: usize = 2;
+
+    fn luma(x: usize, y: usize) -> u8 {
+        (40 + y * 60 + x * 17) as u8
+    }
+
+    fn cb(x: usize, y: usize) -> u8 {
+        (50 + y * 70 + x * 45) as u8
+    }
+
+    fn cr(x: usize, y: usize) -> u8 {
+        (230 - y * 50 - x * 55) as u8
+    }
+
+    /// A `width × height` byte plane stored with `stride`, padding set to `0xEE`.
+    fn plane(
+        width: usize,
+        height: usize,
+        stride: usize,
+        sample: impl Fn(usize, usize) -> u8,
+    ) -> Vec<u8> {
+        let mut data = vec![0xEE; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                data[y * stride + x] = sample(x, y);
+            }
+        }
+        data
+    }
+
+    fn frame(
+        format: PixelFormat,
+        width: usize,
+        height: usize,
+        data: Vec<Vec<u8>>,
+        linesize: Vec<usize>,
+    ) -> Frame {
+        let mut frame = Frame::new_video(0, 0, format);
+        frame.width = width;
+        frame.height = height;
+        frame.data = data;
+        frame.linesize = linesize;
+        frame.pts = Some(42);
+        frame
+    }
+
+    fn nv(format: PixelFormat) -> Frame {
+        let chroma = |x: usize, y: usize| {
+            let u_first = format == PixelFormat::Nv12;
+            if (x % 2 == 0) == u_first {
+                cb(x / 2, y)
+            } else {
+                cr(x / 2, y)
+            }
+        };
+        frame(
+            format,
+            W,
+            H,
+            vec![plane(W, H, 9, luma), plane(CW * 2, CH, 11, chroma)],
+            vec![9, 11],
+        )
+    }
+
+    fn planar(format: PixelFormat) -> Frame {
+        let chroma_h = if format == PixelFormat::Yuv422P {
+            H
+        } else {
+            CH
+        };
+        frame(
+            format,
+            W,
+            H,
+            vec![
+                plane(W, H, 7, luma),
+                plane(CW, chroma_h, 4, cb),
+                plane(CW, chroma_h, 6, cr),
+            ],
+            vec![7, 4, 6],
+        )
+    }
+
+    fn convert(
+        src: &Frame,
+        dst: PixelFormat,
+        dst_w: usize,
+        dst_h: usize,
+        method: InterpolationMethod,
+        color: Option<ColorConversion>,
+    ) -> Frame {
+        let mut config = ScalerConfig::new(
+            src.width as u32,
+            src.height as u32,
+            src.pixel_format,
+            dst_w as u32,
+            dst_h as u32,
+            dst,
+        )
+        .with_interpolation(method);
+        config.color_conversion = color;
+        Scaler::new(config).unwrap().scale(src).unwrap()
+    }
+
+    fn packed(dst: PixelFormat, [r, g, b]: [u8; 3]) -> Vec<u8> {
+        match dst {
+            PixelFormat::Rgba => vec![r, g, b, 255],
+            PixelFormat::Rgb24 => vec![r, g, b],
+            PixelFormat::Bgr24 => vec![b, g, r],
+            other => panic!("unexpected packed format {other:?}"),
+        }
+    }
+
+    /// Per-pixel reference for a 1:1 conversion of the `W × H` test image.
+    fn expected(dst: PixelFormat, chroma_h_step: usize, color: &ColorConversion) -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in 0..H {
+            for x in 0..W {
+                let (r, g, b) = yuv_to_rgb(
+                    luma(x, y),
+                    cb(x / 2, y / chroma_h_step),
+                    cr(x / 2, y / chroma_h_step),
+                    color.src_space,
+                    color.src_range == ColorRange::Limited,
+                );
+                out.extend(packed(dst, [r, g, b]));
+            }
+        }
+        out
+    }
+
+    fn colors() -> [ColorConversion; 3] {
+        [
+            (ColorSpace::BT601, ColorRange::Limited),
+            (ColorSpace::BT709, ColorRange::Full),
+            (ColorSpace::BT2020, ColorRange::Limited),
+        ]
+        .map(|(space, range)| ColorConversion::new(space, ColorSpace::RGB, range, ColorRange::Full))
+    }
+
+    #[test]
+    fn nv21_reads_v_before_u() {
+        // Pure red in BT.601 limited range is Y=81, U=90, V=240; NV21 stores V first.
+        let red = frame(
+            PixelFormat::Nv21,
+            2,
+            2,
+            vec![vec![81; 4], vec![240, 90]],
+            vec![2, 2],
+        );
+        for dst in PACKED {
+            let out = convert(&red, dst, 2, 2, InterpolationMethod::Bilinear, None);
+            let bpp = if dst == PixelFormat::Rgba { 4 } else { 3 };
+            assert_eq!(out.pixel_format, dst);
+            assert_eq!(out.linesize, vec![2 * bpp]);
+            let (first, last) = (out.data[0][0], out.data[0][2]);
+            let (r, b) = if dst == PixelFormat::Bgr24 {
+                (last, first)
+            } else {
+                (first, last)
+            };
+            assert!(r >= 253 && b <= 2, "{dst:?}: r={r} b={b}");
+        }
+    }
+
+    #[test]
+    fn one_to_one_nv12_and_nv21_match_the_per_pixel_reference() {
+        for color in colors() {
+            for dst in PACKED {
+                let want = expected(dst, 2, &color);
+                for format in [PixelFormat::Nv12, PixelFormat::Nv21] {
+                    for method in METHODS {
+                        let out = convert(&nv(format), dst, W, H, method, Some(color.clone()));
+                        assert_eq!(out.data[0], want, "{format:?} -> {dst:?}");
+                        assert_eq!((out.width, out.height, out.pts), (W, H, Some(42)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_to_one_planar_paths_match_the_per_pixel_reference() {
+        for color in colors() {
+            for dst in PACKED {
+                for (format, chroma_h_step) in
+                    [(PixelFormat::Yuv420P, 2), (PixelFormat::Yuv422P, 1)]
+                {
+                    let out = convert(
+                        &planar(format),
+                        dst,
+                        W,
+                        H,
+                        InterpolationMethod::Bilinear,
+                        Some(color.clone()),
+                    );
+                    assert_eq!(
+                        out.data[0],
+                        expected(dst, chroma_h_step, &color),
+                        "{format:?} -> {dst:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nv12_and_nv21_resize_exactly_like_planar_420() {
+        // The semi-planar resize path and the planar one must agree for every
+        // kernel, on upscales and downscales alike.
+        for (dw, dh) in [(10, 6), (7, 5), (3, 2), (W, H + 1)] {
+            for dst in PACKED {
+                for method in METHODS {
+                    let want = convert(&planar(PixelFormat::Yuv420P), dst, dw, dh, method, None);
+                    for format in [PixelFormat::Nv12, PixelFormat::Nv21] {
+                        let out = convert(&nv(format), dst, dw, dh, method, None);
+                        assert_eq!(
+                            out.data[0],
+                            want.data[0],
+                            "{format:?} -> {dst:?} {dw}x{dh} {}",
+                            method.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nearest_2x_resize_replicates_the_one_to_one_pixels() {
+        for format in [PixelFormat::Nv12, PixelFormat::Nv21] {
+            let method = InterpolationMethod::NearestNeighbor;
+            let same = convert(&nv(format), PixelFormat::Rgba, W, H, method, None);
+            let double = convert(&nv(format), PixelFormat::Rgba, W * 2, H * 2, method, None);
+            for y in 0..H * 2 {
+                for x in 0..W * 2 {
+                    let got = &double.data[0][(y * W * 2 + x) * 4..][..4];
+                    let want = &same.data[0][((y / 2) * W + x / 2) * 4..][..4];
+                    assert_eq!(got, want, "{format:?} at ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yuv422p_to_rgb24_and_bgr24_use_full_height_chroma() {
+        // Row 0 is neutral grey, row 1 strongly red: 4:2:0 sampling would lose it.
+        let src = frame(
+            PixelFormat::Yuv422P,
+            2,
+            2,
+            vec![vec![81; 4], vec![128, 90], vec![128, 240]],
+            vec![2, 1, 1],
+        );
+        let method = InterpolationMethod::Bilinear;
+        let rgb = convert(&src, PixelFormat::Rgb24, 2, 2, method, None);
+        let bgr = convert(&src, PixelFormat::Bgr24, 2, 2, method, None);
+        assert_eq!(rgb.linesize, vec![6]);
+        assert_eq!(rgb.data[0][0], rgb.data[0][2], "row 0 is grey");
+        assert!(rgb.data[0][6] >= 253 && rgb.data[0][8] <= 2, "row 1 is red");
+        for (r, b) in rgb.data[0].chunks_exact(3).zip(bgr.data[0].chunks_exact(3)) {
+            assert_eq!([r[0], r[1], r[2]], [b[2], b[1], b[0]]);
+        }
+    }
+
+    #[test]
+    fn yuv422p_resize_to_rgb24_honours_the_kernel_and_matches_rgba() {
+        let src = planar(PixelFormat::Yuv422P);
+        let run = |dst, method| convert(&src, dst, 11, 7, method, None).data.remove(0);
+        let nearest = run(PixelFormat::Rgb24, InterpolationMethod::NearestNeighbor);
+        let bilinear = run(PixelFormat::Rgb24, InterpolationMethod::Bilinear);
+        assert_ne!(nearest, bilinear);
+        let rgba = run(PixelFormat::Rgba, InterpolationMethod::Bilinear);
+        let stripped: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| p[..3].to_vec()).collect();
+        assert_eq!(bilinear, stripped);
+    }
+
+    #[test]
+    fn bgr24_to_rgba_swaps_channels_with_padded_stride() {
+        let src = frame(
+            PixelFormat::Bgr24,
+            2,
+            2,
+            vec![vec![
+                30, 20, 10, 60, 50, 40, 9, 9, //
+                90, 80, 70, 120, 110, 100,
+            ]],
+            vec![8],
+        );
+        let out = convert(
+            &src,
+            PixelFormat::Rgba,
+            2,
+            2,
+            InterpolationMethod::Bilinear,
+            None,
+        );
+        assert_eq!(out.linesize, vec![8]);
+        assert_eq!(
+            out.data[0],
+            vec![10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255]
+        );
+    }
+
+    #[test]
+    fn bgra_to_rgba_keeps_alpha() {
+        let src = frame(
+            PixelFormat::Bgra,
+            2,
+            1,
+            vec![vec![3, 2, 1, 4, 7, 6, 5, 200]],
+            vec![8],
+        );
+        let method = InterpolationMethod::NearestNeighbor;
+        let out = convert(&src, PixelFormat::Rgba, 2, 1, method, None);
+        assert_eq!(out.data[0], vec![1, 2, 3, 4, 5, 6, 7, 200]);
+        let wide = convert(&src, PixelFormat::Rgba, 4, 1, method, None);
+        assert_eq!(
+            wide.data[0],
+            vec![1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 200, 5, 6, 7, 200]
+        );
+    }
+
+    #[test]
+    fn gray8_to_rgba_replicates_luma() {
+        let src = frame(
+            PixelFormat::Gray8,
+            2,
+            2,
+            vec![vec![0, 255, 9, 100, 200]],
+            vec![3],
+        );
+        let method = InterpolationMethod::Bilinear;
+        let out = convert(&src, PixelFormat::Rgba, 2, 2, method, None);
+        assert_eq!(
+            out.data[0],
+            vec![0, 0, 0, 255, 255, 255, 255, 255, 100, 100, 100, 255, 200, 200, 200, 255]
+        );
+    }
+
+    #[test]
+    fn packed_sources_honour_the_kernel_on_resize() {
+        for format in [PixelFormat::Bgr24, PixelFormat::Bgra, PixelFormat::Gray8] {
+            let bpp = format.channels();
+            let mut src = Frame::new_video(2, 2, format);
+            src.data = vec![(0..2 * 2 * bpp)
+                .map(|i| if (i / bpp) % 2 == 0 { 0 } else { 255 })
+                .collect()];
+            let red = |method| -> Vec<u8> {
+                let out = convert(&src, PixelFormat::Rgba, 4, 2, method, None);
+                out.data[0][..16].chunks_exact(4).map(|p| p[0]).collect()
+            };
+            assert_eq!(
+                red(InterpolationMethod::NearestNeighbor),
+                vec![0, 0, 255, 255],
+                "{format:?}"
+            );
+            let bilinear = red(InterpolationMethod::Bilinear);
+            assert!(
+                bilinear[1] > 0 && bilinear[2] < 255,
+                "{format:?}: {bilinear:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_paths_reject_bad_planes_and_wrong_formats() {
+        for format in [
+            PixelFormat::Nv21,
+            PixelFormat::Yuv422P,
+            PixelFormat::Bgr24,
+            PixelFormat::Bgra,
+            PixelFormat::Gray8,
+        ] {
+            let dst = PixelFormat::Rgba;
+            for (dw, dh) in [(4, 4), (6, 2)] {
+                let config = ScalerConfig::new(4, 4, format, dw, dh, dst);
+                let scaler = Scaler::new(config).unwrap();
+                let good = Frame::new_video(4, 4, format);
+                assert!(scaler.scale(&good).is_ok(), "{format:?}");
+
+                let mut truncated = good.clone();
+                let last = truncated.data.len() - 1;
+                truncated.data[last].truncate(1);
+                assert!(scaler.scale(&truncated).is_err(), "{format:?} truncated");
+
+                let mut overlapping = good.clone();
+                overlapping.linesize[0] = 1;
+                assert!(scaler.scale(&overlapping).is_err(), "{format:?} stride");
+
+                let mut missing = good.clone();
+                missing.data.pop();
+                assert!(scaler.scale(&missing).is_err(), "{format:?} missing");
+
+                let mut mislabelled = good;
+                mislabelled.pixel_format = PixelFormat::Rgb24;
+                assert!(scaler.scale(&mislabelled).is_err(), "{format:?} label");
+            }
+        }
+    }
+
+    #[test]
+    fn new_paths_reject_an_overflowing_destination() {
+        for format in [PixelFormat::Nv21, PixelFormat::Bgr24, PixelFormat::Gray8] {
+            let config = ScalerConfig::new(4, 4, format, u32::MAX, u32::MAX, PixelFormat::Rgba);
+            let err = Scaler::new(config)
+                .unwrap()
+                .scale(&Frame::new_video(4, 4, format))
+                .expect_err("unallocatable destination");
+            assert!(
+                matches!(err, RsError::InvalidData(_)),
+                "{format:?}: {err:?}"
+            );
         }
     }
 }
